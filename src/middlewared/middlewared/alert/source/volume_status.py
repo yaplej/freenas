@@ -1,60 +1,108 @@
-from middlewared.alert.base import AlertClass, AlertCategory, AlertLevel, Alert, AlertSource
+from dataclasses import dataclass
+from typing import Any
+
+from middlewared.alert.base import Alert, AlertCategory, AlertClass, AlertClassConfig, AlertLevel, AlertSource
+from middlewared.plugins.zfs_.zfs_events import VOLUME_STATUS_ALERTS
+from middlewared.utils.zfs import query_imported_fast_impl
 
 
-class VolumeStatusAlertClass(AlertClass):
-    category = AlertCategory.STORAGE
-    level = AlertLevel.CRITICAL
-    title = "Pool Status Is Not Healthy"
-    text = "Pool %(volume)s state is %(state)s: %(status)s%(devices)s"
+@dataclass(kw_only=True)
+class VolumeStatusAlert(AlertClass):
+    config = AlertClassConfig(
+        category=AlertCategory.STORAGE,
+        level=AlertLevel.CRITICAL,
+        title="Pool Status Is Not Healthy",
+        text="Pool %(volume)s state is %(state)s: %(status)s%(devices)s",
+        proactive_support=True,
+    )
 
-    proactive_support = True
+    volume: str
+    state: str
+    status: str
+    devices: str
+
+
+@dataclass(kw_only=True)
+class BootPoolStatusAlert(AlertClass):
+    config = AlertClassConfig(
+        category=AlertCategory.SYSTEM,
+        level=AlertLevel.CRITICAL,
+        title="Boot Pool Is Not Healthy",
+        text="Boot pool status is %(status)s: %(status_detail)s.",
+        proactive_support=True,
+    )
+
+    status: str
+    status_detail: str
 
 
 class VolumeStatusAlertSource(AlertSource):
-    async def check(self):
+    async def check(self) -> list[Alert[Any]] | None:
         if not await self.enabled():
-            return
+            return None
 
-        alerts = []
-        for pool in await self.middleware.call("pool.query"):
-            if not pool["is_decrypted"]:
-                continue
+        try:
+            states = await self.middleware.call("cache.get", "VolumeStatusAlertSource.pools_states")
+        except KeyError:
+            states = None
 
-            if not pool["healthy"]:
-                if await self.middleware.call("system.is_enterprise"):
-                    try:
-                        await self.middleware.call("enclosure.sync_zpool", pool["name"])
-                    except Exception:
-                        pass
+        current_states = await self.middleware.run_in_thread(query_imported_fast_impl)
+        await self.middleware.call("cache.put", "VolumeStatusAlertSource.pools_states", current_states)
 
-                bad_vdevs = []
-                if pool["topology"]:
-                    for vdev in await self.middleware.call("pool.flatten_topology", pool["topology"]):
-                        if vdev["type"] == "DISK" and vdev["status"] != "ONLINE":
-                            name = vdev["guid"]
-                            if vdev.get("unavail_disk"):
-                                name = f'{vdev["unavail_disk"]["model"]} {vdev["unavail_disk"]["serial"]}'
-                            bad_vdevs.append(f"Disk {name} is {vdev['status']}")
-                if bad_vdevs:
-                    devices = (f"<br>The following devices are not healthy:"
-                               f"<ul><li>{'</li><li>'.join(bad_vdevs)}</li></ul>")
-                else:
-                    devices = ""
+        alerts = None
+        if current_states == states:
+            try:
+                alerts = await self.middleware.call("cache.get", VOLUME_STATUS_ALERTS)
+            except KeyError:
+                pass
 
-                alerts.append(Alert(
-                    VolumeStatusAlertClass,
-                    {
-                        "volume": pool["name"],
-                        "state": pool["status"],
-                        "status": pool["status_detail"],
-                        "devices": devices,
-                    }
-                ))
+        if alerts is None:
+            alerts = []
+            boot_pool = await self.middleware.call2(self.middleware.services.boot.pool_name)
+            for pool in await self.middleware.call("zpool.query_impl", {"pool_names": [boot_pool]}):
+                if not pool["healthy"]:
+                    alerts.append([
+                        "BootPoolStatusAlert",
+                        {
+                            "status": pool["status"],
+                            "status_detail": pool["status_detail"],
+                        },
+                    ])
+            for pool in await self.middleware.call("pool.query"):
+                if not pool["healthy"] or (pool["warning"] and pool["status_code"] != "FEAT_DISABLED"):
+                    bad_vdevs = []
+                    if pool["topology"]:
+                        for vdev in await self.middleware.call("pool.flatten_topology", pool["topology"]):
+                            if vdev["type"] == "DISK" and vdev["status"] != "ONLINE":
+                                name = vdev["guid"]
+                                if vdev.get("unavail_disk"):
+                                    name = f'{vdev["unavail_disk"]["model"]} {vdev["unavail_disk"]["serial"]}'
+                                bad_vdevs.append(f"Disk {name} is {vdev['status']}")
+                    if bad_vdevs:
+                        devices = (f"<br>The following devices are not healthy:"
+                                   f"<ul><li>{'</li><li>'.join(bad_vdevs)}</li></ul>")
+                    else:
+                        devices = ""
 
-        return alerts
+                    alerts.append([
+                        "VolumeStatusAlert",
+                        {
+                            "volume": pool["name"],
+                            "state": pool["status"],
+                            "status": pool["status_detail"],
+                            "devices": devices,
+                        }
+                    ])
 
-    async def enabled(self):
-        if await self.middleware.call("system.is_enterprise"):
+            await self.middleware.call("cache.put", VOLUME_STATUS_ALERTS, alerts)
+
+        klass_map: dict[str, type[AlertClass]] = {
+            "BootPoolStatusAlert": BootPoolStatusAlert, "VolumeStatusAlert": VolumeStatusAlert,
+        }
+        return [Alert(klass_map[alert[0]].from_args(alert[1])) for alert in alerts]
+
+    async def enabled(self) -> bool:
+        if await self.middleware.call("system.is_ha_capable"):
             status = await self.middleware.call("failover.status")
             return status in ("MASTER", "SINGLE")
 

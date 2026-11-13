@@ -6,23 +6,43 @@
 # at the start and end of sessions of *any* kind (both interactive and
 # non-interactive).
 
-<%namespace name="pam" file="pam.inc.mako" />\
 <%
-        dsp = pam.getDirectoryServicePam(middleware=middleware, render_ctx=render_ctx)
-%>\
+    from middlewared.utils.directoryservices.constants import DSType
+    from middlewared.utils.pam import (
+        TTY_AUDIT_LINE, STANDALONE_SESSION, AD_SESSION, SSS_SESSION,
+        TRUENAS_SESSION_LIMIT, TRUENAS_SESSION_NO_LIMIT
+    )
 
-# here are the per-package modules (the "Primary" block)
-session	[default=1]			pam_permit.so
-# here's the fallback if no module succeeds
-session	requisite			pam_deny.so
-# prime the stack with a positive return value if there isn't one already;
-# this avoids us returning an error just because nothing sets a success code
-# since the modules above will each just jump around
-session	required			pam_permit.so
-# and here are more per-package modules (the "Additional" block)
-% if dsp.enabled() and dsp.name() != 'NIS':
-${dsp.pam_session()}
+    tty_audit_line = None
+
+    match (dstype := render_ctx['directoryservices.status']['type']):
+        # dstype of None means standalone server
+        case None:
+            conf = STANDALONE_SESSION
+        case DSType.AD.value:
+            conf = AD_SESSION
+        case DSType.LDAP.value | DSType.IPA.value:
+            conf = SSS_SESSION
+        case _:
+            raise TypeError(f'{dstype}: unknown DSType')
+
+    if render_ctx['system.security.config'].enable_gpos_stig:
+        tty_audit_line = TTY_AUDIT_LINE
+        truenas_session_line = TRUENAS_SESSION_LIMIT
+    else:
+        truenas_session_line = TRUENAS_SESSION_NO_LIMIT
+%>\
+% if tty_audit_line:
+${TTY_AUDIT_LINE.as_conf()}
 % endif
-session	required	pam_unix.so
-session	optional	pam_systemd.so
-# end of pam-auth-update config
+${truenas_session_line.as_conf()}
+% if conf.primary:
+${'\n'.join(line.as_conf() for line in conf.primary)}
+% endif
+session	[default=1]			pam_permit.so
+session	requisite			pam_deny.so
+session	required			pam_permit.so
+session	optional			pam_systemd.so
+% if conf.secondary:
+${'\n'.join(line.as_conf() for line in conf.secondary)}
+% endif

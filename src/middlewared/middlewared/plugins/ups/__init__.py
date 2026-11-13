@@ -1,0 +1,82 @@
+from __future__ import annotations
+
+import typing
+
+from middlewared.alert.base import OneShotAlertClass
+from middlewared.api import api_method
+from middlewared.api.current import (
+    UPSDriverChoicesArgs,
+    UPSDriverChoicesResult,
+    UPSEntry,
+    UPSPortChoicesArgs,
+    UPSPortChoicesResult,
+    UPSUpdate,
+    UPSUpdateArgs,
+    UPSUpdateResult,
+)
+from middlewared.service import SystemServiceService, private
+
+from .config import UPSServicePart
+from .upssched_event import handle_upssched_event
+from .utils import alert_class_names, driver_choices, port_choices
+
+if typing.TYPE_CHECKING:
+    from middlewared.main import Middleware
+
+
+__all__ = ('UPSService',)
+
+
+class UPSService(SystemServiceService[UPSEntry]):
+
+    class Config:
+        cli_namespace = 'service.ups'
+        role_prefix = 'SYSTEM_GENERAL'
+        entry = UPSEntry
+        generic = True
+
+    def __init__(self, middleware: Middleware):
+        super().__init__(middleware)
+        self._service_part = UPSServicePart(self.context)
+
+    async def config(self) -> UPSEntry:
+        return await self._service_part.config()
+
+    @api_method(UPSUpdateArgs, UPSUpdateResult, check_annotations=True)
+    async def do_update(self, data: UPSUpdate) -> UPSEntry:
+        """
+        Update UPS Service Configuration.
+        """
+        return await self._service_part.do_update(data)
+
+    @api_method(UPSDriverChoicesArgs, UPSDriverChoicesResult, check_annotations=True, roles=['SYSTEM_GENERAL_READ'])
+    def driver_choices(self) -> dict[str, str]:
+        """
+        Returns choices of UPS drivers supported by the system.
+        """
+        return driver_choices()
+
+    @api_method(UPSPortChoicesArgs, UPSPortChoicesResult, roles=['SYSTEM_GENERAL_READ'], check_annotations=True)
+    def port_choices(self) -> list[str]:
+        """
+        Returns available UPS device ports for the system (serial ports, USB HID devices, and "auto").
+        """
+        adv_config = self.call_sync2(self.s.system.advanced.config)
+        return port_choices(adv_config.serialconsole, adv_config.serialport)
+
+    @private
+    async def dismiss_alerts(self) -> None:
+        await self.call2(self.s.alert.oneshot_delete, alert_class_names())
+
+    @private
+    async def replace_alert(self, instance: OneShotAlertClass) -> None:
+        await self.call2(self.s.alert.oneshot_replace, alert_class_names(), instance)
+
+    @private
+    async def upssched_event(self, notify_type: str) -> None:
+        await handle_upssched_event(self.context, notify_type)
+
+
+async def setup(middleware: Middleware) -> None:
+    # Let's delete all UPS related alerts when starting middlewared ensuring we don't have any leftovers
+    await middleware.call('ups.dismiss_alerts')

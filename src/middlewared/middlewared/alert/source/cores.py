@@ -1,51 +1,63 @@
-from middlewared.alert.base import AlertClass, AlertCategory, AlertLevel, AlertSource, Alert
+from dataclasses import dataclass
+from typing import Any
+
+from middlewared.alert.applicability import NOT_APPLIANCE_HARDWARE
+from middlewared.alert.base import Alert, AlertCategory, AlertClass, AlertClassConfig, AlertLevel, AlertSource
 
 
-class CoreFilesArePresentAlertClass(AlertClass):
-    category = AlertCategory.SYSTEM
-    level = AlertLevel.WARNING
-    title = "Core Files Found in System Dataset"
-    text = ("Core files for the following executables were found: %(corefiles)s. Please create a ticket at "
-            "https://jira.ixsystems.com/ and attach the relevant core files along with a system debug. "
-            "Once the core files have been archived and attached to the ticket, they may be removed "
-            "by running the following command in shell: 'rm /var/db/system/cores/*'.")
+@dataclass(kw_only=True)
+class CoreFilesArePresentAlert(AlertClass):
+    config = AlertClassConfig(
+        category=AlertCategory.SYSTEM,
+        level=AlertLevel.WARNING,
+        title="Core Files Detected",
+        text=(
+            "Core files for executables have been found in /var/db/system/cores/."
+            "Please open the shell, copy any core files present in /var/db/system/cores/ "
+            "and then generate a system debug. Next, create a ticket at https://ixsystems.atlassian.net/ "
+            "and attach the core files and debug. After creating the ticket, the core files can be removed "
+            "from the system by opening shell and entering 'rm /var/db/system/cores/*'."
+        ),
+        applies_to=NOT_APPLIANCE_HARDWARE,
+    )
 
-    products = ("SCALE",)
+    corefiles: str
 
 
 class CoreFilesArePresentAlertSource(AlertSource):
-    products = ("SCALE",)
-    ignore_executables = (
-        # Crashes at https://github.com/smartmontools/smartmontools/blob/6cc32bf/smartmontools/knowndrives.cpp#L98
-        # when trying to run `-d sat` against certain drives. This is clearly a memory corruption issue since
-        # allocation/freeing in that class is pretty straightforward. Things like that are very hard to debug.
-        # If it crashes with `-d sat` (which is a first try) we simply run it normally so these segfaults are not
-        # a big deal.
-        "/usr/sbin/smartctl",
-    )
-    ignore_units = (
-        # Unit: "containerd.service"/"docker.service" is related to k3s.
-        # users are free to run whatever they would like to in containers
-        # and we don't officially support all the apps themselves so we
-        # ignore those core dumps
-        "containerd.service",
-        "docker.service",
-        # Unit: "syslog-ng.service" has been core dumping for, literally, years
-        # on freeBSD and now also on linux. The fix is non-trivial and it seems
-        # to be very specific to how we implemented our system dataset. Anyways,
-        # the crash isn't harmful so we ignore it.
-        "syslog-ng.service",
-    )
+    applies_to = NOT_APPLIANCE_HARDWARE
 
-    async def check(self):
+    async def should_alert(self, core: dict[str, Any]) -> bool:
+        if core["corefile"] != "present" or not core["unit"]:
+            # no core file on disk, no investigation
+            # not associated to a unit? probably impossible but better safe than sorry
+            return False
+
+        return bool(core["unit"].startswith((
+            # NFS related service(s)
+            "nfs-blkmap.service",
+            "nfs-idmapd.service",
+            "nfs-mountd.service",
+            "nfsdcld.service",
+            "rpc-statd.service",
+            "rpcbind.service",
+            # SMB related service(s)
+            "smbd.service",
+            "winbind.service",
+            "nmbd.service",
+            "wsdd.service",
+            # SCST related service(s)
+            "scst.service",
+            # ZFS related (userspace) service(s)
+            "zfs-zed.service",
+        )))
+
+    async def check(self) -> Alert[CoreFilesArePresentAlert] | None:
         corefiles = []
-        for coredump in filter(lambda c: c["corefile"] == "present", await self.middleware.call("system.coredumps")):
-            if coredump["exe"] in self.ignore_executables:
-                continue
-            if coredump["unit"] in self.ignore_units:
-                continue
-
-            corefiles.append(f"{coredump['exe']} ({coredump['time']})")
+        for coredump in await self.middleware.call("system.coredumps"):
+            if await self.should_alert(coredump):
+                corefiles.append(f"{coredump['exe']} ({coredump['time']})")
 
         if corefiles:
-            return Alert(CoreFilesArePresentAlertClass, {"corefiles": ', '.join(corefiles)})
+            return Alert(CoreFilesArePresentAlert(corefiles=', '.join(corefiles)))
+        return None

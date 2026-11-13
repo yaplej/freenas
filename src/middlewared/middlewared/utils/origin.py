@@ -1,0 +1,281 @@
+from __future__ import annotations
+
+from dataclasses import dataclass
+from ipaddress import ip_address
+import socket
+from socket import AF_INET, AF_INET6, AF_UNIX, SO_PEERCRED, SOL_SOCKET
+from struct import calcsize, unpack
+from typing import TYPE_CHECKING
+
+from aiohttp.web import Request
+from truenas_pynetif.diag import get_inet_diag, netlink_diag
+
+from . import MIDDLEWARE_NGINX_SOCK
+from .auth import AUID_UNSET, get_login_uid
+
+if TYPE_CHECKING:
+    from middlewared.api.base.server.app import App
+
+
+__all__ = ('ConnectionOrigin', 'is_external_call')
+
+HA_HEARTBEAT_IPS = ('169.254.10.1', '169.254.10.2')
+UIDS_TO_CHECK = (33, 0)
+
+
+@dataclass(slots=True, frozen=True, kw_only=True)
+class ConnectionOrigin:
+    family: socket.AddressFamily
+    """The address family associated to the API connection"""
+    loc_addr: str | None = None
+    """If `family` is not of type AF_UNIX, this represents
+    the local IP address associated to the TCP/IP connection"""
+    loc_port: int | None = None
+    """If `family` is not of type AF_UNIX, this represents
+    the local port associated to the TCP/IP connection"""
+    rem_addr: str | None = None
+    """If `family` is not of type AF_UNIX, this represents
+    the remote IP address associated to the TCP/IP connection"""
+    rem_port: int | None = None
+    """If `family` is not of type AF_UNIX, this represents
+    the remote port associated to the TCP/IP connection"""
+    pid: int | None = None
+    """If `family` is of type AF_UNIX, this represents
+    the process id associated to the unix datagram connection"""
+    uid: int | None = None
+    """If `family` is of type AF_UNIX, this represents
+    the user id associated to the unix datagram connection"""
+    gid: int | None = None
+    """If `family` is of type AF_UNIX, this represents
+    the group id associated to the unix datagram connection"""
+    loginuid: int | None = None
+    """If `family` is of type AF_UNIX, this represents
+    the login uid associated to the unix datagram connection.
+    The login uid can be used to determine whether the connection was
+    created by an interactive shell session"""
+    ssl: bool = False
+    """Nginx reports that https was used for connection"""
+
+    @classmethod
+    def create(cls, request: Request) -> ConnectionOrigin | None:
+        try:
+            transport = request.transport
+            if transport is None:
+                return None
+
+            sock = transport.get_extra_info("socket")
+            if sock.family == AF_UNIX:
+                if sock.getsockname() == MIDDLEWARE_NGINX_SOCK:
+                    # nginx reverse-proxies external API/UI traffic over a
+                    # private unix socket, but these connections represent
+                    # remote TCP/IP clients. Classify them as TCP/IP origins
+                    # from the reverse-proxy X-Real-Remote-* headers so that
+                    # all downstream access control treats them exactly like
+                    # direct nginx TCP connections (UI allowlist enforced, no
+                    # local/root auto-authentication, secure-transport, etc.).
+                    return get_tcp_ip_info(sock, request)
+
+                pid, uid, gid = unpack("3i", sock.getsockopt(SOL_SOCKET, SO_PEERCRED, calcsize("3i")))
+                login_uid = get_login_uid(pid)
+                return cls(
+                    family=sock.family,
+                    pid=pid,
+                    uid=uid,
+                    loginuid=login_uid,
+                    gid=gid,
+                )
+            elif sock.family in (AF_INET, AF_INET6):
+                return get_tcp_ip_info(sock, request)
+
+            return None
+        except AttributeError:
+            # request.transport can be None by the time this is
+            # called on HA systems because remote node could
+            # have been rebooted
+            return None
+
+    def __str__(self) -> str:
+        if self.is_unix_family:
+            return f"UNIX socket (pid={self.pid} uid={self.uid} gid={self.gid})"
+        elif self.family == AF_INET:
+            return f"{self.rem_addr}:{self.rem_port}"
+        elif self.family == AF_INET6:
+            return f"[{self.rem_addr}]:{self.rem_port}"
+        return ""
+
+    def match(self, origin: "ConnectionOrigin") -> bool:
+        if self.is_unix_family:
+            return self.uid == origin.uid and self.gid == origin.gid
+        else:
+            return self.rem_addr == origin.rem_addr
+
+    @property
+    def repr(self) -> str:
+        return f"pid:{self.pid}" if self.is_unix_family else str(self.rem_addr)
+
+    @property
+    def session_is_interactive(self) -> bool:
+        """ This is used to indicate whether session is internal
+        for purposes of STIG checks. This property is only set for
+        AF_UNIX connections and indicates whether its an interactive """
+        if self.loginuid is None:
+            # Not AF_UNIX connection. Always apply restrictions
+            # for interactive sessions.
+            return True
+
+        # self.loginuid may be set to AUID_FAULTED if for some reason
+        # we encountered a major issue in retrieving the loginuid.
+        # Since this value is used to determine whether to allow
+        # enhanced privileges in STIG mode we treat AUID_FAULTED
+        # as being an interactive session with less privileges afforded
+        # it.
+        return self.loginuid != AUID_UNSET
+
+    @property
+    def is_tcp_ip_family(self) -> bool:
+        return self.family in (AF_INET, AF_INET6)
+
+    @property
+    def is_unix_family(self) -> bool:
+        return self.family == AF_UNIX
+
+    @property
+    def is_ha_connection(self) -> bool:
+        return (
+            self.family in (AF_INET, AF_INET6) and
+            self.rem_port is not None and self.rem_port <= 1024 and
+            self.rem_addr in HA_HEARTBEAT_IPS and
+            # The peer picks its own source address and port, so also require
+            # that the connection terminated on our heartbeat listener. That
+            # listener is only bound on HA hardware and nginx never proxies to
+            # it, so nothing arriving on a UI address can qualify.
+            self.loc_port == 6000 and self.loc_addr in HA_HEARTBEAT_IPS and
+            # and that it came from the other controller, not from this one.
+            self.loc_addr != self.rem_addr
+        )
+
+    @property
+    def secure_transport(self) -> bool:
+        """Indicates whether we should treat the connection as having
+        secure transport for purposes of invalidation of API keys.
+        Secure in this case means AF_UNIX, loopback connection, or
+        transport is encrypted."""
+
+        if self.ssl or self.is_unix_family or self.is_ha_connection:
+            return True
+
+        if self.is_tcp_ip_family:
+            try:
+                assert self.rem_addr is not None
+                return ip_address(self.rem_addr).is_loopback
+            except Exception:
+                pass
+
+        # By default assume that transport is insecure
+        return False
+
+    def ppids(self) -> set[int]:
+        if self.pid is None:
+            return set()
+
+        pid: int | None = self.pid
+        ppids: set[int] = set()
+        while pid is not None:
+            try:
+                with open(f"/proc/{pid}/status") as f:
+                    found_ppid: int | None = None
+                    for line in f:
+                        if line.startswith("PPid:"):
+                            try:
+                                found_ppid = int(line.split(":")[1].strip())
+                            except ValueError:
+                                pass
+                            break
+                    pid = found_ppid
+            except FileNotFoundError:
+                break
+
+            if pid is not None:
+                if pid <= 1:
+                    break
+
+                ppids.add(pid)
+
+        return ppids
+
+
+def get_tcp_ip_info(
+    sock: socket.socket,
+    request: Request,
+) -> ConnectionOrigin | None:
+    # All API connections are terminated by nginx reverse
+    # proxy so the remote address is always 127.0.0.1. The
+    # only exceptions to this are:
+    #   1. Someone connects directly to 127.0.0.1 via a local
+    #       shell session
+    #   2. Someone connects directly to heartbeat IP port 6000
+    #       via a local shell session on a TrueNAS HA system
+    #   3. We connect directly to the other controller on an HA
+    #       machine via heartbeat IP for intra-node communication.
+    #       (this is done by us)
+    try:
+        # These headers are set by nginx or a user trying to do
+        # (potentially) nefarious things. If these are set then
+        # we need to check if the UID of the socket is owned by
+        # 0 (root) or 33 (www-data (nginx forks workers))
+        ra = request.headers["X-Real-Remote-Addr"]
+        rp = int(request.headers["X-Real-Remote-Port"])
+        family = socket.AF_INET6 if ":" in ra else socket.AF_INET
+        ssl = request.headers.get("X-Https", "") == "on"
+        check_uids = True
+    except (KeyError, ValueError):
+        if sock.family not in (AF_INET, AF_INET6):
+            # No reverse-proxy headers on a non-TCP/IP socket (e.g. the nginx
+            # unix socket reached without the expected headers). We cannot
+            # determine a meaningful origin, so reject the connection rather
+            # than attempt to unpack a unix peer name.
+            return None
+        ra, rp = sock.getpeername()
+        family = sock.family
+        ssl = False
+        check_uids = False
+
+    with netlink_diag() as ds:
+        for info in get_inet_diag(ds, family=family):
+            if info.dst == ra and info.dport == rp:
+                if check_uids and info.uid not in UIDS_TO_CHECK:
+                    continue
+                return ConnectionOrigin(
+                    family=family,
+                    loc_addr=info.src,
+                    loc_port=info.sport,
+                    rem_addr=info.dst,
+                    rem_port=info.dport,
+                    ssl=ssl,
+                )
+
+    return None
+
+
+def is_external_call(app: App | None) -> bool:
+    """
+    Determine if this is an external API call that should be tracked.
+    External calls are those which the system is not generating internally i.e self.middleware.call().
+
+    Note: We intentionally track midclt calls (Unix socket) as they can be
+    initiated by users and we want to track their usage patterns (this only applies to midclt calls
+    where user has logged in to a shell and not internal calls made by scripts).
+
+    Returns True for external calls, False for internal calls.
+    """
+    if app is None or app.origin is None:
+        # No origin info, assume internal
+        return False
+
+    origin = app.origin
+
+    # HA connections between nodes are internal
+    if origin.is_ha_connection:
+        return False
+
+    return origin.session_is_interactive

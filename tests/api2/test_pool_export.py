@@ -1,49 +1,46 @@
-#!/usr/bin/env python3
 import pytest
-from pytest_dependency import depends
 
-from middlewared.client import ClientException
-from middlewared.test.integration.utils import call, mock
+from truenas_api_client import ClientException
 
-import os
-import sys
-apifolder = os.getcwd()
-sys.path.append(apifolder)
-from functions import PUT
-from auto_config import pool_name, ha, dev_test
-# comment pytestmark for development testing with --dev-test
-pytestmark = pytest.mark.skipif(dev_test, reason='Skipping for test development testing')
+from middlewared.test.integration.assets.pool import another_pool, pool as pool_name
+from middlewared.test.integration.utils import call, disable_failover, mock
 
 
-def test_systemdataset_migrate_error(request):
-    depends(request, ["pool_04"], scope="session")
+def test_systemdataset_migrate_error():
     """
-    On HA this test will fail with the error below if failover is enable:
+    On HA this test will fail with the error below if failover is enabled:
     [ENOTSUP] Disable failover before exporting last pool on system.
     """
+    with disable_failover():
+        pool = call("pool.query", [["name", "=", pool_name]], {"get": True})
 
-    # Disable Failover
-    if ha is True:
-        results = PUT('/failover/', {"disabled": True, "master": True})
-        assert results.status_code == 200, results.text
+        with mock("systemdataset.update", """\
+            from middlewared.service import job, CallError
 
-    pool = call("pool.query", [["name", "=", pool_name]], {"get": True})
+            @job()
+            def mock(self, job, *args):
+                raise CallError("Test error")
+        """):
+            with pytest.raises(ClientException) as e:
+                call("pool.export", pool["id"], job=True)
 
-    with mock("systemdataset.update", """\
-        from middlewared.service import job, CallError
+            assert e.value.error == (
+                "[EFAULT] This pool contains system dataset, but its reconfiguration failed: [EFAULT] Test error"
+            )
 
-        @job()
-        def mock(self, job, *args):
-            raise CallError("Test error")
-    """):
-        with pytest.raises(ClientException) as e:
-            call("pool.export", pool["id"], job=True)
 
-        assert e.value.error == (
-            "[EFAULT] This pool contains system dataset, but its reconfiguration failed: [EFAULT] Test error"
-        )
+def test_destroy_offline_disks():
+    with another_pool(topology=(2, lambda disks: {
+        "data": [
+            {"type": "MIRROR", "disks": disks[0:2]},
+        ],
+    })) as pool:
+        disk = pool["topology"]["data"][0]["children"][0]
 
-    # Enable back Failover.
-    if ha is True:
-        results = PUT('/failover/', {"disabled": False, "master": True})
-        assert results.status_code == 200, results.text
+        call("pool.offline", pool["id"], {"label": disk["guid"]})
+
+        call("pool.export", pool["id"], {"destroy": True}, job=True)
+
+        unused = [unused for unused in call("disk.get_unused") if unused["name"] == disk["disk"]][0]
+
+        assert unused["exported_zpool"] is None

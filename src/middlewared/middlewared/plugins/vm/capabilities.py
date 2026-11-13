@@ -1,47 +1,47 @@
-from collections import defaultdict
-from xml.etree import ElementTree as etree
+import functools
+import re
+import subprocess
 
-from middlewared.schema import accepts, Dict, returns
-from middlewared.service import private, Service
+from middlewared.service import ServiceContext
 
-from .connection import LibvirtConnectionMixin
+from .constants import VMGuestArch
+
+RE_MACHINE_TYPE_CHOICES = re.compile(r'^\s*(?!none\s)(\S+)(?=\s{2,})', flags=re.M)
 
 
-class VMService(Service, LibvirtConnectionMixin):
+def get_capabilities(context: ServiceContext) -> dict[str, list[str]]:
+    supported_archs: dict[str, list[str]] = {}
 
-    CAPABILITIES = None
+    cp = subprocess.run(['/usr/bin/qemu-system-x86_64', '-machine', 'help'], capture_output=True, text=True)
+    if cp.returncode:
+        context.logger.warning(f'Failed to query machine types for {VMGuestArch.X86_64}: {cp.stderr}')
+    else:
+        if machine_types := RE_MACHINE_TYPE_CHOICES.findall(cp.stdout):
+            supported_archs[VMGuestArch.X86_64] = machine_types
 
-    @private
-    def update_capabilities_cache(self):
-        self._check_setup_connection()
-        xml = etree.fromstring(self.LIBVIRT_CONNECTION.getCapabilities())
-        supported_archs = defaultdict(list)
-        for guest in xml.findall('guest'):
-            arch = guest.find('arch')
-            if not arch or not arch.get('name'):
-                continue
-            arch_name = arch.get('name')
+    cp = subprocess.run(['/usr/bin/qemu-system-i386', '-machine', 'help'], capture_output=True, text=True)
+    if cp.returncode:
+        context.logger.warning(f'Failed to query machine types for {VMGuestArch.I686}: {cp.stderr}')
+    else:
+        if machine_types := RE_MACHINE_TYPE_CHOICES.findall(cp.stdout):
+            supported_archs[VMGuestArch.I686] = machine_types
 
-            for machine_type in filter(lambda m: m.text, arch.findall('machine')):
-                supported_archs[arch_name].append(machine_type.text)
+    # qemu-system-aarch64 reports ~100 machine types: virt*/sbsa-ref plus many
+    # real boards (raspi*, vexpress*, sabrelite, xlnx-*) and microcontroller
+    # platforms (cortex-m*, mps2/mps3-an*, microbit, netduino*). We surface
+    # everything for parity with the x86 path -- frontend can group/filter if
+    # the dropdown gets unwieldy. Revisit if real users are picking unbootable
+    # microcontroller machines and filing bugs.
+    cp = subprocess.run(['/usr/bin/qemu-system-aarch64', '-machine', 'help'], capture_output=True, text=True)
+    if cp.returncode:
+        context.logger.warning(f'Failed to query machine types for {VMGuestArch.AARCH64}: {cp.stderr}')
+    else:
+        if machine_types := RE_MACHINE_TYPE_CHOICES.findall(cp.stdout):
+            supported_archs[VMGuestArch.AARCH64] = machine_types
 
-        self.CAPABILITIES = supported_archs
+    return supported_archs
 
-    @accepts()
-    @returns(Dict(
-        additional_attrs=True,
-        example={
-            'x86_64': ['pc-i440fx-5.2', 'pc-q35-5.2', 'pc-i440fx-2.7'],
-            'i686': ['pc-i440fx-3.0', 'xenfv'],
-        }
-    ))
-    async def guest_architecture_and_machine_choices(self):
-        """
-        Retrieve choices for supported guest architecture types and machine choices.
 
-        Keys in the response would be supported guest architecture(s) on the host and their respective values would
-        be supported machine type(s) for the specific architecture on the host.
-        """
-        if not self.CAPABILITIES:
-            await self.middleware.call('vm.update_capabilities_cache')
-        return self.CAPABILITIES
+@functools.cache
+def guest_architecture_and_machine_choices(context: ServiceContext) -> dict[str, list[str]]:
+    return get_capabilities(context)

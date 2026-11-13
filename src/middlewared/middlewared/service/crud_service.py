@@ -1,0 +1,441 @@
+from __future__ import annotations
+
+import asyncio
+import errno
+import functools
+import sys
+from typing import TYPE_CHECKING, Annotated, Any, overload
+
+from pydantic import Field, create_model
+
+from middlewared.api import API_LOADING_FORBIDDEN, api_method
+from middlewared.api.base.model import (
+    BaseModel,
+    added_event_model,
+    changed_event_model,
+    query_result,
+    query_result_item,
+    removed_event_model,
+)
+from middlewared.service_exception import CallError, InstanceNotFound
+from middlewared.utils.filter_list import filter_list, select_with_query_fields
+from middlewared.utils.type import copy_function_metadata
+
+from .base import ServiceBase
+from .decorators import pass_app, private
+from .full_admin import check_full_admin_payload
+from .service import Service
+from .service_mixin import ServiceChangeMixin
+
+if not API_LOADING_FORBIDDEN:
+    from middlewared.api.current import QueryArgs, QueryOptions
+
+if TYPE_CHECKING:
+    from middlewared.api.current import QueryOptionsCount, QueryOptionsGet
+
+
+# Stripped from the datastore query and re-applied by filter_list on the extended result.
+POST_EXTEND_OPTS = ('count', 'get', 'limit', 'offset', 'select', 'order_by')
+
+
+def get_instance_args(entry: type[BaseModel], primary_key: str = "id") -> type[BaseModel]:
+    return create_model(
+        entry.__name__.removesuffix("Entry") + "GetInstanceArgs",
+        __base__=(BaseModel,),
+        __module__=entry.__module__,
+        id=Annotated[entry.model_fields[primary_key].annotation, Field()],
+        options=Annotated[QueryOptions, Field(default_factory=QueryOptions)],
+    )
+
+
+def get_instance_result(entry: type[BaseModel]) -> type[BaseModel]:
+    return create_model(
+        entry.__name__.removesuffix("Entry") + "GetInstanceResult",
+        __base__=(BaseModel,),
+        __module__=entry.__module__,
+        result=Annotated[entry, Field()],
+    )
+
+
+class CRUDServiceMetabase(ServiceBase):
+    def __new__(cls, name, bases, attrs):
+        klass = super().__new__(cls, name, bases, attrs)
+        if any(
+            name == c_name and len(bases) == len(c_bases) and all(b.__name__ == c_b for b, c_b in zip(bases, c_bases))
+            for c_name, c_bases in (
+                ('CRUDService', ('ServiceChangeMixin', 'Service', 'Generic')),
+                ('GenericCRUDService', ('CRUDService', 'Generic')),
+                ('SharingTaskService', ('CRUDService', 'Generic')),
+                ('SharingService', ('SharingTaskService', 'Generic')),
+                ('TaskPathService', ('SharingTaskService', 'Generic')),
+                ('GenericSharingTaskService', ('GenericCRUDService', 'Generic')),
+                ('GenericSharingService', ('GenericSharingTaskService', 'Generic')),
+                ('GenericTaskPathService', ('GenericSharingTaskService', 'Generic')),
+            )
+        ):
+            return klass
+
+        config = klass._config
+        entry = config.entry
+        private = config.private
+        cli_private = config.cli_private
+
+        if not private:
+            if not config.role_prefix:
+                raise ValueError(f'{config.namespace}: public CRUDService must have role_prefix defined')
+            if not config.entry:
+                raise ValueError(f'{config.namespace}: public CRUDService must have entry defined')
+
+        if entry is not None:
+            query_result_model = query_result(entry)
+            is_generic_crud = any(
+                base.__name__ == 'GenericCRUDService' for base in klass.__mro__[1:]
+            )
+            use_check_annotations = is_generic_crud
+
+            # GenericCRUDService.query/get_instance use the type-vars `E` and `PK` in
+            # their string annotations.  Inject the concrete types so
+            # that check_method_annotations can eval() them.  A service may define its own
+            # `query` (e.g. to document it), which leaves `get_instance` inherited from a
+            # different module, so every module we are about to decorate out of needs them.
+            if is_generic_crud:
+                pk = entry.model_fields[config.datastore_primary_key].annotation
+                for method in (klass.query, klass.get_instance):
+                    mod = sys.modules[method.__module__].__dict__
+                    mod['E'] = entry
+                    mod['PK'] = pk
+
+            if (
+                any(klass.query == getattr(parent, 'query', None) for parent in klass.__mro__[1:]) or
+                not hasattr(klass.query, 'new_style_accepts')
+            ):
+                # No need to inject api method if filterable has been explicitly specified
+                klass.query = api_method(
+                    QueryArgs, query_result_model, private=private, cli_private=cli_private,
+                    check_annotations=use_check_annotations, pass_app=config.pass_app_to_query,
+                )(klass.query)
+
+            get_instance_args_model = get_instance_args(entry, primary_key=config.datastore_primary_key)
+            get_instance_result_model = get_instance_result(entry)
+            klass.get_instance = api_method(
+                get_instance_args_model,
+                get_instance_result_model,
+                private=private,
+                cli_private=cli_private,
+                check_annotations=use_check_annotations,
+            )(klass.get_instance)
+
+            # Models must be registered with their factories for backwards compatibility.
+            klass._register_models = [
+                (query_result_model, query_result, entry.__name__),
+                (query_result_model.__annotations__["result"].__args__[1],
+                 query_result_item, entry.__name__),
+                (get_instance_args_model, get_instance_args, entry.__name__),
+                (get_instance_result_model, get_instance_result, entry.__name__),
+            ] + klass._register_models
+
+        return klass
+
+
+class CRUDService[E](ServiceChangeMixin, Service, metaclass=CRUDServiceMetabase):
+    """
+    CRUD service abstract class
+
+    Meant for services in that a set of entries can be queried, new entry
+    create, updated and/or deleted.
+
+    CRUD stands for Create Retrieve Update Delete.
+    """
+
+    def __init__(self, middleware) -> None:
+        super().__init__(middleware)
+        if self._config.event_register and self._config.entry:
+            if self._config.role_prefix:
+                roles = [f'{self._config.role_prefix}_READ']
+            else:
+                roles = ['READONLY_ADMIN']
+
+            self.middleware.event_register(
+                f'{self._config.namespace}.query',
+                f'Sent on {self._config.namespace} changes.',
+                private=self._config.private,
+                models={
+                    'ADDED': added_event_model(self._config.entry),
+                    'CHANGED': changed_event_model(self._config.entry),
+                    'REMOVED': removed_event_model(self._config.entry),
+                },
+                roles=roles,
+            )
+
+    @private
+    async def get_options(self, options):
+        options = options or {}
+        options['extend'] = self._config.datastore_extend
+        options['extend_context'] = self._config.datastore_extend_context
+        options['extend_fk'] = self._config.datastore_extend_fk
+        options['prefix'] = self._config.datastore_prefix
+        options.setdefault('force_sql_filters', False)
+        options.setdefault('count', False)
+        options.setdefault('get', False)
+        return options
+
+    async def query(self, filters=None, options=None) -> list[E] | E | int:
+        if not self._config.datastore:
+            raise NotImplementedError(
+                f'{self._config.namespace}.query must be implemented or a '
+                '`datastore` Config attribute provided.'
+            )
+
+        if not filters:
+            filters = []
+
+        options = await self.get_options(options)
+        # Surface `select` to extend_context so services can skip expensive per-row work
+        # (e.g. lock-state lookups) when the relevant field isn't being selected.
+        extra = {**(options.get('extra') or {}), 'select': select_with_query_fields(filters, options)}
+
+        # In case we are extending which may transform the result in numerous ways
+        # we can only filter the final result. Exception is when forced to use sql
+        # for filters for performance reasons.
+        if not options['force_sql_filters'] and options['extend']:
+            datastore_options = options.copy()
+            for option in POST_EXTEND_OPTS:
+                datastore_options.pop(option, None)
+            datastore_options['extra'] = extra
+            result = await self.middleware.call(
+                'datastore.query', self._config.datastore, [], datastore_options
+            )
+            result = await self.middleware.run_in_thread(
+                filter_list, result, filters, options
+            )
+        else:
+            result = await self.middleware.call(
+                'datastore.query', self._config.datastore, filters, {**options, 'extra': extra},
+            )
+
+        if self._config.generic:
+            return self._handle_generic_query_result(result, options['count'], options['get'])
+
+        return result
+
+    def _handle_generic_query_result[E](self, result: Any, count: bool, get: bool) -> list[E] | E | int:
+        if count:
+            return result
+
+        if get:
+            return self._config.entry.__query_result_item__(**result)
+
+        return [self._config.entry.__query_result_item__(**item) for item in result]
+
+    @pass_app(message_id=True)
+    async def create(self, app, audit_callback, message_id, data):
+        await check_full_admin_payload(app, self.do_create, data, None)
+        return await self.middleware._call(
+            f'{self._config.namespace}.create', self, await self._get_crud_wrapper_func(
+                self.do_create, 'create', 'ADDED',
+            ), [data], app=app, audit_callback=audit_callback, message_id=message_id,
+        )
+
+    create.audit_callback = True
+
+    @pass_app(message_id=True)
+    async def update(self, app, audit_callback, message_id, id_, data):
+        await check_full_admin_payload(app, self.do_update, data, functools.partial(self.get_instance, id_))
+        return await self.middleware._call(
+            f'{self._config.namespace}.update', self, await self._get_crud_wrapper_func(
+                self.do_update, 'update', 'CHANGED', id_,
+            ), [id_, data], app=app, audit_callback=audit_callback, message_id=message_id,
+        )
+
+    update.audit_callback = True
+
+    @pass_app(message_id=True)
+    async def delete(self, app, audit_callback, message_id, id_, *args):
+        return await self.middleware._call(
+            f'{self._config.namespace}.delete', self, await self._get_crud_wrapper_func(
+                self.do_delete, 'delete', 'REMOVED', id_,
+            ), [id_] + list(args), app=app, audit_callback=audit_callback, message_id=message_id,
+        )
+
+    delete.audit_callback = True
+
+    async def _get_crud_wrapper_func(self, func, action, event_type, oid=None):
+        def send_event(rv):
+            if isinstance(rv, BaseModel):
+                rv = rv.model_dump()
+            if self._config.event_send and (action == 'delete' or isinstance(rv, dict) and 'id' in rv):
+                kwargs = {'id': oid or rv['id']}
+                if isinstance(rv, dict):
+                    kwargs['fields'] = rv
+                self.middleware.send_event(f'{self._config.namespace}.query', event_type, **kwargs)
+
+        if asyncio.iscoroutinefunction(func):
+            async def nf(*args, **kwargs):
+                rv = await func(*args, **kwargs)
+                await self.middleware.call_hook(f'{self._config.namespace}.post_{action}', rv)
+                send_event(rv)
+                return rv
+        else:
+            def nf(*args, **kwargs):
+                rv = func(*args, **kwargs)
+                self.middleware.call_hook_sync(f'{self._config.namespace}.post_{action}', rv)
+                send_event(rv)
+                return rv
+
+        copy_function_metadata(func, nf)
+        return nf
+
+    def _get_instance_options(self, options):
+        options = options or {}
+        if self._config.datastore:
+            # Without this an extended query extends every row before filtering on the primary key.
+            # No extend_context reads across rows, so extending only the matching row gives the same entry.
+            options = {**options, 'force_sql_filters': True}
+        return options
+
+    async def get_instance(self, id_, options=None) -> E:
+        """
+        Returns instance matching `id`. If `id` is not found, Validation error is raised.
+
+        Please see `query` method documentation for `options`.
+        """
+        instance = await self.middleware.call(
+            f'{self._config.namespace}.query',
+            [[self._config.datastore_primary_key, '=', id_]],
+            self._get_instance_options(options),
+        )
+        if not instance:
+            raise InstanceNotFound(f'{self._config.verbose_name} {id_} does not exist')
+
+        return instance[0]
+
+    @private
+    def get_instance__sync(self, id_, options=None) -> E:
+        """
+        Synchronous implementation of `get_instance`.
+        """
+        instance = self.middleware.call_sync(
+            f'{self._config.namespace}.query',
+            [[self._config.datastore_primary_key, '=', id_]],
+            self._get_instance_options(options),
+        )
+        if not instance:
+            raise InstanceNotFound(f'{self._config.verbose_name} {id_} does not exist')
+
+        return instance[0]
+
+    async def _ensure_unique(self, verrors, schema_name, field_name, value, id_=None, query_field_name=None):
+        if query_field_name is None:
+            query_field_name = field_name
+        f = [(query_field_name, '=', value)]
+        if id_ is not None:
+            f.append(('id', '!=', id_))
+        instance = await self.middleware.call(f'{self._config.namespace}.query', f)
+        if instance:
+            verrors.add(
+                '.'.join(filter(None, [schema_name, field_name])),
+                f'Object with this {field_name} already exists'
+            )
+
+    @private
+    async def check_dependencies(self, id_, ignored=None):
+        """
+        Raises EBUSY CallError if some datastores/services (except for `ignored`) reference object specified by id.
+        """
+        dependencies = await self.get_dependencies(id_, ignored)
+        if dependencies:
+            dep_err = 'This object is being used by following service(s):\n'
+            for index, dependency in enumerate(dependencies.values()):
+                key = 'service' if dependency['service'] else 'datastore'
+                dep_err += f'{index + 1}) {dependency[key]!r} {key.capitalize()}\n'
+
+            raise CallError(dep_err, errno.EBUSY, {'dependencies': list(dependencies.values())})
+
+    @private
+    async def get_dependencies(self, id_, ignored=None):
+        ignored = ignored or set()
+
+        services = {
+            service['config'].get('datastore'): (name, service)
+            for name, service in (await self.middleware.call('core.get_services')).items()
+            if service['config'].get('datastore')
+        }
+
+        dependencies = {}
+        for datastore, fk in await self.middleware.call('datastore.get_backrefs', self._config.datastore):
+            if datastore in ignored:
+                continue
+
+            if datastore in services:
+                service = {
+                    'name': services[datastore][0],
+                    'type': services[datastore][1]['type'],
+                }
+
+                if service['name'] in ignored:
+                    continue
+            else:
+                service = None
+
+            objects = await self.middleware.call('datastore.query', datastore, [(fk, '=', id_)])
+            if objects:
+                data = {
+                    'objects': objects,
+                }
+                if service is not None:
+                    query_col = fk
+                    prefix = services[datastore][1]['config'].get('datastore_prefix')
+                    if prefix:
+                        if query_col.startswith(prefix):
+                            query_col = query_col[len(prefix):]
+
+                    if service['type'] == 'config':
+                        data = {
+                            'key': query_col,
+                        }
+
+                    if service['type'] == 'crud':
+                        data = {
+                            'objects': await self.middleware.call(
+                                f'{service["name"]}.query', [('id', 'in', [object_['id'] for object_ in objects])],
+                            ),
+                        }
+
+                dependencies[datastore] = dict({
+                    'datastore': datastore,
+                    'service': service['name'] if service else None,
+                }, **data)
+
+        return dependencies
+
+
+class GenericCRUDService[E, PK = int](CRUDService[E]):
+    """
+    CRUDService subclass for generic services that use Pydantic models (QueryOptions)
+    instead of raw dicts. Provides properly typed query/get_instance signatures.
+
+    Services with ``generic = True`` should inherit from this class instead of
+    ``CRUDService`` directly. Set ``_svc_part`` in ``__init__`` to a
+    ``CRUDServicePart`` instance to delegate query/get_instance automatically.
+    """
+
+    @overload
+    async def query(self, filters: list[Any], options: QueryOptionsCount) -> int: ...  # type: ignore[overload-overlap]
+
+    @overload
+    async def query(self, filters: list[Any], options: QueryOptionsGet) -> E: ...  # type: ignore[overload-overlap]
+
+    @overload
+    async def query(
+        self, filters: list[Any] | None = None, options: QueryOptions | None = None,
+    ) -> list[E]: ...
+
+    async def query(
+        self, filters: list[Any] | None = None, options: QueryOptions | None = None,
+    ) -> list[E] | E | int:
+        return await self._svc_part.query(filters or [], options or QueryOptions())
+
+    async def get_instance(
+        self, id_: PK, options: QueryOptions | None = None,
+    ) -> E:
+        return await self._svc_part.get_instance(id_, extra=(options or QueryOptions()).extra)

@@ -1,166 +1,207 @@
-from middlewared.service import job, private, Service
+# Copyright (c) - iXsystems Inc. dba TrueNAS
+#
+# Licensed under the terms of the TrueNAS Enterprise License Agreement
+# See the file LICENSE.IX for complete terms and conditions
 
-from .connection import KMIPServerMixin
+from __future__ import annotations
+
+from typing import TYPE_CHECKING, Any
+
+from middlewared.alert.source.kmip import KMIPZFSDatasetsSyncFailureAlert
+from middlewared.api.current import ZFSResourceEncryptionUnlockArgsData, ZFSResourceQuery
+from middlewared.plugins.zfs.encryption import check_key
+
+from .connection import (
+    connection_config,
+    delete_kmip_secret_data,
+    kmip_connection,
+    register_secret_data,
+    retrieve_secret_data,
+    revoke_and_destroy_key,
+    test_connection,
+)
+from .keystore import KMIPKeyStore
+
+if TYPE_CHECKING:
+    from middlewared.job import Job
+    from middlewared.service import ServiceContext
 
 
-class KMIPService(Service, KMIPServerMixin):
+def zfs_keys_pending_sync(context: ServiceContext, store: KMIPKeyStore) -> bool:
+    config = context.call_sync2(context.s.kmip.config)
+    for ds in context.middleware.call_sync('datastore.query', 'storage.encrypteddataset'):
+        if config.enabled and config.manage_zfs_keys and (
+            ds['encryption_key'] or ds['name'] not in store.zfs_keys
+        ):
+            return True
+        elif (not config.enabled or not config.manage_zfs_keys) and ds['kmip_uid']:
+            return True
+    return False
 
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        self.zfs_keys = {}
 
-    @private
-    async def zfs_keys_pending_sync(self):
-        config = await self.middleware.call('kmip.config')
-        for ds in await self.middleware.call('datastore.query', 'storage.encrypteddataset'):
-            if config['enabled'] and config['manage_zfs_keys'] and (
-                ds['encryption_key'] or ds['name'] not in self.zfs_keys
-            ):
-                return True
-            elif any(not config[k] for k in ('enabled', 'manage_zfs_keys')) and ds['kmip_uid']:
-                return True
-        return False
-
-    @private
-    def push_zfs_keys(self, ids=None):
-        datasets = self.middleware.call_sync(
-            'datastore.query', 'storage.encrypteddataset', [['id', 'in', ids]] if ids else []
+def existing_dataset_names(context: ServiceContext, names: list[str]) -> set[str]:
+    if not names:
+        # Empty `paths` would list every root filesystem instead of none.
+        return set()
+    return {
+        i['name'] for i in context.call_sync2(
+            context.s.zfs.resource.list_impl, ZFSResourceQuery(paths=names, properties=None)
         )
-        existing_datasets = {ds['name']: ds for ds in self.middleware.call_sync('pool.dataset.query')}
-        failed = []
-        with self._connection(self.middleware.call_sync('kmip.connection_config')) as conn:
-            for ds in filter(lambda d: d['name'] in existing_datasets, datasets):
-                if not ds['encryption_key']:
-                    # We want to make sure we have the KMIP server's keys and in-memory keys in sync
-                    try:
-                        if ds['name'] in self.zfs_keys and self.middleware.call_sync(
-                            'zfs.dataset.check_key', ds['name'], {'key': self.zfs_keys[ds['name']]}
-                        ):
-                            continue
-                        else:
-                            key = self._retrieve_secret_data(ds['kmip_uid'], conn)
-                    except Exception as e:
-                        self.middleware.logger.debug(f'Failed to retrieve key for {ds["name"]}: {e}')
-                    else:
-                        self.zfs_keys[ds['name']] = key
-                    continue
+    }
 
-                self.zfs_keys[ds['name']] = ds['encryption_key']
-                destroy_successful = False
-                if ds['kmip_uid']:
-                    # This needs to be revoked and destroyed
-                    destroy_successful = self._revoke_and_destroy_key(ds['kmip_uid'], conn, self.middleware.logger)
-                    if not destroy_successful:
-                        self.middleware.logger.debug(f'Failed to destroy key from KMIP Server for {ds["name"]}')
+
+def get_encrypted_datasets(context: ServiceContext, filters: list[Any]) -> list[dict[str, Any]]:
+    ds_in_db: dict[str, Any] = {}
+    for i in context.middleware.call_sync('datastore.query', 'storage.encrypteddataset', filters):
+        ds_in_db[i['name']] = i
+    existing = existing_dataset_names(context, list(ds_in_db))
+    return [ds for name, ds in ds_in_db.items() if name in existing]
+
+
+def prune_zfs_keys(context: ServiceContext, store: KMIPKeyStore) -> None:
+    names = list(store.zfs_keys)
+    for name in set(names) - existing_dataset_names(context, names):
+        store.zfs_keys.pop(name, None)
+
+
+def push_zfs_keys(context: ServiceContext, store: KMIPKeyStore, tls: Any, ids: list[Any] | None = None) -> list[str]:
+    failed = []
+    filters = [] if ids is None else [['id', 'in', ids]]
+    existing_datasets = get_encrypted_datasets(context, filters)
+    with kmip_connection(context, connection_config(context)) as conn:
+        for ds in existing_datasets:
+            if not ds['encryption_key']:
+                # We want to make sure we have the KMIP server's keys and in-memory keys in sync
                 try:
-                    uid = self._register_secret_data(ds['name'], self.zfs_keys[ds['name']], conn)
-                except Exception:
-                    failed.append(ds['name'])
-                    update_data = {'kmip_uid': None} if destroy_successful else {}
+                    if (
+                        ds['name'] in store.zfs_keys
+                        and check_key(tls, ds['name'], key=store.zfs_keys[ds['name']])
+                    ):
+                        continue
+                    else:
+                        key = retrieve_secret_data(ds['kmip_uid'], conn)
+                except Exception as e:
+                    context.middleware.logger.debug(f'Failed to retrieve key for {ds["name"]}: {e}')
                 else:
-                    update_data = {'encryption_key': None, 'kmip_uid': uid}
-                if update_data:
-                    self.middleware.call_sync('datastore.update', 'storage.encrypteddataset', ds['id'], update_data)
-        self.zfs_keys = {k: v for k, v in self.zfs_keys.items() if k in existing_datasets}
-        return failed
+                    store.zfs_keys[ds['name']] = key
+                continue
 
-    @private
-    def pull_zfs_keys(self):
-        datasets = self.middleware.call_sync('datastore.query', 'storage.encrypteddataset', [['kmip_uid', '!=', None]])
-        existing_datasets = {ds['name']: ds for ds in self.middleware.call_sync('pool.dataset.query')}
-        failed = []
-        connection_successful = self.middleware.call_sync('kmip.test_connection')
-        for ds in filter(lambda d: d['name'] in existing_datasets, datasets):
+            store.zfs_keys[ds['name']] = ds['encryption_key']
+            destroy_successful = False
+            if ds['kmip_uid']:
+                # This needs to be revoked and destroyed
+                destroy_successful = revoke_and_destroy_key(ds['kmip_uid'], conn, context.middleware.logger)
+                if not destroy_successful:
+                    context.middleware.logger.debug(f'Failed to destroy key from KMIP Server for {ds["name"]}')
             try:
-                if ds['encryption_key']:
-                    key = ds['encryption_key']
-                elif ds['name'] in self.zfs_keys and self.middleware.call_sync(
-                    'zfs.dataset.check_key', ds['name'], {'key': self.zfs_keys[ds['name']]}
-                ):
-                    key = self.zfs_keys[ds['name']]
-                elif connection_successful:
-                    with self._connection(self.middleware.call_sync('kmip.connection_config')) as conn:
-                        key = self._retrieve_secret_data(ds['kmip_uid'], conn)
-                else:
-                    raise Exception('Failed to sync dataset')
+                uid = register_secret_data(ds['name'], store.zfs_keys[ds['name']], conn)
             except Exception:
                 failed.append(ds['name'])
+                update_data: dict[str, Any] = {'kmip_uid': None} if destroy_successful else {}
             else:
-                update_data = {'encryption_key': key, 'kmip_uid': None}
-                self.middleware.call_sync('datastore.update', 'storage.encrypteddataset', ds['id'], update_data)
-                self.zfs_keys.pop(ds['name'], None)
-                if connection_successful:
-                    self.middleware.call_sync('kmip.delete_kmip_secret_data', ds['kmip_uid'])
-        self.zfs_keys = {k: v for k, v in self.zfs_keys.items() if k in existing_datasets}
-        return failed
+                update_data = {'encryption_key': None, 'kmip_uid': uid}
+            if update_data:
+                context.middleware.call_sync('datastore.update', 'storage.encrypteddataset', ds['id'], update_data)
+    prune_zfs_keys(context, store)
+    return failed
 
-    @private
-    @job(lock=lambda args: f'kmip_sync_zfs_keys_{args}')
-    def sync_zfs_keys(self, job, ids=None):
-        if not self.middleware.call_sync('kmip.zfs_keys_pending_sync'):
-            return
-        config = self.middleware.call_sync('kmip.config')
-        conn_successful = self.middleware.call_sync('kmip.test_connection', None, True)
-        if config['enabled'] and config['manage_zfs_keys']:
-            if conn_successful:
-                failed = self.push_zfs_keys(ids)
+
+def pull_zfs_keys(context: ServiceContext, store: KMIPKeyStore, tls: Any) -> list[str]:
+    existing_datasets = get_encrypted_datasets(context, [['kmip_uid', '!=', None]])
+    failed = []
+    connection_successful = test_connection(context)
+    for ds in existing_datasets:
+        try:
+            if ds['encryption_key']:
+                key = ds['encryption_key']
+            elif (
+                ds['name'] in store.zfs_keys
+                and check_key(tls, ds['name'], key=store.zfs_keys[ds['name']])
+            ):
+                key = store.zfs_keys[ds['name']]
+            elif connection_successful:
+                with kmip_connection(context, connection_config(context)) as conn:
+                    key = retrieve_secret_data(ds['kmip_uid'], conn)
             else:
-                return
+                raise Exception('Failed to sync dataset')
+        except Exception:
+            failed.append(ds['name'])
         else:
-            failed = self.pull_zfs_keys()
-        if failed:
-            self.middleware.call_sync(
-                'alert.oneshot_create', 'KMIPZFSDatasetsSyncFailure', {'datasets': ','.join(failed)}
-            )
-        self.middleware.call_hook_sync('kmip.zfs_keys_sync')
-        return failed
+            update_data = {'encryption_key': key, 'kmip_uid': None}
+            context.middleware.call_sync('datastore.update', 'storage.encrypteddataset', ds['id'], update_data)
+            store.zfs_keys.pop(ds['name'], None)
+            if connection_successful:
+                delete_kmip_secret_data(context, ds['kmip_uid'])
+    prune_zfs_keys(context, store)
+    return failed
 
-    @private
-    async def clear_sync_pending_zfs_keys(self):
-        to_remove = []
-        for ds in await self.middleware.call(
-            'datastore.query', 'storage.encrypteddataset', [['kmip_uid', '!=', None]]
-        ):
-            if ds['encryption_key']:
-                await self.middleware.call('datastore.update', 'storage.encrypteddataset', {'kmip_uid': None})
-            else:
-                to_remove.append(ds['id'])
-        await self.middleware.call('datastore.delete', 'storage.encrypteddataset', [['id', 'in', to_remove]])
-        self.zfs_keys = {}
 
-    @private
-    def initialize_zfs_keys(self, connection_success):
-        locked_datasets = [ds['id'] for ds in self.middleware.call_sync('zfs.dataset.locked_datasets')]
-        for ds in self.middleware.call_sync('datastore.query', 'storage.encrypteddataset',):
-            if ds['encryption_key']:
-                self.zfs_keys[ds['name']] = ds['encryption_key']
-            elif ds['kmip_uid'] and connection_success:
-                try:
-                    with self._connection(self.middleware.call_sync('kmip.connection_config')) as conn:
-                        key = self._retrieve_secret_data(ds['kmip_uid'], conn)
-                except Exception:
-                    self.middleware.logger.debug(f'Failed to retrieve key for {ds["name"]}')
-                else:
-                    self.zfs_keys[ds['name']] = key
-            if ds['name'] in self.zfs_keys and ds['name'] in locked_datasets:
-                self.middleware.call_sync('pool.dataset.unlock', ds['name'])
+def sync_zfs_keys(
+    context: ServiceContext, store: KMIPKeyStore, job: Job, tls: Any, ids: list[Any] | None = None,
+) -> list[str] | None:
+    if not zfs_keys_pending_sync(context, store):
+        return None
+    config = context.call_sync2(context.s.kmip.config)
+    conn_successful = test_connection(context, None, True)
+    if config.enabled and config.manage_zfs_keys:
+        if conn_successful:
+            failed = push_zfs_keys(context, store, tls, ids)
+        else:
+            return None
+    else:
+        failed = pull_zfs_keys(context, store, tls)
+    if failed:
+        context.call_sync2(
+            context.s.alert.oneshot_create, KMIPZFSDatasetsSyncFailureAlert(datasets=','.join(failed))
+        )
+    context.middleware.call_hook_sync('kmip.zfs_keys_sync')
+    return failed
 
-    @private
-    async def retrieve_zfs_keys(self):
-        return self.zfs_keys
 
-    @private
-    async def reset_zfs_key(self, dataset, kmip_uid):
-        self.zfs_keys.pop(dataset, None)
-        if kmip_uid:
+async def clear_sync_pending_zfs_keys(context: ServiceContext, store: KMIPKeyStore) -> None:
+    to_remove = []
+    for ds in await context.middleware.call(
+        'datastore.query', 'storage.encrypteddataset', [['kmip_uid', '!=', None]]
+    ):
+        if ds['encryption_key']:
+            await context.middleware.call('datastore.update', 'storage.encrypteddataset', ds['id'], {'kmip_uid': None})
+        else:
+            to_remove.append(ds['id'])
+    await context.middleware.call('datastore.delete', 'storage.encrypteddataset', [['id', 'in', to_remove]])
+    store.zfs_keys = {}
+
+
+def initialize_zfs_keys(context: ServiceContext, store: KMIPKeyStore, connection_success: bool) -> None:
+    for ds in context.middleware.call_sync('datastore.query', 'storage.encrypteddataset',):
+        if ds['encryption_key']:
+            store.zfs_keys[ds['name']] = ds['encryption_key']
+        elif ds['kmip_uid'] and connection_success:
             try:
-                await self.middleware.call('kmip.delete_kmip_secret_data', kmip_uid)
-            except Exception as e:
-                self.middleware.logger.debug(
-                    f'Failed to remove encryption key from KMIP server for "{dataset}" Dataset: {e}'
+                with kmip_connection(context, connection_config(context)) as conn:
+                    key = retrieve_secret_data(ds['kmip_uid'], conn)
+            except Exception:
+                context.middleware.logger.debug(f'Failed to retrieve key for {ds["name"]}')
+            else:
+                store.zfs_keys[ds['name']] = key
+        if ds['name'] in store.zfs_keys:
+            if context.call_sync2(context.s.zfs.resource.path_is_locked, ds['name']):
+                context.call_sync2(
+                    context.s.zfs.resource.encryption.unlock,
+                    ZFSResourceEncryptionUnlockArgsData(path=ds['name'], start_attachments=True),
                 )
-        await self.middleware.call_hook('kmip.zfs_keys_sync')
 
-    @private
-    async def update_zfs_keys(self, zfs_keys):
-        self.zfs_keys = zfs_keys
+
+async def reset_zfs_key(context: ServiceContext, store: KMIPKeyStore, dataset: str, kmip_uid: str | None) -> None:
+    store.zfs_keys.pop(dataset, None)
+    if kmip_uid:
+        try:
+            await context.to_thread(delete_kmip_secret_data, context, kmip_uid)
+        except Exception as e:
+            context.middleware.logger.debug(
+                f'Failed to remove encryption key from KMIP server for "{dataset}" Dataset: {e}'
+            )
+    await context.middleware.call_hook('kmip.zfs_keys_sync')
+
+
+def update_zfs_keys(store: KMIPKeyStore, zfs_keys: dict[str, str]) -> None:
+    store.zfs_keys = zfs_keys

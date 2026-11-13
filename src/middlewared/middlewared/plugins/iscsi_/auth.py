@@ -1,7 +1,33 @@
+from middlewared.alert.source.discovery_auth import (
+    UPGRADE_ALERTS,
+    ISCSIDiscoveryAuthMixedAlert,
+    ISCSIDiscoveryAuthMultipleCHAPAlert,
+    ISCSIDiscoveryAuthMultipleMutualCHAPAlert,
+)
+from middlewared.api import api_method
+from middlewared.api.current import (
+    iSCSITargetAuthCredentialCreateArgs,
+    iSCSITargetAuthCredentialCreateResult,
+    iSCSITargetAuthCredentialDeleteArgs,
+    iSCSITargetAuthCredentialDeleteResult,
+    iSCSITargetAuthCredentialEntry,
+    iSCSITargetAuthCredentialUpdateArgs,
+    iSCSITargetAuthCredentialUpdateResult,
+)
+from middlewared.service import CallError, CRUDService, ValidationErrors, private
 import middlewared.sqlalchemy as sa
 
-from middlewared.schema import accepts, Dict, Int, Patch, Str
-from middlewared.service import CallError, CRUDService, private, ValidationErrors
+from .utils import IscsiAuthType
+
+INVALID_CHARACTERS = '#'
+
+
+def _auth_summary(data):
+    user = data.get('user', '')
+    tag = data.get('tag', '')
+    if peeruser := data.get('peeruser'):
+        return f'{user}/{peeruser} ({tag})'
+    return f'{user} ({tag})'
 
 
 class iSCSITargetAuthCredentialModel(sa.Model):
@@ -13,6 +39,7 @@ class iSCSITargetAuthCredentialModel(sa.Model):
     iscsi_target_auth_secret = sa.Column(sa.EncryptedText())
     iscsi_target_auth_peeruser = sa.Column(sa.String(120))
     iscsi_target_auth_peersecret = sa.Column(sa.EncryptedText())
+    iscsi_target_auth_discovery_auth = sa.Column(sa.String(20), default=IscsiAuthType.NONE)
 
 
 class iSCSITargetAuthCredentialService(CRUDService):
@@ -22,120 +49,144 @@ class iSCSITargetAuthCredentialService(CRUDService):
         datastore = 'services.iscsitargetauthcredential'
         datastore_prefix = 'iscsi_target_auth_'
         cli_namespace = 'sharing.iscsi.target.auth_credential'
+        role_prefix = 'SHARING_ISCSI_AUTH'
+        entry = iSCSITargetAuthCredentialEntry
 
-    @accepts(Dict(
-        'iscsi_auth_create',
-        Int('tag', required=True),
-        Str('user', required=True),
-        Str('secret', required=True),
-        Str('peeruser', default=''),
-        Str('peersecret', default=''),
-        register=True
-    ))
+    @api_method(iSCSITargetAuthCredentialCreateArgs, iSCSITargetAuthCredentialCreateResult,
+                audit='Create iSCSI Authorized Access', audit_extended=lambda data: _auth_summary(data))
     async def do_create(self, data):
         """
         Create an iSCSI Authorized Access.
-
-        `tag` should be unique among all configured iSCSI Authorized Accesses.
-
-        `secret` and `peersecret` should have length between 12-16 letters inclusive.
-
-        `peeruser` and `peersecret` are provided only when configuring mutual CHAP. `peersecret` should not be
-        similar to `secret`.
         """
-        verrors = ValidationErrors()
-        await self.validate(data, 'iscsi_auth_create', verrors)
+        orig_peerusers = await self.middleware.call('iscsi.auth.da_mutual_chap_peerusers')
 
-        if verrors:
-            raise verrors
+        verrors = ValidationErrors()
+        await self.validate(data, 'iscsi_auth_create', verrors, len(orig_peerusers))
+
+        verrors.check()
 
         data['id'] = await self.middleware.call(
             'datastore.insert', self._config.datastore, data,
             {'prefix': self._config.datastore_prefix}
         )
 
+        await self.middleware.call('iscsi.auth.recalc_mutual_chap_alert', orig_peerusers)
         await self._service_change('iscsitarget', 'reload')
 
         return await self.get_instance(data['id'])
 
-    @accepts(
-        Int('id'),
-        Patch(
-            'iscsi_auth_create',
-            'iscsi_auth_update',
-            ('attr', {'update': True})
-        )
-    )
-    async def do_update(self, id, data):
+    @api_method(iSCSITargetAuthCredentialUpdateArgs, iSCSITargetAuthCredentialUpdateResult,
+                audit='Update iSCSI Authorized Access', audit_callback=True)
+    async def do_update(self, audit_callback, id_, data):
         """
-        Update iSCSI Authorized Access of `id`.
+        Update iSCSI Authorized Access of ``id``.
         """
-        old = await self.get_instance(id)
+        old = await self.get_instance(id_)
+        audit_callback(_auth_summary(old))
 
         new = old.copy()
         new.update(data)
 
+        orig_peerusers = await self.middleware.call('iscsi.auth.da_mutual_chap_peerusers')
+        num_peerusers = len(orig_peerusers)
+        if old['discovery_auth'] == IscsiAuthType.CHAP_MUTUAL:
+            # Don't count this entry for validation since we're not adding
+            # a new Mutual CHAP peeruser, only updating an existing one
+            num_peerusers -= 1
+
         verrors = ValidationErrors()
-        await self.validate(new, 'iscsi_auth_update', verrors)
-        if new['tag'] != old['tag'] and not await self.query([['tag', '=', old['tag']], ['id', '!=', id]]):
-            usages = await self.is_in_use_by_portals_targets(id)
+        await self.validate(new, 'iscsi_auth_update', verrors, num_peerusers)
+        if new['tag'] != old['tag'] and not await self.query([['tag', '=', old['tag']], ['id', '!=', id_]]):
+            usages = await self.is_in_use(id_)
             if usages['in_use']:
                 verrors.add('iscsi_auth_update.tag', usages['usages'])
 
-        if verrors:
-            raise verrors
+        verrors.check()
 
         await self.middleware.call(
-            'datastore.update', self._config.datastore, id, new,
+            'datastore.update', self._config.datastore, id_, new,
             {'prefix': self._config.datastore_prefix}
         )
 
+        await self.middleware.call('iscsi.auth.recalc_mutual_chap_alert', orig_peerusers)
+
+        # We might have cleared some junk
+        await self.call2(self.s.alert.alert_source_clear_run, 'ISCSIAuthSecret')
+
         await self._service_change('iscsitarget', 'reload')
 
-        return await self.get_instance(id)
+        return await self.get_instance(id_)
 
-    @accepts(Int('id'))
-    async def do_delete(self, id):
+    @api_method(iSCSITargetAuthCredentialDeleteArgs, iSCSITargetAuthCredentialDeleteResult,
+                audit='Delete iSCSI Authorized Access', audit_callback=True)
+    async def do_delete(self, audit_callback, id_):
         """
-        Delete iSCSI Authorized Access of `id`.
+        Delete iSCSI Authorized Access of ``id``.
         """
-        config = await self.get_instance(id)
-        if not await self.query([['tag', '=', config['tag']], ['id', '!=', id]]):
-            usages = await self.is_in_use_by_portals_targets(id)
+        config = await self.get_instance(id_)
+        audit_callback(_auth_summary(config))
+
+        if not await self.query([['tag', '=', config['tag']], ['id', '!=', id_]]):
+            # We are attempting to delete the last auth in a particular group (aka tag)
+            usages = await self.is_in_use(id_)
             if usages['in_use']:
                 raise CallError(usages['usages'])
 
-        return await self.middleware.call(
-            'datastore.delete', self._config.datastore, id
+        orig_peerusers = await self.middleware.call('iscsi.auth.da_mutual_chap_peerusers')
+
+        result = await self.middleware.call(
+            'datastore.delete', self._config.datastore, id_
         )
+        if orig_peerusers:
+            await self.middleware.call('iscsi.auth.recalc_mutual_chap_alert', orig_peerusers)
+
+        # We might have cleared some junk
+        await self.call2(self.s.alert.alert_source_clear_run, 'ISCSIAuthSecret')
+
+        await self._service_change('iscsitarget', 'reload')
+
+        return result
 
     @private
-    async def is_in_use_by_portals_targets(self, id):
-        config = await self.get_instance(id)
+    async def is_in_use(self, id_):
+        config = await self.get_instance(id_)
         usages = []
-        portals = await self.middleware.call(
-            'iscsi.portal.query', [['discovery_authgroup', '=', config['tag']]], {'select': ['id']}
-        )
-        if portals:
-            usages.append(
-                f'Authorized access of {id} is being used by portal(s): {", ".join(p["id"] for p in portals)}'
-            )
+        # Check targets
         groups = await self.middleware.call(
             'datastore.query', 'services.iscsitargetgroups', [['iscsi_target_authgroup', '=', config['tag']]]
         )
         if groups:
             usages.append(
-                f'Authorized access of {id} is being used by following target(s): '
+                f'Authorized access of {id_} is being used by following target(s): '
                 f'{", ".join(str(g["iscsi_target"]["id"]) for g in groups)}'
             )
 
         return {'in_use': bool(usages), 'usages': '\n'.join(usages)}
 
     @private
-    async def validate(self, data, schema_name, verrors):
+    def _validate_secret(self, secret, fieldname, title, schema_name, verrors):
+        if len(secret) < 12 or len(secret) > 16:
+            verrors.add(
+                f'{schema_name}.{fieldname}',
+                f'{title} must be between 12 and 16 characters.'
+            )
+        if secret != secret.strip():
+            verrors.add(
+                f'{schema_name}.{fieldname}',
+                f'{title} contains leading or trailing space.'
+            )
+        if bad_chars := [ch for ch in INVALID_CHARACTERS if ch in secret]:
+            verrors.add(
+                f'{schema_name}.{fieldname}',
+                f'{title} contains invalid characters: {",".join(bad_chars)}'
+            )
+
+    @private
+    async def validate(self, data, schema_name, verrors, discovery_auth_mutual_chap_count):
         secret = data.get('secret')
         peer_secret = data.get('peersecret')
         peer_user = data.get('peeruser', '')
+        discovery_auth = data.get('discovery_auth')
 
         if not peer_user and peer_secret:
             verrors.add(
@@ -143,28 +194,99 @@ class iSCSITargetAuthCredentialService(CRUDService):
                 'The peer user is required if you set a peer secret.'
             )
 
-        if len(secret) < 12 or len(secret) > 16:
-            verrors.add(
-                f'{schema_name}.secret',
-                'Secret must be between 12 and 16 characters.'
-            )
+        self._validate_secret(secret, 'secret', 'Secret', schema_name, verrors)
 
-        if not peer_user:
-            return
-
-        if not peer_secret:
-            verrors.add(
-                f'{schema_name}.peersecret',
-                'The peer secret is required if you set a peer user.'
-            )
-        elif peer_secret == secret:
-            verrors.add(
-                f'{schema_name}.peersecret',
-                'The peer secret cannot be the same as user secret.'
-            )
-        elif peer_secret:
-            if len(peer_secret) < 12 or len(peer_secret) > 16:
+        if peer_user:
+            if not peer_secret:
                 verrors.add(
                     f'{schema_name}.peersecret',
-                    'Peer Secret must be between 12 and 16 characters.'
+                    'The peer secret is required if you set a peer user.'
                 )
+            elif peer_secret == secret:
+                verrors.add(
+                    f'{schema_name}.peersecret',
+                    'The peer secret cannot be the same as user secret.'
+                )
+            else:
+                self._validate_secret(peer_secret, 'peersecret', 'Peer Secret', schema_name, verrors)
+            if discovery_auth == IscsiAuthType.CHAP_MUTUAL and discovery_auth_mutual_chap_count:
+                verrors.add(
+                    f'{schema_name}.discovery_auth',
+                    f'Cannot specify {IscsiAuthType.CHAP_MUTUAL} as only one such entry is permitted.'
+                )
+        else:
+            if discovery_auth == IscsiAuthType.CHAP_MUTUAL:
+                verrors.add(
+                    f'{schema_name}.discovery_auth',
+                    f'Cannot specify {IscsiAuthType.CHAP_MUTUAL} if peer_user has not been defined.'
+                )
+
+    @private
+    async def da_mutual_chap_peerusers(self):
+        """
+        Return a list of peerusers that are in use for Mutual CHAP discovery auth.
+        """
+        filters = [['discovery_auth', '=', IscsiAuthType.CHAP_MUTUAL], ['peeruser', '!=', '']]
+        options = {'select': ['peeruser']}
+        return [entry['peeruser'] for entry in await self.middleware.call('iscsi.auth.query', filters, options)]
+
+    @private
+    async def recalc_mutual_chap_alert(self, orig_peerusers):
+        alert_name = 'ISCSIDiscoveryAuthMultipleMutualCHAP'
+        peerusers = await self.middleware.call('iscsi.auth.da_mutual_chap_peerusers')
+        if len(orig_peerusers) > 1:
+            # Alert was in place, do we need to update or remove it?
+            if len(peerusers) <= 1:
+                # Clear the existing alert
+                await self.call2(self.s.alert.oneshot_delete, alert_name, {'peeruser': orig_peerusers[0]})
+            elif peerusers[0] != orig_peerusers[0]:
+                # Remove old event and replace with new one.
+                await self.call2(self.s.alert.oneshot_delete, alert_name, {'peeruser': orig_peerusers[0]})
+                await self.call2(
+                    self.s.alert.oneshot_create, ISCSIDiscoveryAuthMultipleMutualCHAPAlert(peeruser=peerusers[0]),
+                )
+        elif len(peerusers) > 1:
+            # Alert was not in place, add one.
+            await self.call2(
+                self.s.alert.oneshot_create, ISCSIDiscoveryAuthMultipleMutualCHAPAlert(peeruser=peerusers[0]),
+            )
+
+    UPGRADE_ALERT_CLASSES = {
+        'ISCSIDiscoveryAuthMixed': ISCSIDiscoveryAuthMixedAlert,
+        'ISCSIDiscoveryAuthMultipleCHAP': ISCSIDiscoveryAuthMultipleCHAPAlert,
+        'ISCSIDiscoveryAuthMultipleMutualCHAP': ISCSIDiscoveryAuthMultipleMutualCHAPAlert,
+    }
+
+    @private
+    async def load_upgrade_alerts(self):
+        """
+        Load any events that may have been generated during an alembic migration.
+        """
+        for alert in UPGRADE_ALERTS:
+            try:
+                args = await self.call2(self.s.keyvalue.get, alert)
+                alert_cls = self.UPGRADE_ALERT_CLASSES[alert]
+                await self.call2(self.s.alert.oneshot_create, alert_cls(**args))
+                await self.call2(self.s.keyvalue.delete, alert)
+            except KeyError:
+                pass
+
+    @private
+    async def clear_alerts(self):
+        alerts = [
+            alert for alert in await self.call2(self.s.alert.list)
+            if alert.klass.startswith('ISCSIDiscoveryAuth')
+        ]
+        for alert in alerts:
+            await self.call2(self.s.alert.oneshot_delete, alert.klass, alert.args)
+
+
+async def __event_system_ready(middleware, event_type, args):
+    await middleware.call('iscsi.auth.load_upgrade_alerts')
+
+
+async def setup(middleware):
+    if await middleware.call('system.ready'):
+        await middleware.call('iscsi.auth.load_upgrade_alerts')
+    else:
+        middleware.event_subscribe('system.ready', __event_system_ready)

@@ -1,8 +1,6 @@
-import os
-
 from middlewared.common.attachment import LockableFSAttachmentDelegate
-from middlewared.plugins.zfs_.utils import zvol_name_to_path
-from middlewared.utils.path import is_child
+from middlewared.plugins.zfs.zvol_utils import zvol_name_to_path
+from middlewared.service_exception import MatchNotFound, ValidationError
 
 from .extents import iSCSITargetExtentService
 
@@ -12,14 +10,10 @@ class ISCSIFSAttachmentDelegate(LockableFSAttachmentDelegate):
     title = 'iSCSI Extent'
     service = 'iscsitarget'
     service_class = iSCSITargetExtentService
+    set_triggers = frozenset({'volsize', 'readonly', 'snapdev'})
 
-    async def get_query_filters(self, enabled, options=None):
-        return [['type', '=', 'DISK']] + (await super().get_query_filters(enabled, options))
-
-    async def is_child_of_path(self, resource, path):
-        dataset_name = os.path.relpath(path, '/mnt')
-        full_zvol_path = zvol_name_to_path(dataset_name)
-        return is_child(resource[self.path_field], os.path.relpath(full_zvol_path, '/dev'))
+    def get_query_filters(self, enabled):
+        return [['type', '=', 'DISK']] + super().get_query_filters(enabled)
 
     async def delete(self, attachments):
         orphan_targets_ids = set()
@@ -42,8 +36,144 @@ class ISCSIFSAttachmentDelegate(LockableFSAttachmentDelegate):
         await self._service_change('iscsitarget', 'reload')
 
     async def stop(self, attachments):
-        await self.restart_reload_services(attachments)
+        if attachments:
+            # Reload ACTIVE
+            await self._service_change(
+                'iscsitarget',
+                'reload',
+                options={'ha_propagate': False}
+            )
+            alua_enabled = await self.middleware.call('iscsi.global.alua_enabled')
+            if alua_enabled and await self.middleware.call('failover.remote_connected'):
+                for extent in attachments:
+                    try:
+                        assoc = await self.middleware.call(
+                            'iscsi.targetextent.query',
+                            [['extent', '=', extent['id']]],
+                            {'get': True}
+                        )
+                        target_name = (await self.middleware.call(
+                            'iscsi.target.query',
+                            [['id', '=', assoc['target']]],
+                            {'select': ['name'], 'get': True}))['name']
+                    except MatchNotFound:
+                        self.logger.debug(
+                            'Failed to obtain details for extent %r (%r)',
+                            extent['id'],
+                            extent['name']
+                        )
+                        continue
+
+                    # Check that the HA target is no longer offering the LUN that we just deleted.
+                    # Wait a short period if necessary (though this should not be required).
+                    await self.middleware.call(
+                        'iscsi.target.wait_for_ha_lun_absent',
+                        target_name,
+                        assoc['lunid']
+                    )
+                    try:
+                        # iscsi.alua.removed_target_extent includes a local service reload
+                        # Turn off the implicit RELOAD as we'll reload when finished the
+                        # attachments loop.
+                        await self.middleware.call(
+                            'failover.call_remote',
+                            'iscsi.alua.removed_target_extent',
+                            [target_name, assoc['lunid'], extent['name'], False]
+                        )
+                    except Exception:
+                        self.logger.exception('Failed to update STANDBY node')
+                        # Better to continue than to raise the exception
+                # Now that all extents have been processed, reload STANDBY
+                await self.middleware.call(
+                    'failover.call_remote',
+                    'service.control',
+                    ['RELOAD', 'iscsitarget'],
+                    {'job': True},
+                )
+                await self.middleware.call('iscsi.alua.wait_for_alua_settled')
+
+    async def start(self, attachments):
+        if attachments:
+            alua_enabled = await self.middleware.call('iscsi.global.alua_enabled')
+            remote_connected = await self.middleware.call('failover.remote_connected')
+            service_started = await self.call2(self.s.service.started, self.service)
+            if alua_enabled and remote_connected and service_started:
+                await self._service_change(
+                    'iscsitarget',
+                    'reload',
+                    options={'ha_propagate': False}
+                )
+                for extent in attachments:
+                    try:
+                        assoc = await self.middleware.call(
+                            'iscsi.targetextent.query',
+                            [['extent', '=', extent['id']]],
+                            {'get': True}
+                        )
+                        target_name = (await self.middleware.call(
+                            'iscsi.target.query',
+                            [['id', '=', assoc['target']]],
+                            {'select': ['name'], 'get': True}))['name']
+                    except MatchNotFound:
+                        self.logger.warning('Failed to update extent %r %r',
+                                            extent['id'], extent['name'])
+                        continue
+                    await self.middleware.call(
+                        'iscsi.target.wait_for_ha_lun_present',
+                        target_name,
+                        assoc['lunid']
+                    )
+                    try:
+                        await self.middleware.call(
+                            'failover.call_remote',
+                            'iscsi.alua.added_target_extent',
+                            [target_name]
+                        )
+                    except Exception:
+                        self.logger.exception(
+                            'Failed to update STANDBY node for %r %r',
+                            extent['id'], extent['name']
+                        )
+                        # Better to continue than to raise the exception
+                # Now that all extents have been processed, reload STANDBY
+                await self.middleware.call(
+                    'failover.call_remote',
+                    'service.control',
+                    ['RELOAD', 'iscsitarget'],
+                    {'job': True},
+                )
+                await self.middleware.call(
+                    'iscsi.alua.wait_cluster_mode',
+                    assoc['target'],
+                    assoc['extent']
+                )
+            else:
+                await super().start(attachments)
+
+    def validate_set(self, state):
+        if not state.snapshot_devices or not state.changed('snapdev') or state.effective('snapdev') != 'hidden':
+            return
+
+        paths = [zvol_name_to_path(name).removeprefix('/dev/') for name in sorted(state.snapshot_devices)]
+        if self.middleware.call_sync('iscsi.extent.query', [['path', 'in', paths]], {'select': ['path']}):
+            raise ValidationError(
+                state.attribute('snapdev'),
+                f'{state.path!r} has snapshots which have attachments being used. Before marking it '
+                'as HIDDEN, remove attachment usages.',
+            )
+
+    def after_set(self, state):
+        if state.type != 'VOLUME':
+            return
+        if state.changed('volsize'):
+            self.middleware.call_sync('iscsi.global.resync_lun_size_for_zvol', state.path)
+        if 'readonly' in state.touched():
+            self.middleware.call_sync(
+                'iscsi.global.resync_readonly_property_for_zvol', state.path, state.effective('readonly')
+            )
 
 
 async def setup(middleware):
-    await middleware.call('pool.dataset.register_attachment_delegate', ISCSIFSAttachmentDelegate(middleware))
+    await middleware.call2(
+        middleware.services.zfs.resource.register_attachment_delegate, ISCSIFSAttachmentDelegate(middleware)
+    )

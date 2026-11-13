@@ -1,8 +1,4 @@
-import contextlib
-import os
-import textwrap
-
-from middlewared.service import private, Service
+from middlewared.service import Service, private
 
 
 class SMBService(Service):
@@ -12,7 +8,7 @@ class SMBService(Service):
 
     @private
     async def disable_acl_if_trivial(self):
-        share_ids = await self.middleware.call("keyvalue.get", "smb_disable_acl_if_trivial", [])
+        share_ids = await self.call2(self.s.keyvalue.get, "smb_disable_acl_if_trivial", [])
         if not share_ids:
             return
 
@@ -22,24 +18,26 @@ class SMBService(Service):
                 continue
 
             try:
-                acl_is_trivial = await self.middleware.call("filesystem.acl_is_trivial", share["path"])
+                acl_is_trivial = not (await self.middleware.call("filesystem.stat", share["path"])).acl
             except Exception:
-                self.middleware.logger.warning("Error running filesystem.acl_is_trivial for share %r", share["id"],
-                                               exc_info=True)
+                self.middleware.logger.warning(
+                    "Failed to check for presence of filesystem ACL for share %r",
+                    share["id"], exc_info=True,
+                )
                 continue
 
             if acl_is_trivial:
-                self.middleware.logger.info("ACL is trivial for migrated AFP share %r, disabling ACL", share["id"])
+                self.middleware.logger.info("ACL is not present on migrated AFP share %r, disabling ACL", share["id"])
                 await self.middleware.call(
                     "datastore.update", "sharing.cifs_share", share["id"], {"cifs_acl": False},
                 )
             else:
-                self.middleware.logger.info("ACL is not trivial for migrated AFP share %r, not disabling ACL",
+                self.middleware.logger.info("ACL is present on migrated AFP share %r, not disabling ACL",
                                             share["id"])
 
             share_ids.discard(share["id"])
 
         if share_ids:
-            await self.middleware.call("keyvalue.set", "smb_disable_acl_if_trivial", list(share_ids))
+            await self.call2(self.s.keyvalue.set, "smb_disable_acl_if_trivial", list(share_ids))
         else:
-            await self.middleware.call("keyvalue.delete", "smb_disable_acl_if_trivial")
+            await self.call2(self.s.keyvalue.delete, "smb_disable_acl_if_trivial")

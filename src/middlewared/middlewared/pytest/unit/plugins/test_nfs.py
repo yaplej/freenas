@@ -1,99 +1,72 @@
-from mock import ANY, Mock, patch
+import asyncio
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, Mock
 
-from middlewared.plugins.nfs import SharingNFSService
-
-
-def test__sharing_nfs_service__validate_hosts_and_networks__host_is_32_network():
-    with patch("middlewared.plugins.nfs.os.stat", lambda dev: {
-        "/mnt/data/a": Mock(st_dev=1),
-        "/mnt/data/b": Mock(st_dev=1),
-    }[dev]):
-        middleware = Mock()
-
-        verrors = Mock()
-
-        SharingNFSService(middleware).validate_hosts_and_networks(
-            [
-                {
-                    "path": "/mnt/data/a",
-                    "hosts": ["192.168.0.1"],
-                    "networks": [],
-                },
-            ],
-            {
-                "path": "/mnt/data/b",
-                "hosts": ["192.168.0.1"],
-                "networks": [],
-            },
-            "sharingnfs_update",
-            verrors,
-            {
-                "192.168.0.1": "192.168.0.1",
-            },
-        )
-
-        verrors.add.assert_called_once_with("sharingnfs_update.hosts", ANY)
+from middlewared.api.current import SharingNFSEntry
+from middlewared.plugins.nfs_.share_hosts import validate_hosts_and_networks
 
 
-def test__sharing_nfs_service__validate_hosts_and_networks__dataset_is_already_exported():
-    with patch("middlewared.plugins.nfs.os.stat", lambda dev: {
-        "/mnt/data/a": Mock(st_dev=1),
-        "/mnt/data/b": Mock(st_dev=1),
-    }[dev]):
-        middleware = Mock()
-
-        verrors = Mock()
-
-        SharingNFSService(middleware).validate_hosts_and_networks(
-            [
-                {
-                    "path": "/mnt/data/a",
-                    "hosts": [],
-                    "networks": ["192.168.0.0/24"],
-                },
-            ],
-            {
-                "path": "/mnt/data/b",
-                "hosts": [],
-                "networks": ["192.168.0.0/24"],
-            },
-            "sharingnfs_update",
-            verrors,
-            {
-                "192.168.0.1": "192.168.0.1",
-            },
-        )
-
-        verrors.add.assert_called_once_with("sharingnfs_update.networks", ANY)
+def share(path, hosts, networks):
+    return SharingNFSEntry(
+        id=1,
+        path=path,
+        dataset=None,
+        relative_path=None,
+        locked=False,
+        hosts=hosts,
+        networks=networks,
+    )
 
 
-def test__sharing_nfs_service__validate_hosts_and_networks__fs_is_already_exported_for_world():
-    with patch("middlewared.plugins.nfs.os.stat", lambda dev: {
-        "/mnt/data/a": Mock(st_dev=1),
-        "/mnt/data/b": Mock(st_dev=1),
-    }[dev]):
-        middleware = Mock()
+def context():
+    ctx = Mock()
+    ctx.middleware.call = AsyncMock(side_effect=lambda method, path: SimpleNamespace(realpath=path))
+    return ctx
 
-        verrors = Mock()
 
-        SharingNFSService(middleware).validate_hosts_and_networks(
-            [
-                {
-                    "path": "/mnt/data/a",
-                    "hosts": ["192.168.0.1"],
-                    "networks": [],
-                },
-            ],
-            {
-                "path": "/mnt/data/b",
-                "hosts": [],
-                "networks": [],
-            },
-            "sharingnfs_update",
-            verrors,
-            {
-                "192.168.0.1": "192.168.0.1",
-            },
-        )
+def validate(other_shares, data, dns_cache, verrors):
+    asyncio.run(
+        validate_hosts_and_networks(context(), other_shares, data, "sharingnfs_update", verrors, dns_cache)
+    )
 
-        verrors.add.assert_called_once_with("sharingnfs_update.networks", ANY)
+
+def test__validate_hosts_and_networks__host_is_32_network():
+    verrors = Mock()
+
+    validate(
+        [share("/mnt/data/a", ["192.168.0.1"], [])],
+        share("/mnt/data/b", ["192.168.0.1"], []),
+        {"192.168.0.1": "192.168.0.1"},
+        verrors,
+    )
+
+    # NAS-123042: A passing condition
+    verrors.add.assert_not_called()
+
+
+def test__validate_hosts_and_networks__dataset_is_already_exported():
+    verrors = Mock()
+
+    validate(
+        [share("/mnt/data/a", [], ["192.168.0.0/24"])],
+        share("/mnt/data/b", [], ["192.168.0.0/24"]),
+        {"192.168.0.1": "192.168.0.1"},
+        verrors,
+    )
+
+    # NAS-123042: A passing condition
+    verrors.add.assert_not_called()
+
+
+def test__validate_hosts_and_networks__fs_is_already_exported_for_world():
+    verrors = Mock()
+
+    validate(
+        [share("/mnt/data/a", ["192.168.0.1"], [])],
+        share("/mnt/data/b", [], []),
+        {"192.168.0.1": "192.168.0.1"},
+        verrors,
+    )
+
+    # This is now a passing condition: NAS-120957
+    verrors.add.assert_not_called()

@@ -1,0 +1,214 @@
+from __future__ import annotations
+
+from collections.abc import Awaitable, Sequence
+from typing import TYPE_CHECKING, Any, cast, overload
+
+from middlewared.api import API_LOADING_FORBIDDEN
+from middlewared.service_exception import InstanceNotFound, ValidationErrors
+from middlewared.utils.filter_list import filter_getattrs_and_ops, filter_list, select_with_query_fields
+
+from .part import ServicePart
+
+if not API_LOADING_FORBIDDEN:
+    from middlewared.api.current import QueryOptions
+
+if TYPE_CHECKING:
+    from middlewared.api.current import QueryOptionsCount, QueryOptionsGet
+
+
+__all__ = ('CRUDServicePart',)
+
+# The rest disagree: `~`, `^`, `$` and `rin` are case-insensitive in SQL, and `!=`, `<`, `<=`,
+# `>` and `>=` drop rows where the column is NULL.
+SQL_ONLY_FILTER_OPERATORS = frozenset(('=', 'in', 'nin'))
+
+
+def filters_are_sql_only(filters: Sequence[Any], fields: frozenset[str]) -> bool:
+    try:
+        attrs, ops = filter_getattrs_and_ops(filters)
+    except ValueError:
+        return False
+
+    return attrs <= fields and ops <= SQL_ONLY_FILTER_OPERATORS
+
+
+class CRUDServicePart[E, PK = int](ServicePart):
+    __slots__ = ()
+
+    _datastore: str
+    _datastore_prefix: str = ''
+    _datastore_primary_key: str = 'id'
+    _datastore_sql_filters: frozenset[str] = frozenset()
+    _entry: type[E]
+
+    async def extend_context(self, rows: list[dict[str, Any]], extra: dict[str, Any]) -> dict[str, Any]:
+        return await self.to_thread(self.extend_context_sync, rows, extra)
+
+    def extend_context_sync(self, rows: list[dict[str, Any]], extra: dict[str, Any]) -> dict[str, Any]:
+        return {}
+
+    def extend(self, data: dict[str, Any], context: dict[str, Any]) -> dict[str, Any] | Awaitable[dict[str, Any]]:
+        return data
+
+    def compress(self, data: dict[str, Any]) -> dict[str, Any] | Awaitable[dict[str, Any]]:
+        return data
+
+    async def _query_rows(
+        self,
+        filters: list[Any],
+        options: QueryOptions,
+        extra: dict[str, Any],
+    ) -> list[dict[str, Any]]:
+        """Read and extend every row that `query` then filters and paginates.
+
+        Override to report rows that do not live in the datastore.
+        """
+        datastore_filters: list[Any] = []
+        ds_opts: dict[str, Any] = {'prefix': self._datastore_prefix}
+        if options.force_sql_filters:
+            datastore_filters = filters
+            ds_opts['force_sql_filters'] = True
+
+        rows: list[dict[str, Any]] = await self.middleware.call(
+            'datastore.query', self._datastore, datastore_filters, ds_opts,
+        )
+        ctx = await self.extend_context(rows, extra)
+        return await self._run_extend_many(rows, ctx)
+
+    @overload
+    async def query(self, filters: list[Any], options: QueryOptionsCount) -> int: ...  # type: ignore[overload-overlap]
+
+    @overload
+    async def query(self, filters: list[Any], options: QueryOptionsGet) -> E: ...  # type: ignore[overload-overlap]
+
+    @overload
+    async def query(
+        self, filters: list[Any] | None = None, options: QueryOptions | None = None,
+    ) -> list[E]: ...
+
+    async def query(
+        self, filters: list[Any] | None = None, options: QueryOptions | None = None,
+    ) -> list[E] | E | int:
+        if filters is None:
+            filters = []
+        if options is None:
+            options = QueryOptions()
+
+        caller_forced_sql_filters = options.force_sql_filters
+        if filters and filters_are_sql_only(filters, self._datastore_sql_filters):
+            options = options.model_copy(update={'force_sql_filters': True})
+
+        opts = options.model_dump()
+        extra = opts.get('extra', {}) or {}
+        # Surface `select` to extend_context so services can skip expensive per-row work
+        # (e.g. lock-state lookups) when the relevant field isn't being selected.
+        extra = {**extra, 'select': select_with_query_fields(filters, opts)}
+
+        rows = await self._query_rows(filters, options, extra)
+
+        post_filters = filters
+        if caller_forced_sql_filters:
+            post_filters = []
+
+        result: Any = filter_list(rows, post_filters, opts)
+
+        if isinstance(result, int):
+            return result
+
+        if isinstance(result, dict):
+            return self._to_entry(result)
+
+        if isinstance(result, list):
+            result_list: list[E] = []
+            for row in result:
+                try:
+                    result_list.append(self._to_entry(row))
+                except Exception as e:
+                    if options.delete_invalid_rows:
+                        self.middleware.logger.error(
+                            "Validation error while parsing table %r row %r: %r. "
+                            "The row will be deleted from the database.",
+                            self._datastore,
+                            row["id"],
+                            repr(e),
+                        )
+                        await self.middleware.call("datastore.delete", self._datastore, row["id"], {"cascade": True})
+
+            return result_list
+
+        return result
+
+    async def get_instance(self, id_: PK, extra: dict[str, Any] | None = None) -> E:
+        rows: list[dict[str, Any]] = await self.middleware.call(
+            'datastore.query', self._datastore,
+            [[self._datastore_primary_key, '=', id_]],
+            {'prefix': self._datastore_prefix},
+        )
+        if not rows:
+            raise InstanceNotFound(f'{self._entry.__name__.removesuffix("Entry")} {id_} does not exist')
+
+        ctx = await self.extend_context(rows, extra or {})
+        return self._to_entry(await self._run_extend(rows[0], ctx))
+
+    def get_instance__sync(self, id_: PK, extra: dict[str, Any] | None = None) -> E:
+        return self.run_coroutine(self.get_instance(id_, extra))
+
+    async def _create(self, data: dict[str, Any]) -> E:
+        data = await self._run_compress(data)
+        pk = cast(PK, await self.middleware.call(
+            'datastore.insert', self._datastore, data,
+            {'prefix': self._datastore_prefix},
+        ))
+        return await self.get_instance(pk)
+
+    async def _update(self, id_: PK, data: dict[str, Any]) -> E:
+        data = await self._run_compress(data)
+        await self.middleware.call(
+            'datastore.update', self._datastore, id_, data,
+            {'prefix': self._datastore_prefix},
+        )
+        return await self.get_instance(id_)
+
+    async def _delete(self, id_: PK) -> None:
+        await self.middleware.call('datastore.delete', self._datastore, id_)
+
+    async def _ensure_unique(
+        self,
+        verrors: ValidationErrors,
+        schema_name: str,
+        field_name: str,
+        value: Any,
+        id_: PK | None = None,
+        query_field_name: str | None = None,
+    ) -> None:
+        filters = [[query_field_name or field_name, '=', value]]
+        if id_ is not None:
+            filters.append(['id', '!=', id_])
+        if await self.query(filters):
+            verrors.add(
+                '.'.join(filter(None, [schema_name, field_name])),
+                f'Object with this {field_name} already exists',
+            )
+
+    def _to_entry(self, data: dict[str, Any]) -> E:
+        constructor = cast(type[E], getattr(self._entry, '__query_result_item__', self._entry))
+        return constructor(**data)
+
+    async def _run_extend_many(
+        self, rows: list[dict[str, Any]], context: dict[str, Any],
+    ) -> list[dict[str, Any]]:
+        for i, row in enumerate(rows):
+            rows[i] = await self._run_extend(row, context)
+        return rows
+
+    async def _run_extend(self, data: dict[str, Any], context: dict[str, Any]) -> dict[str, Any]:
+        result = self.extend(data, context)
+        if isinstance(result, Awaitable):
+            return await result
+        return result
+
+    async def _run_compress(self, data: dict[str, Any]) -> dict[str, Any]:
+        result = self.compress(data)
+        if isinstance(result, Awaitable):
+            return await result
+        return result

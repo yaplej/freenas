@@ -1,12 +1,14 @@
+from dataclasses import asdict, dataclass
+from typing import Any
+
 from sqlalchemy import and_, types
 from sqlalchemy.sql import sqltypes
 
-from middlewared.schema import accepts, Any, Bool, Dict, Str
 from middlewared.service import Service
+from middlewared.sqlalchemy import Model
 
 from .filter import FilterMixin
 from .schema import SchemaMixin
-
 
 """
 By default, when an update/insert/delete operation occurs we will
@@ -28,37 +30,53 @@ after all the db operations are complete.
 """
 
 
+@dataclass(slots=True, kw_only=True)
+class DatastoreOptions:
+    cascade: bool = False
+    ha_sync: bool = True
+    prefix: str = ""
+    send_events: bool = True
+
+
+class NoRowsWereUpdatedException(Exception):
+    pass
+
+
 class DatastoreService(Service, FilterMixin, SchemaMixin):
 
     class Config:
         private = True
 
-    @accepts(
-        Str('name'),
-        Dict('data', additional_attrs=True),
-        Dict(
-            'options',
-            Bool('ha_sync', default=True),
-            Str('prefix', default=''),
-            Bool('send_events', default=True),
-        ),
-    )
-    async def insert(self, name, data, options):
+    def _handle_datastore_opts(self, options: dict | None = None):
+        if options is None:
+            opts = asdict(DatastoreOptions())
+        else:
+            opts = asdict(DatastoreOptions(**options))
+        return opts
+
+    async def insert(self, name: str, data: dict, options: dict | None = None):
         """
         Insert a new entry to `name`.
         """
         table = self._get_table(name)
+        options = self._handle_datastore_opts(options)
         insert, relationships = self._extract_relationships(table, options['prefix'], data)
-
         for column in table.c:
             if column.default is not None:
-                insert.setdefault(column.name, column.default.arg)
+                value = column.default.arg
+                if callable(value):
+                    value = value(None)
+                insert.setdefault(column.name, value)
             if not column.nullable:
                 if isinstance(column.type, (types.String, types.Text)):
                     insert.setdefault(column.name, '')
 
         pk_column = self._get_pk(table)
-        return_last_insert_rowid = type(pk_column.type) == sqltypes.Integer
+        # Only use last_insert_rowid if the PK is an integer type AND we didn't provide a value
+        return_last_insert_rowid = (
+            isinstance(pk_column.type, sqltypes.Integer) and
+            pk_column.name not in insert
+        )
         result = await self.middleware.call(
             'datastore.execute_write',
             table.insert().values(**insert),
@@ -72,39 +90,38 @@ class DatastoreService(Service, FilterMixin, SchemaMixin):
         else:
             pk = insert[pk_column.name]
 
-        await self._handle_relationships(pk, relationships)
+        try:
+            await self._handle_relationships(pk, relationships)
+        except Exception:
+            await self.middleware.call(
+                'datastore.execute_write',
+                table.delete().where(pk_column == pk),
+                {
+                    'ha_sync': options['ha_sync'],
+                },
+            )
+            raise
 
         if options['send_events']:
             await self.middleware.call('datastore.send_insert_events', name, insert)
 
         return pk
 
-    @accepts(
-        Str('name'),
-        Any('id_or_filters'),
-        Dict('data', additional_attrs=True),
-        Dict(
-            'options',
-            Bool('ha_sync', default=True),
-            Str('prefix', default=''),
-            Bool('send_events', default=True),
-        ),
-    )
-    async def update(self, name, id_or_filters, data, options):
+    async def update(self, name: str, id_or_filters: Any, data: dict, options: dict | None = None):
         """
         Update an entry `id` in `name`.
         """
         table = self._get_table(name)
         data = data.copy()
-
+        options = self._handle_datastore_opts(options)
         if isinstance(id_or_filters, list):
             rows = await self.middleware.call('datastore.query', name, id_or_filters, {'prefix': options['prefix']})
             if len(rows) != 1:
                 raise RuntimeError(f'{len(rows)} found, expecting one')
 
-            id = rows[0][self._get_pk(table).name]
+            id_ = rows[0][self._get_pk(table).name]
         else:
-            id = id_or_filters
+            id_ = id_or_filters
 
         for column in table.c:
             if column.foreign_keys:
@@ -116,20 +133,20 @@ class DatastoreService(Service, FilterMixin, SchemaMixin):
         if update:
             result = await self.middleware.call(
                 'datastore.execute_write',
-                table.update().values(**update).where(self._where_clause(table, id, {'prefix': options['prefix']})),
+                table.update().values(**update).where(self._where_clause(table, id_, {'prefix': options['prefix']})),
                 {
                     'ha_sync': options['ha_sync'],
                 },
             )
             if result.rowcount != 1:
-                raise RuntimeError('No rows were updated')
+                raise NoRowsWereUpdatedException()
 
             if options['send_events']:
-                await self.middleware.call('datastore.send_update_events', name, id)
+                await self.middleware.call('datastore.send_update_events', name, id_)
 
-        await self._handle_relationships(id, relationships)
+        await self._handle_relationships(id_, relationships)
 
-        return id
+        return id_
 
     def _extract_relationships(self, table, prefix, data):
         relationships = self._get_relationships(table)
@@ -173,21 +190,18 @@ class DatastoreService(Service, FilterMixin, SchemaMixin):
         else:
             return self._get_pk(table) == id_or_filters
 
-    @accepts(
-        Str('name'),
-        Any('id_or_filters'),
-        Dict(
-            'options',
-            Bool('ha_sync', default=True),
-            Str('prefix', default=''),
-            Bool('send_events', default=True),
-        ),
-    )
-    async def delete(self, name, id_or_filters, options):
+    async def delete(self, name: str, id_or_filters: Any, options: dict | None = None):
         """
         Delete an entry `id` in `name`.
         """
         table = self._get_table(name)
+        options = self._handle_datastore_opts(options)
+
+        if options['cascade']:
+            if not isinstance(id_or_filters, int):
+                raise ValueError('Cascade delete is only supported when deleting a single row by its id')
+
+            await self._cascade_delete(table, id_or_filters, options)
 
         await self.middleware.call(
             'datastore.execute_write',
@@ -201,3 +215,33 @@ class DatastoreService(Service, FilterMixin, SchemaMixin):
             await self.middleware.call('datastore.send_delete_events', name, id_or_filters)
 
         return True
+
+    async def _cascade_delete(self, table, id_: int, options: dict):
+        """
+        Delete the rows that reference (via a foreign key) the row `id_` of `table` that is about to be deleted.
+        """
+        pk = self._get_pk(table)
+        child_options = {
+            'cascade': True,
+            'ha_sync': options['ha_sync'],
+            'send_events': options['send_events'],
+        }
+        for referencing_table in Model.metadata.tables.values():
+            for column in referencing_table.c:
+                if not any(foreign_key.column is pk for foreign_key in column.foreign_keys):
+                    continue
+
+                referencing_name = referencing_table.name.replace('_', '.', 1)
+                referencing_pk_name = self._get_pk(referencing_table).name
+                for row in await self.middleware.call(
+                    'datastore.query',
+                    referencing_name,
+                    [[column.name, '=', id_]],
+                    {'relationships': False},
+                ):
+                    referencing_id = row[referencing_pk_name]
+                    self.middleware.logger.warning(
+                        '%s: cascade deleting row %r referencing %s row %r',
+                        referencing_table.name, referencing_id, table.name, id_,
+                    )
+                    await self.delete(referencing_name, referencing_id, child_options)

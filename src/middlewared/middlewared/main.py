@@ -1,896 +1,589 @@
-from .apidocs import app as apidocs_app
-from .client import ejson as json
-from .common.event_source.manager import EventSourceManager
-from .event import Events
-from .job import Job, JobsQueue
-from .pipe import Pipes, Pipe
-from .restful import copy_multipart_to_pipe, RESTfulAPI
-from .settings import conf
-from .schema import clean_and_validate_arg, Error as SchemaError
-import middlewared.service
-from .service_exception import adapt_exception, CallError, CallException, ValidationError, ValidationErrors
-from .utils import MIDDLEWARE_RUN_DIR, osc, sw_version
-from .utils.debug import get_frame_details, get_threads_stacks
-from .utils.lock import SoftHardSemaphore, SoftHardSemaphoreLimit
-from .utils.nginx import get_remote_addr_port
-from .utils.plugins import LoadPluginsMixin
-from .utils.profile import profile_wrap
-from .utils.service.call import ServiceCallMixin
-from .utils.threading import set_thread_name, IoThreadPoolExecutor
-from .utils.type import copy_function_metadata
-from .webui_auth import addr_in_allowlist, WebUIAuth
-from .worker import main_worker, worker_init
-from .webhooks.cluster_events import ClusterEventsApplication
-from aiohttp import web
-from aiohttp.http_websocket import WSCloseCode
-from aiohttp.web_exceptions import HTTPPermanentRedirect
-from aiohttp.web_middlewares import normalize_path_middleware
-from aiohttp_wsgi import WSGIHandler
-from collections import defaultdict, deque
+from __future__ import annotations
 
 import argparse
 import asyncio
-import binascii
-from collections import namedtuple
+from collections import defaultdict
 import concurrent.futures
-import concurrent.futures.process
 import concurrent.futures.thread
 import contextlib
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import errno
-import fcntl
 import functools
 import inspect
-import itertools
-import multiprocessing
 import os
-import pickle
+import pathlib
 import re
-import queue
-import setproctitle
+import shutil
 import signal
-import socket
-import struct
 import sys
-import termios
+import syslog
+import textwrap
 import threading
 import time
 import traceback
 import types
-from typing import Pattern
-import urllib.parse
+import typing
 import uuid
-import tracemalloc
 
-from systemd.daemon import notify as systemd_notify
+from aiohttp import web
+from aiohttp.http_websocket import WSCloseCode
+from aiohttp.web_exceptions import HTTPPermanentRedirect
+from aiohttp.web_middlewares import normalize_path_middleware
+from pydantic import Field, create_model
+from truenas_api_client import json
 
-from . import logger
+import middlewared.service
 
+from .api.aliases import aliases as api_versions_aliases
+from .api.base.handler.dump_params import dump_params
+from .api.base.handler.model_provider import LazyModuleModelProvider, ModuleModelProvider, ProxyModelProvider
+from .api.base.handler.result import serialize_result
+from .api.base.handler.version import APIVersion, APIVersionsAdapter
+from .api.base.model import BaseModel
+from .api.base.server.api import API
+from .api.base.server.doc import APIDumper
+from .api.base.server.event import Event
+from .api.base.server.legacy_api_method import LegacyAPIMethod
+from .api.base.server.method import Method
+from .api.base.server.ws_handler.base import BaseWebSocketHandler
+from .api.base.server.ws_handler.rpc import RpcWebSocketHandler
+from .apps import FileApplication, ShellApplication, WebSocketApplication
+from .common.event_source.manager import EventSourceManager
+from .event import Events
+from .job import Job, JobsQueue, State
+from .logger import Logger, setup_audit_logging, setup_logging
+from .pipe import Pipe
+from .pylibvirt import create_pylibvirt_domains_manager
+from .role import ROLES, RoleManager
+from .service_container import BaseServiceContainer
+from .service_exception import CallError, ErrnoMixin
+from .utils import MIDDLEWARE_NGINX_SOCK, MIDDLEWARE_RUN_DIR, MIDDLEWARE_STARTED_SENTINEL_PATH, sw_version
+from .utils.audit import audit_username_from_session
+from .utils.debug import get_threads_stacks
+from .utils.lang import undefined
+from .utils.limits import MsgSizeError, MsgSizeLimit, parse_message
+from .utils.mock import coerce_mock_result, get_mock_return_model, mock_args_match
+from .utils.nss.pwd import getpwnam
+from .utils.plugins import LoadPluginsMixin
+from .utils.prctl import set_cmdline, set_name
+from .utils.privilege import app_can_see_secrets
+from .utils.profile import profile_wrap
+from .utils.rate_limit.cache import RateLimitCache
+from .utils.service.call import ServiceCallMixin
+from .utils.service.call_mixin import CallMixin
+from .utils.service.crud import real_crud_method
+from .utils.systemd import SystemdNotifier
+from .utils.threading import (
+    IoThreadPoolExecutor,
+    io_thread_pool_executor,
+    run_coro_threadsafe,
+    set_thread_name,
+    thread_local_storage,
+)
+from .utils.time_utils import utc_now
+from .utils.type import copy_function_metadata
+from .utils.types import AuditCallback, JobProgressCallback
+from .utils.web_app import SiteManager
+
+if typing.TYPE_CHECKING:
+    from collections.abc import Coroutine
+    from concurrent.futures import Future
+    from types import MethodType, ModuleType
+
+    from aiohttp.web_request import Request
+
+    from .api.base.server.app import App
+    from .api.base.server.ws_handler.rpc import RpcWebSocketApp
+    from .pipe import Pipes
+    from .service import Service
+    from .utils.origin import ConnectionOrigin
+    from .utils.types import EventType
+
+from middlewared.plugins.account.group import GroupService
+from middlewared.plugins.account.privilege import PrivilegeService
+from middlewared.plugins.account.user import UserService
+from middlewared.plugins.acme_dns_authenticator import DNSAuthenticatorService as ACMEDNSAuthenticatorService
+from middlewared.plugins.acme_protocol import ACMEProtocolService
+from middlewared.plugins.acme_registration import ACMERegistrationService
+from middlewared.plugins.alert import AlertService
+from middlewared.plugins.alert.alertclasses import AlertClassesService
+from middlewared.plugins.alert.alertservice import AlertServiceService
+from middlewared.plugins.api_key import ApiKeyService
+from middlewared.plugins.apps import AppService
+from middlewared.plugins.boot import BootService
+from middlewared.plugins.catalog import CatalogService
+from middlewared.plugins.certificate import CertificateService
+from middlewared.plugins.cloud_backup import CloudBackupService
+from middlewared.plugins.cloud_sync import CloudSyncService
+from middlewared.plugins.container import ContainerService
+from middlewared.plugins.container.lxc import LXCConfigService
+from middlewared.plugins.cron import CronJobService
+from middlewared.plugins.dns_client import DNSClientService
+from middlewared.plugins.docker import DockerService
+from middlewared.plugins.ftp import FTPService
+from middlewared.plugins.hardware import (
+    HardwareMemoryService,
+    HardwareVirtualization,
+    MseriesBiosService,
+    MseriesNvdimmService,
+)
+from middlewared.plugins.init_shutdown_script import InitShutdownScriptService
+from middlewared.plugins.keychain import KeychainCredentialService
+from middlewared.plugins.keyvalue import KeyValueService
+from middlewared.plugins.kmip import KMIPService
+from middlewared.plugins.mail import MailService
+from middlewared.plugins.network_routes import RouteService, StaticRouteService
+from middlewared.plugins.nfs_ import NFSService
+from middlewared.plugins.nfs_.share import SharingNFSService
+from middlewared.plugins.ntp import NTPServerService
+from middlewared.plugins.ports import PortService
+from middlewared.plugins.pwenc import PWEncService
+from middlewared.plugins.replication import ReplicationService
+from middlewared.plugins.reporting import ReportingService
+from middlewared.plugins.rsync import RsyncTaskService
+from middlewared.plugins.security import SystemSecurityService
+from middlewared.plugins.service import ServiceService
+from middlewared.plugins.snapshot import PeriodicSnapshotTaskService
+from middlewared.plugins.snmp import SNMPService
+from middlewared.plugins.ssh import SSHService
+from middlewared.plugins.support import SupportService
+from middlewared.plugins.sysctl import SysctlService
+from middlewared.plugins.system_advanced import SystemAdvancedService
+from middlewared.plugins.system_vendor import VendorService
+from middlewared.plugins.system_vendor.vendor import is_vendored
+from middlewared.plugins.truecommand import TruecommandService
+from middlewared.plugins.truenas import TrueNASService
+from middlewared.plugins.truenas_connect import TrueNASConnectService
+from middlewared.plugins.truenas_s3 import S3Service, SharingS3Service
+from middlewared.plugins.truesearch import TruesearchService
+from middlewared.plugins.tunable import TunableService
+from middlewared.plugins.update_ import UpdateService
+from middlewared.plugins.ups import UPSService
+from middlewared.plugins.usage import UsageService
+from middlewared.plugins.vm import VMService
+from middlewared.plugins.webshare import WebshareService
+from middlewared.plugins.webshare.sharing import SharingWebshareService
+from middlewared.plugins.zettarepl import ZettareplService
+from middlewared.plugins.zfs.resource import ZFSResourceService
+from middlewared.plugins.zfs.tier import ZfsTierService
+
+_SubHandler = typing.Callable[['Middleware', 'EventType', dict], typing.Awaitable[None]]
 SYSTEMD_EXTEND_USECS = 240000000  # 4mins in microseconds
 
 
 @dataclass
 class LoopMonitorIgnoreFrame:
-    regex: Pattern
-    substitute: str = None
+    regex: typing.Pattern
+    substitute: str | None = None
     cut_below: bool = False
 
 
-class Application(object):
-
-    def __init__(self, middleware, loop, request, response):
-        self.middleware = middleware
-        self.loop = loop
-        self.request = request
-        self.response = response
-        self.authenticated = False
-        self.authenticated_credentials = None
-        self.handshake = False
-        self.logger = logger.Logger('application').getLogger()
-        self.session_id = str(uuid.uuid4())
-        self.rest = False
-        self.websocket = True
-
-        # Allow at most 10 concurrent calls and only queue up until 20
-        self._softhardsemaphore = SoftHardSemaphore(10, 20)
-        self._py_exceptions = False
-
-        """
-        Callback index registered by services. They are blocking.
-
-        Currently the following events are allowed:
-          on_message(app, message)
-          on_close(app)
-        """
-        self.__callbacks = defaultdict(list)
-        self.__subscribed = {}
-
-    def register_callback(self, name, method):
-        assert name in ('on_message', 'on_close')
-        self.__callbacks[name].append(method)
-
-    def _send(self, data):
-        serialized = json.dumps(data)
-        asyncio.run_coroutine_threadsafe(self.response.send_str(serialized), loop=self.loop)
-        _1KB = 1000
-        if len(serialized) > _1KB:
-            # no reason to store data in the deque that
-            # is larger than ~1KB after being serialized.
-            # This gets _really_ painful on systems with
-            # many (100's) of snapshots because running a
-            # simple `zfs.snapshot.query` via midclt from
-            # the cli produces ridiculously large output.
-            # Caching that in the main middleware process
-            # is excessive and only hurts us. Instead we'll
-            # truncate to ~1KB.
-            message = serialized[:_1KB]
-        else:
-            message = serialized
-
-        self.middleware.socket_messages_queue.append({
-            'type': 'outgoing',
-            'session_id': self.session_id,
-            'message': message,
-        })
-
-    def _tb_error(self, exc_info):
-        klass, exc, trace = exc_info
-
-        frames = []
-        cur_tb = trace
-        while cur_tb:
-            tb_frame = cur_tb.tb_frame
-            cur_tb = cur_tb.tb_next
-
-            cur_frame = get_frame_details(tb_frame, self.logger)
-            if cur_frame:
-                frames.append(cur_frame)
-
-        return {
-            'class': klass.__name__,
-            'frames': frames,
-            'formatted': ''.join(traceback.format_exception(*exc_info)),
-            'repr': repr(exc_info[1]),
-        }
-
-    def get_error_dict(self, errno, reason=None, exc_info=None, etype=None, extra=None):
-        error_extra = {}
-        if self._py_exceptions and exc_info:
-            error_extra['py_exception'] = binascii.b2a_base64(pickle.dumps(exc_info[1])).decode()
-        return dict({
-            'error': errno,
-            'type': etype,
-            'reason': reason,
-            'trace': self._tb_error(exc_info) if exc_info else None,
-            'extra': extra,
-        }, **error_extra)
-
-    def send_error(self, message, errno, reason=None, exc_info=None, etype=None, extra=None):
-        self._send({
-            'msg': 'result',
-            'id': message['id'],
-            'error': self.get_error_dict(errno, reason, exc_info, etype, extra),
-        })
-
-    async def call_method(self, message, serviceobj, methodobj):
-        params = message.get('params') or []
-
-        try:
-            async with self._softhardsemaphore:
-                result = await self.middleware._call(message['method'], serviceobj, methodobj, params, app=self)
-            if isinstance(result, Job):
-                result = result.id
-            elif isinstance(result, types.GeneratorType):
-                result = list(result)
-            elif isinstance(result, types.AsyncGeneratorType):
-                result = [i async for i in result]
-            self._send({
-                'id': message['id'],
-                'msg': 'result',
-                'result': result,
-            })
-        except SoftHardSemaphoreLimit as e:
-            self.send_error(
-                message,
-                errno.ETOOMANYREFS,
-                f'Maximum number of concurrent calls ({e.args[0]}) has exceeded.',
-            )
-        except ValidationError as e:
-            self.send_error(message, e.errno, str(e), sys.exc_info(), etype='VALIDATION', extra=[
-                (e.attribute, e.errmsg, e.errno),
-            ])
-        except ValidationErrors as e:
-            self.send_error(message, errno.EAGAIN, str(e), sys.exc_info(), etype='VALIDATION', extra=list(e))
-        except (CallException, SchemaError) as e:
-            # CallException and subclasses are the way to gracefully
-            # send errors to the client
-            self.send_error(message, e.errno, str(e), sys.exc_info(), extra=e.extra)
-        except Exception as e:
-            adapted = adapt_exception(e)
-            if adapted:
-                self.send_error(message, adapted.errno, str(adapted), sys.exc_info(), extra=adapted.extra)
-            else:
-                self.send_error(message, errno.EINVAL, str(e), sys.exc_info())
-                if not self._py_exceptions:
-                    self.logger.warn('Exception while calling {}(*{})'.format(
-                        message['method'],
-                        self.middleware.dump_args(message.get('params', []), method_name=message['method'])
-                    ), exc_info=True)
-                    asyncio.ensure_future(self.__crash_reporting(sys.exc_info()))
-
-    async def __crash_reporting(self, exc_info):
-        if self.middleware.crash_reporting.is_disabled():
-            self.logger.debug('[Crash Reporting] is disabled using sentinel file.')
-        elif self.middleware.crash_reporting_semaphore.locked():
-            self.logger.debug('[Crash Reporting] skipped due too many running instances')
-        else:
-            async with self.middleware.crash_reporting_semaphore:
-                extra_log_files = (('/var/log/middlewared.log', 'middlewared_log'),)
-                await self.middleware.run_in_thread(
-                    self.middleware.crash_reporting.report,
-                    exc_info,
-                    extra_log_files,
-                )
-
-    async def subscribe(self, ident, name):
-        shortname, arg = self.middleware.event_source_manager.short_name_arg(name)
-        if shortname in self.middleware.event_source_manager.event_sources:
-            await self.middleware.event_source_manager.subscribe(self, self.__esm_ident(ident), shortname, arg)
-        else:
-            self.__subscribed[ident] = name
-
-        self._send({
-            'msg': 'ready',
-            'subs': [ident],
-        })
-
-    async def unsubscribe(self, ident):
-        if ident in self.__subscribed:
-            self.__subscribed.pop(ident)
-        elif self.__esm_ident(ident) in self.middleware.event_source_manager.idents:
-            await self.middleware.event_source_manager.unsubscribe(self.__esm_ident(ident))
-
-    def __esm_ident(self, ident):
-        return self.session_id + ident
-
-    def send_event(self, name, event_type, **kwargs):
-        if (
-            not any(i == name or i == '*' for i in self.__subscribed.values()) and
-            self.middleware.event_source_manager.short_name_arg(
-                name
-            )[0] not in self.middleware.event_source_manager.event_sources
-        ):
-            return
-        event = {
-            'msg': event_type.lower(),
-            'collection': name,
-        }
-        kwargs = kwargs.copy()
-        if 'id' in kwargs:
-            event['id'] = kwargs.pop('id')
-        if event_type in ('ADDED', 'CHANGED'):
-            if 'fields' in kwargs:
-                event['fields'] = kwargs.pop('fields')
-        if event_type == 'CHANGED':
-            if 'cleared' in kwargs:
-                event['cleared'] = kwargs.pop('cleared')
-        if kwargs:
-            event['extra'] = kwargs
-        self._send(event)
-
-    def on_open(self):
-        self.middleware.register_wsclient(self)
-
-    async def on_close(self, *args, **kwargs):
-        # Run callbacks registered in plugins for on_close
-        for method in self.__callbacks['on_close']:
-            try:
-                method(self)
-            except Exception:
-                self.logger.error('Failed to run on_close callback.', exc_info=True)
-
-        await self.middleware.event_source_manager.unsubscribe_app(self)
-
-        self.middleware.unregister_wsclient(self)
-
-    async def on_message(self, message):
-        # Run callbacks registered in plugins for on_message
-        for method in self.__callbacks['on_message']:
-            try:
-                method(self, message)
-            except Exception:
-                self.logger.error('Failed to run on_message callback.', exc_info=True)
-
-        if message['msg'] == 'connect':
-            if message.get('version') != '1':
-                self._send({'msg': 'failed', 'version': '1'})
-            else:
-                features = message.get('features') or []
-                if 'PY_EXCEPTIONS' in features:
-                    self._py_exceptions = True
-                # aiohttp can cancel tasks if a request take too long to finish
-                # It is desired to prevent that in this stage in case we are debugging
-                # middlewared via gdb (which makes the program execution a lot slower)
-                await asyncio.shield(self.middleware.call_hook('core.on_connect', app=self))
-                self._send({'msg': 'connected', 'session': self.session_id})
-                self.handshake = True
-        elif not self.handshake:
-            self._send({'msg': 'failed', 'version': '1'})
-        elif message['msg'] == 'method':
-            error = False
-            if 'method' not in message:
-                self.send_error(message, errno.EINVAL, "Message is malformed: 'method' is absent.")
-                error = True
-            else:
-                try:
-                    serviceobj, methodobj = self.middleware._method_lookup(message['method'])
-                except CallError as e:
-                    self.send_error(message, e.errno, str(e), sys.exc_info(), extra=e.extra)
-                    error = True
-            if not error and not hasattr(methodobj, '_no_auth_required'):
-                if not self.authenticated:
-                    self.send_error(message, errno.EACCES, 'Not authenticated')
-                    error = True
-                elif not self.authenticated_credentials.authorize('CALL', message['method']):
-                    self.send_error(message, errno.EACCES, 'Not authorized')
-                    error = True
-            if not error:
-                asyncio.ensure_future(self.call_method(message, serviceobj, methodobj))
-        elif message['msg'] == 'ping':
-            pong = {'msg': 'pong'}
-            if 'id' in message:
-                pong['id'] = message['id']
-            self._send(pong)
-        elif not self.authenticated:
-            self.send_error(message, errno.EACCES, 'Not authenticated')
-        elif message['msg'] == 'sub':
-            if not self.authenticated_credentials.authorize('SUBSCRIBE', message['name']):
-                self.send_error(message, errno.EACCES, 'Not authorized')
-            else:
-                await self.subscribe(message['id'], message['name'])
-        elif message['msg'] == 'unsub':
-            await self.unsubscribe(message['id'])
-
-        if message.get('msg') == 'method' and message.get('method') and isinstance(message.get('params'), list):
-            log_message = dict(
-                message, params=self.middleware.dump_args(message.get('params', []), method_name=message['method'])
-            )
-        else:
-            log_message = message
-
-        self.middleware.socket_messages_queue.append({
-            'type': 'incoming',
-            'session_id': self.session_id,
-            'message': log_message,
-        })
-
-    def __getstate__(self):
-        return {}
-
-    def __setstate__(self, newstate):
-        pass
-
-
-class FileApplication(object):
-
-    def __init__(self, middleware, loop):
-        self.middleware = middleware
-        self.loop = loop
-        self.jobs = {}
-
-    def register_job(self, job_id, buffered):
-        self.jobs[job_id] = self.middleware.loop.call_later(
-            3600 if buffered else 60,  # FIXME: Allow the job to run for infinite time + give 300 seconds to begin
-                                       # download instead of waiting 3600 seconds for the whole operation
-            lambda: asyncio.ensure_future(self._cleanup_job(job_id)),
-        )
-
-    async def _cleanup_cancel(self, job_id):
-        job_cleanup = self.jobs.pop(job_id, None)
-        if job_cleanup:
-            job_cleanup.cancel()
-
-    async def _cleanup_job(self, job_id):
-        if job_id not in self.jobs:
-            return
-        self.jobs[job_id].cancel()
-        del self.jobs[job_id]
-
-        job = self.middleware.jobs[job_id]
-        await job.pipes.close()
-
-    async def download(self, request):
-        path = request.path.split('/')
-        if not request.path[-1].isdigit():
-            resp = web.Response()
-            resp.set_status(404)
-            return resp
-
-        job_id = int(path[-1])
-
-        qs = urllib.parse.parse_qs(request.query_string)
-        denied = False
-        filename = None
-        if 'auth_token' not in qs:
-            denied = True
-        else:
-            auth_token = qs.get('auth_token')[0]
-            token = await self.middleware.call('auth.get_token', auth_token)
-            if not token:
-                denied = True
-            else:
-                if token['attributes'].get('job') != job_id:
-                    denied = True
-                else:
-                    filename = token['attributes'].get('filename')
-        if denied:
-            resp = web.Response()
-            resp.set_status(401)
-            return resp
-
-        job = self.middleware.jobs.get(job_id)
-        if not job:
-            resp = web.Response()
-            resp.set_status(404)
-            return resp
-
-        if job_id not in self.jobs:
-            resp = web.Response()
-            resp.set_status(410)
-            return resp
-
-        resp = web.StreamResponse(status=200, reason='OK', headers={
-            'Content-Type': 'application/octet-stream',
-            'Content-Disposition': f'attachment; filename="{filename}"',
-            'Transfer-Encoding': 'chunked',
-        })
-        await resp.prepare(request)
-
-        def do_copy():
-            while True:
-                read = job.pipes.output.r.read(1048576)
-                if read == b'':
-                    break
-                asyncio.run_coroutine_threadsafe(resp.write(read), loop=self.loop).result()
-
-        try:
-            await self._cleanup_cancel(job_id)
-            await self.middleware.run_in_thread(do_copy)
-        finally:
-            await job.pipes.close()
-
-        await resp.drain()
-        return resp
-
-    async def upload(self, request):
-        denied = True
-        api_key = None
-        auth = request.headers.get('Authorization')
-        if auth:
-            if auth.startswith('Basic '):
-                twofactor_auth = await self.middleware.call('auth.twofactor.config')
-                if twofactor_auth['enabled']:
-                    return web.Response(status=401, body='HTTP Basic Auth is unavailable when OTP is enabled')
-
-                try:
-                    auth = binascii.a2b_base64(auth[6:]).decode()
-                    if ':' in auth:
-                        user, password = auth.split(':', 1)
-                        if await self.middleware.call('auth.check_user', user, password):
-                            denied = False
-                except binascii.Error:
-                    pass
-            elif auth.startswith('Token '):
-                auth_token = auth.split(" ", 1)[1]
-                token = await self.middleware.call('auth.get_token', auth_token)
-
-                if token:
-                    denied = False
-            elif auth.startswith('Bearer '):
-                key = auth.split(' ', 1)[1]
-
-                if api_key := await self.middleware.call('api_key.authenticate', key):
-                    denied = False
-        else:
-            qs = urllib.parse.parse_qs(request.query_string)
-            if 'auth_token' in qs:
-                auth_token = qs.get('auth_token')[0]
-                token = await self.middleware.call('auth.get_token', auth_token)
-                if token:
-                    denied = False
-
-        if denied:
-            resp = web.Response()
-            resp.set_status(401)
-            return resp
-
-        reader = await request.multipart()
-
-        part = await reader.next()
-        if not part:
-            resp = web.Response(status=405, body='No part found on payload')
-            resp.set_status(405)
-            return resp
-
-        if part.name != 'data':
-            resp = web.Response(status=405, body='"data" part must be the first on payload')
-            resp.set_status(405)
-            return resp
-
-        try:
-            data = json.loads(await part.read())
-        except Exception as e:
-            return web.Response(status=400, body=str(e))
-
-        if 'method' not in data:
-            return web.Response(status=422)
-
-        if api_key is not None:
-            if not api_key.authorize('CALL', data['method']):
-                resp = web.Response()
-                resp.set_status(403)
-                return resp
-
-        filepart = await reader.next()
-
-        if not filepart or filepart.name != 'file':
-            resp = web.Response(status=405, body='"file" not found as second part on payload')
-            resp.set_status(405)
-            return resp
-
-        try:
-            job = await self.middleware.call(data['method'], *(data.get('params') or []),
-                                             pipes=Pipes(input=self.middleware.pipe()))
-            await self.middleware.run_in_thread(copy_multipart_to_pipe, self.loop, filepart, job.pipes.input)
-        except CallError as e:
-            if e.errno == CallError.ENOMETHOD:
-                status_code = 422
-            else:
-                status_code = 412
-            return web.Response(status=status_code, body=str(e))
-        except Exception as e:
-            return web.Response(status=500, body=str(e))
-
-        resp = web.Response(
-            status=200,
-            headers={
-                'Content-Type': 'application/json',
-            },
-            body=json.dumps({'job_id': job.id}).encode(),
-        )
-        return resp
-
-
-ShellResize = namedtuple("ShellResize", ["cols", "rows"])
-
-
-class ShellWorkerThread(threading.Thread):
-    """
-    Worker thread responsible for forking and running the shell
-    and spawning the reader and writer threads.
-    """
-
-    def __init__(self, middleware, ws, input_queue, loop, options):
-        self.middleware = middleware
-        self.ws = ws
-        self.input_queue = input_queue
-        self.loop = loop
-        self.shell_pid = None
-        self.command = self.get_command(options)
-        self._die = False
-        super(ShellWorkerThread, self).__init__(daemon=True)
-
-    def get_command(self, options):
-        allowed_options = ('chart_release', 'vm_id')
-        if all(options.get(k) for k in allowed_options):
-            raise CallError(f'Only one option is supported from {", ".join(allowed_options)}')
-
-        if options.get('vm_id'):
-            if osc.IS_FREEBSD:
-                return ['/usr/bin/cu', '-l', f'nmdm{options["vm_id"]}B']
-            else:
-                return [
-                    '/usr/bin/virsh', '-c', 'qemu+unix:///system?socket=/run/truenas_libvirt/libvirt-sock',
-                    'console', f'{options["vm_data"]["id"]}_{options["vm_data"]["name"]}'
-                ]
-        elif options.get('chart_release'):
-            return [
-                '/usr/local/bin/k3s', 'kubectl', 'exec', '-n', options['chart_release']['namespace'],
-                f'pod/{options["pod_name"]}', '--container', options['container_name'], '-it', '--',
-                options.get('command', '/bin/bash'),
-            ]
-        else:
-            return ['/usr/bin/login', '-p', '-f', 'root']
-
-    def resize(self, cols, rows):
-        self.input_queue.put(ShellResize(cols, rows))
-
-    def run(self):
-
-        self.shell_pid, master_fd = os.forkpty()
-        if self.shell_pid == 0:
-            osc.close_fds(3)
-
-            os.chdir('/root')
-            env = {
-                'TERM': 'xterm',
-                'HOME': '/root',
-                'LANG': 'en_US.UTF-8',
-                'PATH': '/sbin:/bin:/usr/sbin:/usr/bin:/usr/local/sbin:/usr/local/bin:/root/bin',
-            }
-            if osc.IS_LINUX:
-                env['LC_ALL'] = 'C.UTF-8'
-            os.execve(self.command[0], self.command, env)
-
-        # Terminal baudrate affects input queue size
-        attr = termios.tcgetattr(master_fd)
-        attr[4] = attr[5] = termios.B921600
-        termios.tcsetattr(master_fd, termios.TCSANOW, attr)
-
-        def reader():
-            """
-            Reader thread for reading from pty file descriptor
-            and forwarding it to the websocket.
-            """
-            try:
-                while True:
-                    try:
-                        read = os.read(master_fd, 1024)
-                    except OSError:
-                        break
-                    if read == b'':
-                        break
-                    asyncio.run_coroutine_threadsafe(
-                        self.ws.send_bytes(read), loop=self.loop
-                    ).result()
-            except Exception:
-                self.middleware.logger.error("Error in ShellWorkerThread.reader", exc_info=True)
-                self.abort()
-
-        def writer():
-            """
-            Writer thread for reading from input_queue and write to
-            the shell pty file descriptor.
-            """
-            try:
-                while True:
-                    try:
-                        get = self.input_queue.get(timeout=1)
-                        if isinstance(get, ShellResize):
-                            fcntl.ioctl(master_fd, termios.TIOCSWINSZ, struct.pack("HHHH", get.rows, get.cols, 0, 0))
-                        else:
-                            os.write(master_fd, get)
-                    except queue.Empty:
-                        # If we timeout waiting in input query lets make sure
-                        # the shell process is still alive
-                        try:
-                            os.kill(self.shell_pid, 0)
-                        except ProcessLookupError:
-                            break
-            except Exception:
-                self.middleware.logger.error("Error in ShellWorkerThread.writer", exc_info=True)
-                self.abort()
-
-        t_reader = threading.Thread(target=reader, daemon=True)
-        t_reader.start()
-
-        t_writer = threading.Thread(target=writer, daemon=True)
-        t_writer.start()
-
-        # Wait for shell to exit
-        while True:
-            try:
-                pid, rv = os.waitpid(self.shell_pid, os.WNOHANG)
-            except ChildProcessError:
-                break
-            if self._die:
-                return
-            if pid <= 0:
-                time.sleep(1)
-
-        t_reader.join()
-        t_writer.join()
-        asyncio.run_coroutine_threadsafe(self.ws.close(), self.loop)
-
-    def die(self):
-        self._die = True
-
-    def abort(self):
-        asyncio.run_coroutine_threadsafe(self.ws.close(), self.loop)
-
-        with contextlib.suppress(ProcessLookupError):
-            os.kill(self.shell_pid, signal.SIGTERM)
-
-        self.die()
-
-
-class ShellConnectionData(object):
-    id = None
-    t_worker = None
-
-
-class ShellApplication(object):
-    shells = {}
-
-    def __init__(self, middleware):
-        self.middleware = middleware
-
-    async def ws_handler(self, request):
-        ws = web.WebSocketResponse()
-        await ws.prepare(request)
-
-        if not await self.middleware.ws_can_access(request, ws):
-            return
-
-        conndata = ShellConnectionData()
-        conndata.id = str(uuid.uuid4())
-
-        try:
-            await self.run(ws, request, conndata)
-        except Exception:
-            if conndata.t_worker:
-                await self.worker_kill(conndata.t_worker)
-        finally:
-            self.shells.pop(conndata.id, None)
-            return ws
-
-    async def run(self, ws, request, conndata):
-
-        # Each connection will have its own input queue
-        input_queue = queue.Queue()
-        authenticated = False
-
-        async for msg in ws:
-            if authenticated:
-                # Add content of every message received in input queue
-                input_queue.put(msg.data)
-            else:
-                try:
-                    data = json.loads(msg.data)
-                except json.decoder.JSONDecodeError:
-                    continue
-
-                token = data.get('token')
-                if not token:
-                    continue
-
-                token = await self.middleware.call('auth.get_token', token)
-                if not token:
-                    await ws.send_json({
-                        'msg': 'failed',
-                        'error': {
-                            'error': errno.EACCES,
-                            'reason': 'Invalid token',
-                        }
-                    })
-                    continue
-
-                authenticated = True
-
-                options = data.get('options', {})
-                if options.get('vm_id'):
-                    options['vm_data'] = await self.middleware.call('vm.get_instance', options['vm_id'])
-                if options.get('chart_release_name'):
-                    if not options.get('pod_name') or not options.get('container_name'):
-                        raise CallError('Pod name and container name must be specified')
-
-                    options['chart_release'] = await self.middleware.call(
-                        'chart.release.get_instance', options['chart_release_name']
-                    )
-
-                conndata.t_worker = ShellWorkerThread(
-                    middleware=self.middleware, ws=ws, input_queue=input_queue, loop=asyncio.get_event_loop(),
-                    options=options,
-                )
-                conndata.t_worker.start()
-
-                self.shells[conndata.id] = conndata.t_worker
-
-                await ws.send_json({
-                    'msg': 'connected',
-                    'id': conndata.id,
-                })
-
-        # If connection was not authenticated, return earlier
-        if not authenticated:
-            return ws
-
-        if conndata.t_worker:
-            asyncio.ensure_future(self.worker_kill(conndata.t_worker))
-
-        return ws
-
-    async def worker_kill(self, t_worker):
-        # If connection has been closed lets make sure shell is killed
-        if t_worker.shell_pid:
-
-            try:
-                pid_waiter = osc.PidWaiter(self.middleware, t_worker.shell_pid)
-
-                os.kill(t_worker.shell_pid, signal.SIGTERM)
-
-                # If process has not died in 2 seconds, try the big gun
-                if not await pid_waiter.wait(2):
-                    os.kill(t_worker.shell_pid, signal.SIGKILL)
-
-                    # If process has not died even with the big gun
-                    # There is nothing else we can do, leave it be and
-                    # release the worker thread
-                    if not await pid_waiter.wait(2):
-                        t_worker.die()
-            except ProcessLookupError:
-                pass
-
-        # Wait thread join in yet another thread to avoid event loop blockage
-        # There may be a simpler/better way to do this?
-        await self.middleware.run_in_thread(t_worker.join)
-
-
+@dataclass(slots=True, frozen=True, kw_only=True)
 class PreparedCall:
-    def __init__(self, args=None, executor=None, job=None):
-        self.args = args
-        self.executor = executor
-        self.job = job
+    args: list = field(default_factory=list)
+    kwargs: dict = field(default_factory=dict)
+    executor: typing.Any | None = None
+    job: Job | None = None
+    is_coroutine: bool = False
 
 
-class Middleware(LoadPluginsMixin, ServiceCallMixin):
+def get_methods(container: BaseServiceContainer, prefix="") -> dict[str, types.MethodType]:
+    result = {}
+    for name, value in container.__dict__.items():
+        if isinstance(value, BaseServiceContainer):
+            result.update(**get_methods(value, f"{prefix}{name}."))
+        elif isinstance(value, middlewared.service.Service):
+            result.update(**get_service_methods(value, f"{prefix}{name}."))
 
-    CONSOLE_ONCE_PATH = '/tmp/.middlewared-console-once'
+    return result
+
+
+def get_service_methods(service: middlewared.service.Service, prefix: str) -> dict[str, types.MethodType]:
+    result = {}
+    for attr in dir(service):
+        if attr.startswith("_") or attr in {"call2", "call_sync2", "s"}:
+            continue
+
+        attr_value = getattr(service, attr)
+        if isinstance(attr_value, middlewared.service.Service):
+            result.update(**get_service_methods(attr_value, f"{prefix}{attr}."))
+        elif inspect.ismethod(attr_value):
+            result[f"{prefix}{attr}"] = attr_value
+
+    return result
+
+
+class AcmeDnsServicesContainer(BaseServiceContainer):
+    def __init__(self, middleware: "Middleware"):
+        super().__init__(middleware)
+        self.authenticator = ACMEDNSAuthenticatorService(middleware)
+
+
+class AcmeServicesContainer(BaseServiceContainer):
+    def __init__(self, middleware: "Middleware"):
+        super().__init__(middleware)
+        self.protocol = ACMEProtocolService(middleware)
+        self.registration = ACMERegistrationService(middleware)
+        self.dns = AcmeDnsServicesContainer(middleware)
+
+
+class HardwareServicesContainer(BaseServiceContainer):
+    def __init__(self, middleware: "Middleware"):
+        super().__init__(middleware)
+        self.memory = HardwareMemoryService(middleware)
+        self.virtualization = HardwareVirtualization(middleware)
+
+
+class MseriesServicesContainer(BaseServiceContainer):
+    def __init__(self, middleware: "Middleware"):
+        super().__init__(middleware)
+        self.bios = MseriesBiosService(middleware)
+        self.nvdimm = MseriesNvdimmService(middleware)
+
+
+class PoolServicesContainer(BaseServiceContainer):
+    def __init__(self, middleware: "Middleware"):
+        super().__init__(middleware)
+        self.snapshottask = PeriodicSnapshotTaskService(middleware)
+
+
+class SharingServicesContainer(BaseServiceContainer):
+    def __init__(self, middleware: "Middleware"):
+        super().__init__(middleware)
+        self.nfs = SharingNFSService(middleware)
+        self.s3 = SharingS3Service(middleware)
+        self.webshare = SharingWebshareService(middleware)
+
+
+class SystemServicesContainer(BaseServiceContainer):
+    def __init__(self, middleware: "Middleware"):
+        super().__init__(middleware)
+        self.advanced = SystemAdvancedService(middleware)
+        self.ntpserver = NTPServerService(middleware)
+        self.security = SystemSecurityService(middleware)
+        self.vendor = VendorService(middleware)
+
+
+class ZfsServicesContainer(BaseServiceContainer):
+    def __init__(self, middleware: "Middleware"):
+        super().__init__(middleware)
+        self.resource = ZFSResourceService(middleware)
+        self.tier = ZfsTierService(middleware)
+
+
+class ServiceContainer(BaseServiceContainer):
+    def __init__(self, middleware: "Middleware"):
+        super(ServiceContainer, self).__init__(middleware)
+
+        self.acme = AcmeServicesContainer(middleware)
+        self.alert = AlertService(middleware)
+        self.alertclasses = AlertClassesService(middleware)
+        self.alertservice = AlertServiceService(middleware)
+        self.api_key = ApiKeyService(middleware)
+        self.app = AppService(middleware)
+        self.boot = BootService(middleware)
+        self.catalog = CatalogService(middleware)
+        self.certificate = CertificateService(middleware)
+        self.cloud_backup = CloudBackupService(middleware)
+        self.cloudsync = CloudSyncService(middleware)
+        self.container = ContainerService(middleware)
+        self.cronjob = CronJobService(middleware)
+        self.dnsclient = DNSClientService(middleware)
+        self.docker = DockerService(middleware)
+        self.ftp = FTPService(middleware)
+        self.group = GroupService(middleware)
+        self.hardware = HardwareServicesContainer(middleware)
+        self.initshutdownscript = InitShutdownScriptService(middleware)
+        self.keyvalue = KeyValueService(middleware)
+        self.keychaincredential = KeychainCredentialService(middleware)
+        self.kmip = KMIPService(middleware)
+        self.lxc = LXCConfigService(middleware)
+        self.mail = MailService(middleware)
+        self.mseries = MseriesServicesContainer(middleware)
+        self.nfs = NFSService(middleware)
+        self.pool = PoolServicesContainer(middleware)
+        self.port = PortService(middleware)
+        self.privilege = PrivilegeService(middleware)
+        self.pwenc = PWEncService(middleware)
+        self.replication = ReplicationService(middleware)
+        self.reporting = ReportingService(middleware)
+        self.route = RouteService(middleware)
+        self.rsynctask = RsyncTaskService(middleware)
+        self.s3 = S3Service(middleware)
+        self.service = ServiceService(middleware)
+        self.sharing = SharingServicesContainer(middleware)
+        self.snmp = SNMPService(middleware)
+        self.ssh = SSHService(middleware)
+        self.staticroute = StaticRouteService(middleware)
+        self.support = SupportService(middleware)
+        self.sysctl = SysctlService(middleware)
+        self.system = SystemServicesContainer(middleware)
+        self.tn_connect = TrueNASConnectService(middleware)
+        self.truecommand = TruecommandService(middleware)
+        self.truenas = TrueNASService(middleware)
+        self.truesearch = TruesearchService(middleware)
+        self.tunable = TunableService(middleware)
+        self.update = UpdateService(middleware)
+        self.ups = UPSService(middleware)
+        self.usage = UsageService(middleware)
+        self.user = UserService(middleware)
+        self.vm = VMService(middleware)
+        self.webshare = WebshareService(middleware)
+        self.zettarepl = ZettareplService(middleware)
+        self.zfs = ZfsServicesContainer(middleware)
+
+        self.methods = get_methods(self)
+        for method_name, method in self.methods.items():
+            method.__func__.__method_name__ = method_name
+
+
+_AuditEvent = typing.Literal[
+    'METHOD_CALL', 'AUTHENTICATION', 'REBOOT', 'SHUTDOWN', 'LOGOUT',
+    'WEBSHELL_AUTHENTICATION', 'WEBSHELL_LOGOUT',
+]
+
+
+class Middleware(LoadPluginsMixin, ServiceCallMixin, CallMixin):
+
+    CONSOLE_ONCE_PATH = f'{MIDDLEWARE_RUN_DIR}/.middlewared-console-once'
 
     def __init__(
-        self, loop_debug=False, loop_monitor=True, debug_level=None,
-        log_handler=None, trace_malloc=False,
-        log_format='[%(asctime)s] (%(levelname)s) %(name)s.%(funcName)s():%(lineno)d - %(message)s',
+        self,
+        loop_debug: bool = False,
+        loop_monitor: bool = True,
+        debug_level: typing.Literal['TRACE', 'DEBUG', 'INFO', 'WARN', 'ERROR'] = 'DEBUG',
+        log_handler: typing.Literal['console', 'file'] = 'file',
+        log_format: str = '[%(asctime)s] (%(levelname)s) %(name)s.%(funcName)s():%(lineno)d - %(message)s',
+        print_version: bool = True,
     ):
+        # Initialized in self.run()
+        self.app: web.Application
+        self.loop: asyncio.AbstractEventLoop
+        self.runner: web.AppRunner
+        self.site_manager = SiteManager()
+        self.api_versions: list[APIVersion]
+        self.api_versions_adapter: APIVersionsAdapter
+
         super().__init__()
-        self.logger = logger.Logger(
-            'middlewared', debug_level, log_format
-        ).getLogger()
-        self.logger.info('Starting %s middleware', sw_version())
-        self.crash_reporting = logger.CrashReporting()
-        self.crash_reporting_semaphore = asyncio.Semaphore(value=2)
+        self.logger = Logger('middlewared', debug_level, log_format).getLogger()
+        if print_version:
+            self.logger.info('Starting %s middleware', sw_version())
         self.loop_debug = loop_debug
         self.loop_monitor = loop_monitor
-        self.trace_malloc = trace_malloc
         self.debug_level = debug_level
         self.log_handler = log_handler
         self.log_format = log_format
-        self.app = None
-        self.loop = None
         self.__thread_id = threading.get_ident()
-        self.thread_pool_executor = IoThreadPoolExecutor()
-        multiprocessing.set_start_method('spawn')  # Spawn new processes for ProcessPool instead of forking
-        self.__init_procpool()
-        self.__wsclients = {}
-        self.__events = Events()
+        self.__wsclients: dict[str, 'RpcWebSocketApp'] = {}
+        self.role_manager = RoleManager(ROLES)
+        self.events = Events(self.role_manager)
         self.event_source_manager = EventSourceManager(self)
-        self.__event_subs = defaultdict(list)
-        self.__hooks = defaultdict(list)
-        self.__blocked_hooks = defaultdict(lambda: 0)
+        self.__event_subs: defaultdict[str, list[_SubHandler]] = defaultdict(list)
+        self.__hooks: defaultdict[str, list[dict]] = defaultdict(list)
+        self.__blocked_hooks: defaultdict[str, int] = defaultdict(int)  # int() -> 0
         self.__blocked_hooks_lock = threading.Lock()
-        self.__server_threads = []
         self.__init_services()
-        self.__console_io = False if os.path.exists(self.CONSOLE_ONCE_PATH) else None
-        self.__terminate_task = None
+        self.__console_io: typing.TextIO | typing.Literal[False, None] = (
+            False if os.path.exists(self.CONSOLE_ONCE_PATH) else None
+        )
+        self.__terminate_task: asyncio.Task | None = None
         self.jobs = JobsQueue(self)
-        self.mocks = {}
-        self.socket_messages_queue = deque(maxlen=200)
+        self.mocks: defaultdict[str, list[tuple[list, typing.Callable]]] = defaultdict(list)
+        self.tasks: set[asyncio.Task] = set()
+        self.__audit_logger = setup_audit_logging()
+        self.external_method_calls = defaultdict(int)  # Track external API method calls
+        self.libvirt_domains_manager = create_pylibvirt_domains_manager(self)
+        self.dump_result_allow_fallback = True
+        self.services = ServiceContainer(self)
+        self._systemd_notifier: SystemdNotifier | None = None
+
+    @typing.overload
+    def get_method(
+        self, name: str, *, mocks: typing.Literal[True], params: typing.Iterable
+    ) -> tuple[Service, typing.Callable]: ...
+
+    @typing.overload
+    def get_method(
+        self, name: str, *, mocks: typing.Literal[False] = False, params: None = None
+    ) -> tuple[Service, MethodType]: ...
+
+    def get_method(
+        self, name: str, *, mocks: bool = False, params: typing.Iterable | None = None
+    ) -> tuple[Service, typing.Callable]:
+        serviceobj, methodobj = super().get_method(name)
+
+        if mocks:
+            if mock := self._mock_method(name, params):
+                methodobj = mock
+
+        return serviceobj, methodobj
+
+    def create_task[T](self, coro: Coroutine[typing.Any, typing.Any, T], *, name: str | None = None) -> asyncio.Task[T]:
+        if threading.get_ident() != self.__thread_id:
+            raise RuntimeError("You can only use create_task from main thread")
+
+        task = self.loop.create_task(coro, name=name)
+        self.tasks.add(task)
+        task.add_done_callback(self.tasks.discard)
+        return task
+
+    def create_task_threadsafe[T](self, coro: Coroutine[typing.Any, typing.Any, T], *, name: str | None = None) -> None:
+        self.loop.call_soon_threadsafe(lambda: self.create_task(coro, name=name))
+
+    def _load_apis(self) -> dict[str, API]:
+        api_versions = self._load_api_versions()
+        api_versions_adapter = APIVersionsAdapter(api_versions)
+        self.api_versions = api_versions
+        self.api_versions_adapter = api_versions_adapter  # FIXME: Only necessary as a class member for legacy WS API
+        self._check_removed_in(api_versions)
+        apis = self._create_apis(api_versions, api_versions_adapter)
+        for service in self.get_services().values():
+            for current_api_model, model_factory, arg_model_name in getattr(service, '_register_models', []):
+                for api_version in self.api_versions:
+                    api_version.register_model(current_api_model, model_factory, arg_model_name)
+        return apis
+
+    def _load_api_versions(self) -> list[APIVersion]:
+        versions = []
+
+        api_dir = os.path.join(os.path.dirname(__file__), 'api')
+        api_versions_with_module = {
+            version_dir.name.replace('_', '.'): f'middlewared.api.{version_dir.name}'
+            for version_dir in sorted(pathlib.Path(api_dir).iterdir())
+            if version_dir.name.startswith('v') and version_dir.is_dir() and (version_dir / '__init__.py').exists()
+        }
+        model_providers = {}
+        for i, (version, module_name) in enumerate(api_versions_with_module.items()):
+            if i == len(api_versions_with_module) - 1:
+                model_provider = ModuleModelProvider(module_name)
+            else:
+                model_provider = LazyModuleModelProvider(io_thread_pool_executor, module_name)
+
+            model_providers[version] = model_provider
+
+        for api_version, alias in api_versions_aliases.items():
+            if api_version in model_providers:
+                raise RuntimeError(f"Both API module and API alias exist for API version {api_version!r}")
+
+            if (model_provider := model_providers.get(alias)) is None:
+                raise RuntimeError(f"API version {alias!r} (API version {api_version!r} is its alias) does not exist")
+
+            model_providers[api_version] = ProxyModelProvider(model_provider)
+
+        for api_version in sorted(set(api_versions_with_module.keys()) | set(api_versions_aliases.keys())):
+            versions.append(APIVersion(api_version, model_providers[api_version]))
+
+        return versions
+
+    def _check_removed_in(self, api_versions: list[APIVersion]):
+        min_version = min([version.version for version in api_versions])
+        for method_name, method in self._get_methods():
+            if removed_in := getattr(method, "_removed_in", None):
+                if removed_in < min_version:
+                    raise ValueError(
+                        f"Method {method_name} was scheduled to be removed in API version {removed_in}. "
+                        "This API version is no longer present. Please, either remove this method, or make it private."
+                    )
+
+    def _create_apis(
+        self,
+        api_versions: list[APIVersion],
+        api_versions_adapter: APIVersionsAdapter
+    ) -> dict[str, API]:
+        current_api = self._create_api(api_versions[-1].version, Method)
+
+        apis = {
+            "current": current_api,
+            api_versions[-1].version: current_api,
+        }
+
+        for version in api_versions[:-1]:
+            apis[version.version] = self._create_api(version.version, lambda middleware, method_name: LegacyAPIMethod(
+                middleware,
+                method_name,
+                version.version,
+                api_versions_adapter,
+            ))
+
+        return apis
+
+    def _create_api(self, version: str, method_factory: typing.Callable[[Middleware, str], Method]) -> API:
+        methods = []
+        for method_name, methodobj in self._get_methods():
+            method = method_factory(self, method_name)
+
+            if removed_in := getattr(methodobj, "_removed_in", None):
+                if version >= removed_in:
+                    method.private = True
+
+            methods.append(method)
+
+        events = []
+
+        for name, event in self.events:
+            events.append(Event(self, name, event))
+
+        for name, event_source in self.event_source_manager.event_sources.items():
+            description = ''
+            if event_source.__doc__:
+                description += f'{textwrap.dedent(event_source.__doc__).strip()}\n\n'
+            description += (
+                'This event is generated by a dynamic source. If you want to specify subscription params, subscribe to '
+                f'it using the name in the following format `{name}:{{"param": "value"}}`'
+            )
+
+            events.append(Event(self, name, {
+                'description': description,
+                'models': {
+                    'Subscription parameters': event_source.args,
+                    'ADDED': create_model(
+                        event_source.event.__name__,
+                        __base__=(BaseModel,),
+                        __module__=event_source.__module__,
+                        fields=typing.Annotated[event_source.event.model_fields["result"].annotation, Field()],  # noqa: F821
+                    ),
+                },
+                'roles': self.role_manager.roles_for_event(name),
+                'private': False,
+            }))
+
+        events = sorted(events, key=lambda e: e.name)
+
+        return API(version, methods, events)
+
+    def _get_methods(self) -> list[tuple[str, typing.Callable]]:
+        methods = []
+        for service_name, service in self.get_services().items():
+            for attribute in dir(service):
+                if attribute.startswith("_"):
+                    continue
+
+                method = getattr(service, attribute)
+                if not callable(method):
+                    continue
+
+                method_name = f"{service_name}.{attribute}"
+
+                methods.append((method_name, method))
+
+        return methods
+
+    def _add_api_route(self, version: str, api: API):
+        self.app.router.add_route('GET', f'/api/{version}', RpcWebSocketHandler(self, api.methods))
 
     def __init_services(self):
-        from middlewared.service import CoreService
+        from middlewared.service.core_service import CoreService
         self.add_service(CoreService(self))
         self.event_register('core.environ', 'Send on middleware process environment changes.', private=True)
-        self.event_register('core.reconfigure_logging', 'Send when /var/log is remounted.', private=True)
 
-    async def __plugins_load(self):
-
+    def __plugins_load(self):
         setup_funcs = []
 
-        def on_module_begin(mod):
+        def on_module_begin(mod: ModuleType):
             self._console_write(f'loaded plugin {mod.__name__}')
             self.__notify_startup_progress()
 
-        def on_module_end(mod):
+        def on_module_end(mod: ModuleType):
             if not hasattr(mod, 'setup'):
                 return
 
@@ -906,7 +599,49 @@ class Middleware(LoadPluginsMixin, ServiceCallMixin):
             on_module_begin=on_module_begin,
             on_module_end=on_module_end,
             on_modules_loaded=on_modules_loaded,
+            service_container=self.services,
         )
+
+        implicit_methods = ('config', 'get_instance', 'query')
+        role_manager = self.role_manager
+        for namespace, service in self.get_services().items():
+            for method in implicit_methods:
+                role_manager.register_method(f'{namespace}.{method}', [])
+
+            config = service._config
+            role_prefix = config.role_prefix
+            if role_prefix:
+                for method in implicit_methods:
+                    role_manager.add_roles_to_method(f'{namespace}.{method}', [f'{role_prefix}_READ'])
+
+                for method, role in (
+                    ('create', 'WRITE'),
+                    ('update', 'WRITE'),
+                    ('delete', 'DELETE' if config.role_separate_delete else 'WRITE'),
+                ):
+                    role_manager.register_method(f'{namespace}.{method}', [f'{role_prefix}_{role}'])
+
+            for method_name in dir(service):
+                if method_name.startswith('_'):
+                    continue
+
+                method = getattr(service, method_name)
+                if not inspect.ismethod(method):
+                    continue
+
+                roles = getattr(method, 'roles', None) or []
+
+                if method_name in {'do_create', 'do_update', 'do_delete'}:
+                    method_name = method_name.removeprefix('do_')
+
+                if method_name.endswith('_choices'):
+                    roles.append('READONLY_ADMIN')
+
+                    if role_prefix:
+                        roles.append(f'{role_prefix}_READ')
+
+                if roles:
+                    role_manager.register_method(f'{namespace}.{method_name}', roles, exist_ok=True)
 
         return setup_funcs
 
@@ -917,6 +652,9 @@ class Middleware(LoadPluginsMixin, ServiceCallMixin):
             plugin, function = plugin__function
 
             beginning = [
+                # Move uploaded config files to their appropriate locations
+                'config',
+                # Connect to the database
                 'datastore',
                 # Allow internal UNIX socket authentication for plugins that run in separate pools
                 'auth',
@@ -938,13 +676,20 @@ class Middleware(LoadPluginsMixin, ServiceCallMixin):
                 'alert',
                 # Migrate users and groups ASAP
                 'account',
+                # Invalid cloud credentials need to be deleted before invalid cloud tasks
+                'cloud_credentials',
+                'cloud_backup',
+                'cloud_sync',
                 # Replication plugin needs to be initialized before zettarepl in order to register network activity
                 'replication',
                 # Migrate network interfaces ASAP
                 'network',
+                # catalog needs to be initialized before docker setup funcs are executed
+                # TODO: Remove this when we have upgrade alerts in place
+                'catalog',
             ]
             try:
-                return beginning.index(plugin)
+                return beginning.index(plugin.split('.')[0])
             except ValueError:
                 return len(beginning)
         setup_funcs = sorted(setup_funcs, key=sort_key)
@@ -956,10 +701,10 @@ class Middleware(LoadPluginsMixin, ServiceCallMixin):
             name, f = setup_func
             self._console_write(f'setting up plugins ({name}) [{i + 1}/{setup_total}]')
             self.__notify_startup_progress()
-            call = f(self)
+            result = f(self)
             # Allow setup to be a coroutine
-            if asyncio.iscoroutinefunction(f):
-                await call
+            if inspect.isawaitable(result):
+                await result
 
         self.logger.debug('All plugins loaded')
 
@@ -974,11 +719,12 @@ class Middleware(LoadPluginsMixin, ServiceCallMixin):
                         delay = method._periodic.interval
 
                     method_name = f'{service_name}.{task_name}'
-                    self.logger.debug(
+                    self.logger.trace(
                         f"Setting up periodic task {method_name} to run every {method._periodic.interval} seconds"
                     )
 
-                    self.loop.call_later(
+                    self.loop.call_soon_threadsafe(
+                        self.loop.call_later,
                         delay,
                         functools.partial(
                             self.__call_periodic_task,
@@ -987,7 +733,7 @@ class Middleware(LoadPluginsMixin, ServiceCallMixin):
                     )
 
     def __call_periodic_task(self, method, service_name, service_obj, method_name, interval):
-        self.loop.create_task(self.__periodic_task_wrapper(method, service_name, service_obj, method_name, interval))
+        self.create_task(self.__periodic_task_wrapper(method, service_name, service_obj, method_name, interval))
 
     async def __periodic_task_wrapper(self, method, service_name, service_obj, method_name, interval):
         self.logger.trace("Calling periodic task %s", method_name)
@@ -1004,6 +750,8 @@ class Middleware(LoadPluginsMixin, ServiceCallMixin):
             )
         )
 
+    console_error_counter = 0
+
     def _console_write(self, text, fill_blank=True, append=False):
         """
         Helper method to write the progress of middlewared loading to the
@@ -1012,6 +760,15 @@ class Middleware(LoadPluginsMixin, ServiceCallMixin):
         There are some cases where loading will take a considerable amount of time,
         giving user at least some basic feedback is fundamental.
         """
+        console_error_log_max = 3
+        if self.console_error_counter == console_error_log_max:
+            # sigh, truenas is installed on "gamer" hardware which
+            # is miserable. The amount of quirks seen on this style
+            # of hardware is astounding really. If we continually
+            # fail to log to console, there is no reason to spam
+            # our log file with it.
+            return
+
         # False means we are running in a terminal, no console needed
         self.logger.trace('_console_write %r', text)
         if self.__console_io is False:
@@ -1022,7 +779,9 @@ class Middleware(LoadPluginsMixin, ServiceCallMixin):
                 return
             try:
                 self.__console_io = open('/dev/console', 'w')
-            except Exception:
+            except Exception as e:
+                self.logger.debug('Failed to open console: %r', e)
+                self.console_error_counter += 1
                 return
             try:
                 # We need to make sure we only try to write to console one time
@@ -1048,38 +807,52 @@ class Middleware(LoadPluginsMixin, ServiceCallMixin):
                     blank = ' ' * (maxlen - (len(prefix) + len(text)))
                 else:
                     blank = ''
-                writes = self.__console_io.write(
-                    f'\r{prefix}{text}{blank}{newline}'
-                )
+                self.__console_io.write(f'\r{prefix}{text}{blank}{newline}')
             self.__console_io.flush()
-            return writes
-        except OSError:
-            self.logger.debug('Failed to write to console', exc_info=True)
-        except Exception:
-            pass
+            # be sure and reset error counter after we successfully log
+            # to the console
+            self.console_error_counter = 0
+        except Exception as e:
+            self.logger.debug('Failed to write to console: %r', e)
+            self.console_error_counter += 1
 
     def __notify_startup_progress(self):
-        systemd_notify(f'EXTEND_TIMEOUT_USEC={SYSTEMD_EXTEND_USECS}')
+        if self._systemd_notifier:
+            self._systemd_notifier.notify(f'EXTEND_TIMEOUT_USEC={SYSTEMD_EXTEND_USECS}')
 
     def __notify_startup_complete(self):
-        with open(middlewared.service.MIDDLEWARE_STARTED_SENTINEL_PATH, 'w'):
+        with open(MIDDLEWARE_STARTED_SENTINEL_PATH, 'w'):
             pass
 
-        systemd_notify('READY=1')
+        if self._systemd_notifier:
+            self._systemd_notifier.notify('READY=1')
+            self.loop.create_task(self.__watchdog(), name="watchdog")
+
+    async def __watchdog(self):
+        while True:
+            self._systemd_notifier.notify("WATCHDOG=1")
+            await asyncio.sleep(60)
 
     def plugin_route_add(self, plugin_name, route, method):
         self.app.router.add_route('*', f'/_plugins/{plugin_name}/{route}', method)
 
-    def get_wsclients(self):
-        return self.__wsclients
-
-    def register_wsclient(self, client):
+    def register_wsclient(self, client: RpcWebSocketApp):
         self.__wsclients[client.session_id] = client
 
-    def unregister_wsclient(self, client):
+    def unregister_wsclient(self, client: RpcWebSocketApp):
         self.__wsclients.pop(client.session_id)
 
-    def register_hook(self, name, method, *, blockable=False, inline=False, order=0, raise_error=False, sync=True):
+    def register_hook(
+        self,
+        name: str,
+        method: typing.Callable,
+        *,
+        blockable: bool = False,
+        inline: bool = False,
+        order: int = 0,
+        raise_error: bool = False,
+        sync: bool = True
+    ):
         """
         Register a hook under `name`.
 
@@ -1093,7 +866,6 @@ class Middleware(LoadPluginsMixin, ServiceCallMixin):
             raise_error(bool): whether an exception should be raised if a sync hook call fails
             sync(bool): whether the method should be called in a sync way
         """
-
         for hook in self.__hooks[name]:
             if hook['blockable'] != blockable:
                 qualname = hook['method'].__qualname__
@@ -1105,7 +877,7 @@ class Middleware(LoadPluginsMixin, ServiceCallMixin):
 
         if inline:
             if asyncio.iscoroutinefunction(method):
-                raise RuntimeError('You can\'t register coroutine function as inline hook')
+                raise RuntimeError("You can't register coroutine function as inline hook")
 
             if not sync:
                 raise RuntimeError('Inline hooks are always called in a sync way')
@@ -1137,11 +909,12 @@ class Middleware(LoadPluginsMixin, ServiceCallMixin):
             for name in names:
                 self.__blocked_hooks[name] += 1
 
-        yield
-
-        with self.__blocked_hooks_lock:
-            for name in names:
-                self.__blocked_hooks[name] -= 1
+        try:
+            yield
+        finally:
+            with self.__blocked_hooks_lock:
+                for name in names:
+                    self.__blocked_hooks[name] -= 1
 
     def _call_hook_base(self, name, *args, **kwargs):
         if self.__blocked_hooks[name] > 0:
@@ -1149,16 +922,21 @@ class Middleware(LoadPluginsMixin, ServiceCallMixin):
 
         for hook in self.__hooks[name]:
             try:
-                yield hook, hook['method'](self, *args, **kwargs)
+                if asyncio.iscoroutinefunction(hook['method']) or hook['inline']:
+                    fut = hook['method'](self, *args, **kwargs)
+                else:
+                    fut = self.run_in_thread(hook['method'], self, *args, **kwargs)
+
+                yield hook, fut
             except Exception:
                 if hook['raise_error']:
                     raise
 
                 self.logger.error(
-                    'Failed to run hook {}:{}(*{}, **{})'.format(name, hook['method'], args, kwargs), exc_info=True
+                    'Failed to run hook %s:%s(*%s, **%s)', name, hook['method'], args, kwargs, exc_info=True
                 )
 
-    async def call_hook(self, name, *args, **kwargs):
+    async def call_hook(self, name: str, *args, **kwargs) -> None:
         """
         Call all hooks registered under `name` passing *args and **kwargs.
         Args:
@@ -1171,56 +949,36 @@ class Middleware(LoadPluginsMixin, ServiceCallMixin):
                 elif hook['sync']:
                     await fut
                 else:
-                    asyncio.ensure_future(fut)
+                    self.create_task(fut)
             except Exception:
                 if hook['raise_error']:
                     raise
 
                 self.logger.error(
-                    'Failed to run hook {}:{}(*{}, **{})'.format(name, hook['method'], args, kwargs), exc_info=True
+                    'Failed to run hook %s:%s(*%s, **%s)', name, hook['method'], args, kwargs, exc_info=True
                 )
 
-    def call_hook_sync(self, name, *args, **kwargs):
-        return self.run_coroutine(self.call_hook(name, *args, **kwargs))
+    def call_hook_sync(self, name: str, *args, **kwargs) -> None:
+        self.run_coroutine(self.call_hook(name, *args, **kwargs))
 
-    def call_hook_inline(self, name, *args, **kwargs):
+    def call_hook_inline(self, name: str, *args, **kwargs) -> None:
         for hook, fut in self._call_hook_base(name, *args, **kwargs):
             if not hook['inline']:
                 raise RuntimeError('Only inline hooks can be called with call_hook_inline')
-
-    def register_event_source(self, name, event_source):
-        self.event_source_manager.register(name, event_source)
 
     async def run_in_executor(self, pool, method, *args, **kwargs):
         """
         Runs method in a native thread using concurrent.futures.Pool.
         This prevents a CPU intensive or non-asyncio friendly method
         to block the event loop indefinitely.
-        Also used to run non thread safe libraries (using a ProcessPool)
         """
         loop = asyncio.get_event_loop()
         return await loop.run_in_executor(pool, functools.partial(method, *args, **kwargs))
 
-    async def run_in_thread(self, method, *args, **kwargs):
-        return await self.run_in_executor(self.thread_pool_executor, method, *args, **kwargs)
+    async def run_in_thread[**P, T](self, method: typing.Callable[P, T], *args: P.args, **kwargs: P.kwargs) -> T:
+        return await self.run_in_executor(io_thread_pool_executor, method, *args, **kwargs)
 
-    def __init_procpool(self):
-        self.__procpool = concurrent.futures.ProcessPoolExecutor(
-            max_workers=5,
-            initializer=functools.partial(worker_init, self.debug_level, self.log_handler)
-        )
-
-    async def run_in_proc(self, method, *args, **kwargs):
-        retries = 2
-        for i in range(retries):
-            try:
-                return await self.run_in_executor(self.__procpool, method, *args, **kwargs)
-            except concurrent.futures.process.BrokenProcessPool:
-                if i == retries - 1:
-                    raise
-                self.__init_procpool()
-
-    def pipe(self, buffered=False):
+    def pipe(self, buffered: bool = False) -> Pipe:
         """
         :param buffered: Please see :class:`middlewared.pipe.Pipe` documentation for information on unbuffered and
             buffered pipes.
@@ -1228,27 +986,60 @@ class Middleware(LoadPluginsMixin, ServiceCallMixin):
         return Pipe(self, buffered)
 
     def _call_prepare(
-        self, name, serviceobj, methodobj, params, app=None, job_on_progress_cb=None, pipes=None, in_event_loop=True,
-    ):
+        self,
+        name: str,
+        serviceobj: Service,
+        methodobj: typing.Callable,
+        params: typing.Sequence,
+        kwargs: dict | None = None,
+        *,
+        app: App | None = None,
+        audit_callback: AuditCallback | None = None,
+        job_on_progress_cb: JobProgressCallback = None,
+        job_silent: bool = False,
+        message_id: str | None = None,
+        pipes: Pipes | None = None,
+        in_event_loop: bool = True,
+    ) -> PreparedCall:
         """
         :param in_event_loop: Whether we are in the event loop thread.
         :return:
         """
+        kwargs = kwargs or {}
+        audit_callback = audit_callback or (lambda message: None)
+
+        params = list(params)
+
         args = []
         if hasattr(methodobj, '_pass_app'):
+            if methodobj._pass_app['require'] and app is None:
+                raise CallError('`app` is required')
+
             args.append(app)
 
-        if params:
-            args.extend(params)
+        is_coroutine = asyncio.iscoroutinefunction(methodobj)
+
+        if getattr(methodobj, 'audit_callback', None):
+            args.append(audit_callback)
+
+        if hasattr(methodobj, '_pass_thread_local_storage'):
+            if is_coroutine:
+                raise RuntimeError("Thread local storage is invalid for coroutines")
+            args.append(thread_local_storage)
+
+        if hasattr(methodobj, '_pass_app'):
+            if methodobj._pass_app['message_id']:
+                args.append(message_id)
+
+        args.extend(params)
 
         # If the method is marked as a @job we need to create a new
         # entry to keep track of its state.
         job_options = getattr(methodobj, '_job', None)
         if job_options:
-            if serviceobj._config.process_pool:
-                job_options['process'] = True
             # Create a job instance with required args
-            job = Job(self, name, serviceobj, methodobj, args, job_options, pipes, job_on_progress_cb)
+            job = Job(self, name, serviceobj, methodobj, params, job_options, pipes, job_on_progress_cb, job_silent,
+                      app, message_id, audit_callback)
             # Add the job to the queue.
             # At this point an `id` is assigned to the job.
             # Job might be replaced with an already existing job if `lock_queue_size` is used.
@@ -1264,102 +1055,401 @@ class Middleware(LoadPluginsMixin, ServiceCallMixin):
 
                 self.loop.call_soon_threadsafe(cb)
                 event.wait()
-            return PreparedCall(job=job)
+            return PreparedCall(job=job, is_coroutine=is_coroutine)
 
         if hasattr(methodobj, '_thread_pool'):
             executor = methodobj._thread_pool
         elif serviceobj._config.thread_pool:
             executor = serviceobj._config.thread_pool
         else:
-            executor = self.thread_pool_executor
+            executor = io_thread_pool_executor
 
-        return PreparedCall(args=args, executor=executor)
+        return PreparedCall(args=args, kwargs=kwargs, executor=executor, is_coroutine=is_coroutine)
 
     async def _call(
-        self, name, serviceobj, methodobj, params, **kwargs,
-    ):
-        prepared_call = self._call_prepare(name, serviceobj, methodobj, params, **kwargs)
+        self,
+        name: str,
+        serviceobj: Service,
+        methodobj: typing.Callable,
+        params: typing.Sequence,
+        kwargs: dict | None = None,
+        *,
+        app: App | None = None,
+        audit_callback: AuditCallback | None = None,
+        job_on_progress_cb: JobProgressCallback = None,
+        job_silent: bool = False,
+        message_id: str | None = None,
+        pipes: Pipes | None = None,
+        in_event_loop: bool = True,
+    ) -> typing.Any:
+        prepared_call = self._call_prepare(
+            name, serviceobj, methodobj, params, kwargs, app=app, audit_callback=audit_callback,
+            job_on_progress_cb=job_on_progress_cb, job_silent=job_silent, message_id=message_id, pipes=pipes,
+            in_event_loop=in_event_loop
+        )
 
         if prepared_call.job:
             return prepared_call.job
 
-        if asyncio.iscoroutinefunction(methodobj):
+        if prepared_call.is_coroutine:
             self.logger.trace('Calling %r in current IO loop', name)
-            return await methodobj(*prepared_call.args)
-
-        if name not in self.mocks and serviceobj._config.process_pool:
-            self.logger.trace('Calling %r in process pool', name)
-            if isinstance(serviceobj, middlewared.service.CRUDService):
-                service_name, method_name = name.rsplit('.', 1)
-                if method_name in ['create', 'update', 'delete']:
-                    name = f'{service_name}.do_{method_name}'
-            return await self._call_worker(name, *prepared_call.args)
+            return await methodobj(*prepared_call.args, **prepared_call.kwargs)
 
         self.logger.trace('Calling %r in executor %r', name, prepared_call.executor)
-        return await self.run_in_executor(prepared_call.executor, methodobj, *prepared_call.args)
+        return await self.run_in_executor(
+            prepared_call.executor,
+            methodobj,
+            *prepared_call.args,
+            **prepared_call.kwargs,
+        )
 
-    async def _call_worker(self, name, *args, job=None):
-        return await self.run_in_proc(main_worker, name, args, job)
-
-    def dump_args(self, args, method=None, method_name=None):
+    def dump_args(
+        self,
+        args: list[typing.Any],
+        method: typing.Any = None,
+        method_name: str | None = None,
+    ) -> list[typing.Any]:
         if method is None:
             if method_name is not None:
                 try:
-                    method = self._method_lookup(method_name)[1]
+                    method = self.get_method(method_name, mocks=True, params=args)[1]
                 except Exception:
                     return args
 
-        if (not hasattr(method, 'accepts') and
-                method.__name__ in ['create', 'update', 'delete'] and
-                hasattr(method, '__self__')):
-            child_method = getattr(method.__self__, f'do_{method.__name__}', None)
-            if child_method is not None:
-                method = child_method
+        if crud_method := real_crud_method(method):
+            method = crud_method
 
-        if not hasattr(method, 'accepts'):
-            return args
+        if hasattr(method, 'new_style_accepts'):
+            return dump_params(method.new_style_accepts, args, False)
 
-        return [method.accepts[i].dump(arg) if i < len(method.accepts) else arg
-                for i, arg in enumerate(args)]
+        return args
 
-    def dump_result(self, result, method):
-        if not hasattr(method, 'returns'):
+    def dump_result(
+        self,
+        serviceobj: Service,
+        methodobj: typing.Callable,
+        app: App | None,
+        result: typing.Any,
+        *,
+        new_style_returns_model: type[BaseModel] | None = None,
+        expose_secrets: bool = True,
+    ):
+        """
+        Serialize and redact `result` based on authenticated credential and schema.  This method is used when
+        preparing middleware call results for external consumption (either as a call return, or as a value
+        that is logged somewhere). The goal is to ensure that secret / private fields are redacted, i.e.
+        replaced with "********" when appropriate.
+
+        Params:
+            serviceobj: middleware service object
+            methodobj: middleware method object
+            app: websocket app. None if this is an internal method call (full admin privileges)
+            result: result data to be normalized / redacted
+        Keyword-only params:
+            new_style_returns_model:
+            expose secrets: when set to False, Secret/Private fields will _always_
+            be redacted. This is used when generating the results info for core.get_jobs output when
+            the raw_result option is set to False (which is how we call it when generating debugs).
+
+        Raises:
+            pydantic.ValidationError: The result contains values that are not permitted according
+            to the pydantic model. This means the return value or the model is wrong.
+        """
+        if not app_can_see_secrets(app, serviceobj._config.role_prefix):
+            expose_secrets = False
+
+        if isinstance(result, Job):
             return result
 
-        return [
-            method.returns[i].dump(r) if i < len(method.returns) else r for i, r in enumerate([result])
-        ]
+        if (
+            (method_self := getattr(methodobj, "__self__", None))
+            and methodobj.__name__ in {"create", "update", "delete"}
+            and (do_method := getattr(method_self, f"do_{methodobj.__name__}", None))
+        ):
+            # FIXME: Get rid of `create`/`do_create` duality
+            methodobj = do_method
 
-    async def call(self, name, *params, pipes=None, job_on_progress_cb=None, app=None, profile=False):
-        serviceobj, methodobj = self._method_lookup(name)
+        if new_style_returns_model is None:
+            if hasattr(methodobj, "new_style_returns"):
+                new_style_returns_model = methodobj.new_style_returns
+
+        if new_style_returns_model:
+            return serialize_result(new_style_returns_model, result, expose_secrets, self.dump_result_allow_fallback)
+        else:
+            return result
+
+    async def authorize_method_call(
+        self,
+        app: RpcWebSocketApp,
+        method_name: str,
+        methodobj: typing.Any,
+        params: list[typing.Any],
+    ) -> None:
+        if hasattr(methodobj, '_no_auth_required'):
+            if app.authenticated:
+                # Do not rate limit authenticated users
+                return
+
+            if not getattr(methodobj, 'rate_limit', True):
+                # The method is not subjected to rate limit.
+                return
+
+            ip_added = await RateLimitCache.add(method_name, app.origin)
+            if ip_added is None:
+                # the origin of the request for the unauthenticated method is an
+                # internal call or comes from the other controller on an HA system
+                return
+
+            if any((
+                RateLimitCache.max_entries_reached,
+                RateLimitCache.rate_limit_exceeded(method_name, ip_added),
+            )):
+                # 1 of 2 things happened:
+                #   1. we've hit maximum amount of entries for global rate limit
+                #       cache (this is an edge-case and something bad is going on)
+                #   2. OR this endpoint has been hit too many times by the same
+                #       origin IP address
+                #   In either scenario, sleep a random delay and send an error
+                await self.log_audit_message_for_method(method_name, methodobj, params, app, False, False, False)
+                await RateLimitCache.random_sleep()
+                raise CallError('Rate Limit Exceeded', errno.EBUSY)
+
+            # was added to rate limit cache but rate limit thresholds haven't
+            # been met so no error
+            return
+
+        if not app.authenticated:
+            await self.log_audit_message_for_method(method_name, methodobj, params, app, False, False, False)
+            raise CallError('Not authenticated', ErrnoMixin.ENOTAUTHENTICATED)
+
+        # Some methods require authentication to the NAS (a valid account)
+        # but not explicit authorization. In this case the authorization
+        # check is bypassed as long as it is a user session. API keys
+        # explicitly whitelist particular methods and are used for targeted
+        # purposes, and so authorization is _always_ enforced.
+        if app.authenticated_credentials.is_user_session and hasattr(methodobj, '_no_authz_required'):
+            return
+
+        if not app.authenticated_credentials.authorize('CALL', method_name):
+            await self.log_audit_message_for_method(method_name, methodobj, params, app, True, False, False)
+            if app.authenticated_credentials.is_user_session and not app.authenticated_credentials.is_valid():
+                raise CallError('Session is expired', errno.EACCES)
+
+            raise CallError('Not authorized', errno.EACCES)
+
+    def can_subscribe(self, app, name):
+        short_name = name.split(':')[0]
+        if event := self.events.get_event(short_name):
+            if event['no_auth_required']:
+                return True
+
+        if not app.authenticated:
+            return False
+
+        if event:
+            if event['no_authz_required']:
+                return True
+
+        return app.authenticated_credentials.authorize('SUBSCRIBE', short_name)
+
+    async def call_with_audit(
+        self, method: str, serviceobj: Service, methodobj: typing.Callable, params: typing.Iterable, app: App, **kwargs
+    ) -> typing.Any:
+        audit_callback_messages = []
+
+        async def log_audit_message_for_method(success):
+            await self.log_audit_message_for_method(method, methodobj, params, app, True, True, success,
+                                                    audit_callback_messages)
+
+        async def job_on_finish_cb(job):
+            await log_audit_message_for_method(job.state == State.SUCCESS)
+
+        success = False
+        job = None
+        try:
+            result = await self._call(method, serviceobj, methodobj, params, app=app,
+                                      audit_callback=audit_callback_messages.append, **kwargs)
+            success = True
+            if isinstance(result, Job):
+                job = result
+                await job.set_on_finish_cb(job_on_finish_cb)
+
+            return result
+        finally:
+            # If the method is a job, audit message will be logged by `job_on_finish_cb`
+            if job is None:
+                await log_audit_message_for_method(success)
+
+    async def log_audit_message_for_method(
+        self,
+        method,
+        methodobj,
+        params: typing.Iterable,
+        app: App,
+        authenticated: bool,
+        authorized: bool,
+        success: bool,
+        callback_messages: typing.Iterable | None = None,
+    ) -> None:
+        callback_messages = callback_messages or []
+
+        audit = getattr(methodobj, 'audit', None)
+        audit_extended = getattr(methodobj, 'audit_extended', None)
+        if audit is None:
+            if crud_method := real_crud_method(methodobj):
+                audit = getattr(crud_method, 'audit', None)
+                audit_extended = getattr(crud_method, 'audit_extended', None)
+        if audit:
+            audits = [audit]
+
+            if callback_messages:
+                audits = [f'{audit} {callback_message}' for callback_message in callback_messages]
+            elif audit_extended:
+                try:
+                    audits[0] = f'{audit} {audit_extended(*params)}'
+                except Exception:
+                    pass
+
+            for description in audits:
+                await self.log_audit_message(app, 'METHOD_CALL', {
+                    'method': method,
+                    'params': self.dump_args(params, methodobj),
+                    'description': description,
+                    'authenticated': authenticated,
+                    'authorized': authorized,
+                }, success)
+
+    def _build_audit_message_sync(
+        self,
+        app: App,
+        event: _AuditEvent,
+        event_data: dict,
+        success: bool,
+    ) -> str:
+        """
+        Synchronous helper to build audit message with all JSON serialization.
+
+        This method performs all CPU-bound JSON serialization in a single call,
+        which can then be offloaded to a thread pool to prevent blocking the event loop.
+        """
+        remote_addr, origin = "127.0.0.1", None
+        if app is not None and app.origin is not None:
+            origin = app.origin.repr
+            if app.origin.is_tcp_ip_family:
+                remote_addr = origin
+
+        credentials = None
+        if app.authenticated_credentials:
+            credentials = {
+                "credentials": app.authenticated_credentials.class_name(),
+                "credentials_data": app.authenticated_credentials.dump(),
+            }
+
+        vers = {"major": 0, "minor": 1}
+        svc_data_dict = {
+            "vers": vers,
+            "origin": origin,
+            "protocol": "WEBSOCKET" if app.websocket else "REST",
+            "credentials": credentials,
+        }
+        audit_dict = {
+            "TNAUDIT": {
+                "aid": str(uuid.uuid4()),
+                "vers": vers,
+                "addr": remote_addr,
+                "user": audit_username_from_session(app.authenticated_credentials),
+                "sess": app.session_id,
+                "time": utc_now().strftime('%Y-%m-%d %H:%M:%S.%f'),
+                "svc": "MIDDLEWARE",
+                "svc_data": json.dumps(svc_data_dict),
+                "event": event,
+                "event_data": json.dumps(event_data),
+                "success": success,
+            }
+        }
+        return f"@cee:{json.dumps(audit_dict)}"
+
+    def log_audit_message_sync(
+        self,
+        app: App,
+        event: _AuditEvent,
+        event_data: dict,
+        success: bool,
+    ) -> None:
+        message = self._build_audit_message_sync(
+            app,
+            event,
+            event_data,
+            success,
+        )
+
+        self.__audit_logger.info(message)
+
+    async def log_audit_message(
+        self,
+        app: App,
+        event: _AuditEvent,
+        event_data: dict,
+        success: bool,
+    ) -> None:
+        await asyncio.to_thread(
+            self.log_audit_message_sync,
+            app,
+            event,
+            event_data,
+            success,
+        )
+
+    async def call(
+        self,
+        name: str,
+        *params,
+        app: App | None = None,
+        audit_callback: AuditCallback | None = None,
+        job_on_progress_cb: JobProgressCallback = None,
+        job_silent: bool = False,
+        pipes: Pipes | None = None,
+        profile: bool = False,
+    ) -> typing.Any:
+        serviceobj, methodobj = self.get_method(name, mocks=True, params=params)
 
         if profile:
             methodobj = profile_wrap(methodobj)
 
         return await self._call(
             name, serviceobj, methodobj, params,
-            app=app, job_on_progress_cb=job_on_progress_cb, pipes=pipes,
+            app=app, audit_callback=audit_callback, job_on_progress_cb=job_on_progress_cb, job_silent=job_silent,
+            pipes=pipes,
         )
 
-    def call_sync(self, name, *params, job_on_progress_cb=None, background=False):
+    def call_sync(
+        self,
+        name: str,
+        *params,
+        job_on_progress_cb: JobProgressCallback = None,
+        job_silent: bool = False,
+        app: App | None = None,
+        audit_callback: AuditCallback | None = None,
+        background: bool = False,
+    ) -> typing.Any:
+        if threading.get_ident() == self.__thread_id:
+            raise RuntimeError('You cannot use call_sync from main thread')
+
         if background:
-            return self.loop.call_soon_threadsafe(lambda: asyncio.ensure_future(self.call(name, *params)))
+            return self.loop.call_soon_threadsafe(lambda: self.create_task(self.call(name, *params, app=app)))
 
-        serviceobj, methodobj = self._method_lookup(name)
+        serviceobj, methodobj = self.get_method(name, mocks=True, params=params)
 
-        prepared_call = self._call_prepare(name, serviceobj, methodobj, params, job_on_progress_cb=job_on_progress_cb,
-                                           in_event_loop=True)
+        prepared_call = self._call_prepare(name, serviceobj, methodobj, params, app=app, audit_callback=audit_callback,
+                                           job_on_progress_cb=job_on_progress_cb, job_silent=job_silent,
+                                           in_event_loop=False)
 
         if prepared_call.job:
             return prepared_call.job
 
-        if asyncio.iscoroutinefunction(methodobj):
+        if prepared_call.is_coroutine:
             self.logger.trace('Calling %r in main IO loop', name)
             return self.run_coroutine(methodobj(*prepared_call.args))
-
-        if serviceobj._config.process_pool:
-            self.logger.trace('Calling %r in process pool', name)
-            return self.run_coroutine(self._call_worker(name, *prepared_call.args))
 
         if not self._in_executor(prepared_call.executor):
             self.logger.trace('Calling %r in executor %r', name, prepared_call.executor)
@@ -1367,6 +1457,95 @@ class Middleware(LoadPluginsMixin, ServiceCallMixin):
 
         self.logger.trace('Calling %r in current thread', name)
         return methodobj(*prepared_call.args)
+
+    # Signature is provided per call site by the `mypy_call2` plugin.
+    async def call2(
+        self,
+        f: typing.Callable[..., typing.Any],
+        *args: typing.Any,
+        app: App | None = None,
+        audit_callback: AuditCallback | None = None,
+        job_on_progress_cb: JobProgressCallback = None,
+        job_silent: bool = False,
+        pipes: Pipes | None = None,
+        profile: bool = False,
+        **kwargs: typing.Any,
+    ) -> typing.Any:
+        if threading.get_ident() != self.__thread_id:
+            raise RuntimeError("You can only use call from main thread")
+
+        name, serviceobj, methodobj = self.get_method_by_callable(f, args)
+
+        if profile:
+            methodobj = profile_wrap(methodobj)
+
+        return await self._call(
+            name, serviceobj, methodobj, args, kwargs,
+            app=app, audit_callback=audit_callback, job_on_progress_cb=job_on_progress_cb, pipes=pipes,
+        )
+
+    def call_sync2(
+        self,
+        f: typing.Callable[..., typing.Any],
+        *args: typing.Any,
+        app: App | None = None,
+        audit_callback: AuditCallback | None = None,
+        background: bool = False,
+        job_on_progress_cb: JobProgressCallback = None,
+        job_silent: bool = False,
+        **kwargs: typing.Any,
+    ) -> typing.Any:
+        if threading.get_ident() == self.__thread_id:
+            raise RuntimeError("You cannot use call_sync from main thread")
+
+        call_kwargs = {
+            **kwargs,
+            "app": app,
+            "audit_callback": audit_callback,
+            "job_on_progress_cb": job_on_progress_cb,
+        }
+
+        if background:
+            return self.loop.call_soon_threadsafe(lambda: self.create_task(self.call2(f, *args, **call_kwargs)))
+
+        if asyncio.iscoroutinefunction(f):
+            return asyncio.run_coroutine_threadsafe(self.call2(f, *args, **call_kwargs), self.loop).result()
+
+        name, serviceobj, methodobj = self.get_method_by_callable(f, args)
+        prepared_call = self._call_prepare(name, serviceobj, methodobj, args, kwargs, app=app,
+                                           audit_callback=audit_callback, job_on_progress_cb=job_on_progress_cb,
+                                           job_silent=job_silent, in_event_loop=False)
+
+        if prepared_call.job:
+            return prepared_call.job
+
+        if prepared_call.is_coroutine:
+            self.logger.trace("Calling %r in main IO loop", name)
+            return self.run_coroutine(methodobj(*prepared_call.args, **prepared_call.kwargs))
+
+        if not self._in_executor(prepared_call.executor):
+            self.logger.trace("Calling %r in executor %r", name, prepared_call.executor)
+            return self.run_coroutine(self.run_in_executor(prepared_call.executor, methodobj, *prepared_call.args,
+                                                           **prepared_call.kwargs))
+
+        self.logger.trace("Calling %r in current thread", name)
+        return methodobj(*prepared_call.args, **prepared_call.kwargs)
+
+    def get_method_by_callable(self, f: typing.Callable, args: typing.Sequence) -> tuple[str, Service, typing.Callable]:
+        if not inspect.ismethod(f):
+            raise RuntimeError(f"{f!r} is not a method")
+
+        name = getattr(f, "__method_name__", None)
+        if name is None:
+            raise RuntimeError(f"{f!r} is not a member of `self.middleware.services` hierarchy")
+
+        serviceobj = f.__self__
+        methodobj = f
+
+        if mock := self._mock_method(name, args):
+            methodobj = mock
+
+        return name, serviceobj, methodobj
 
     def _in_executor(self, executor):
         if isinstance(executor, concurrent.futures.thread.ThreadPoolExecutor):
@@ -1376,9 +1555,27 @@ class Middleware(LoadPluginsMixin, ServiceCallMixin):
         else:
             raise RuntimeError(f"Unknown executor: {executor!r}")
 
-    def run_coroutine(self, coro, wait=True):
+    @typing.overload
+    def run_coroutine[T](
+        self,
+        coro: Coroutine[typing.Any, typing.Any, T],
+        wait: typing.Literal[True] = True,
+    ) -> T: ...
+
+    @typing.overload
+    def run_coroutine[T](
+        self,
+        coro: Coroutine[typing.Any, typing.Any, T],
+        wait: typing.Literal[False] = False,
+    ) -> Future[T]: ...
+
+    def run_coroutine[T](
+        self,
+        coro: Coroutine[typing.Any, typing.Any, T],
+        wait: bool = True,
+    ) -> T | Future[T]:
         if threading.get_ident() == self.__thread_id:
-            raise RuntimeError('You cannot call_sync or run_coroutine from main thread')
+            raise RuntimeError('You cannot use run_coroutine from main thread')
 
         fut = asyncio.run_coroutine_threadsafe(coro, self.loop)
         if not wait:
@@ -1395,176 +1592,161 @@ class Middleware(LoadPluginsMixin, ServiceCallMixin):
         while not event.wait(1):
             if not self.loop.is_running():
                 raise RuntimeError('Middleware is terminating')
+
         return fut.result()
 
-    def get_events(self):
-        return itertools.chain(
-            self.__events, map(
-                lambda n: (
-                    n[0],
-                    {
-                        'description': inspect.getdoc(n[1]),
-                        'private': False,
-                        'wildcard_subscription': False,
-                        'accepts': n[1].ACCEPTS,
-                        'returns': n[1].RETURNS,
-                    }
-                ),
-                self.event_source_manager.event_sources.items()
-            )
-        )
-
-    def event_subscribe(self, name, handler):
+    def event_subscribe(self, name: str, handler: _SubHandler):
         """
         Internal way for middleware/plugins to subscribe to events.
         """
         self.__event_subs[name].append(handler)
 
-    def event_register(self, name, description, private=False, returns=None):
+    def event_register(
+        self,
+        name: str,
+        description: str,
+        *,
+        private: bool = False,
+        models: dict[EventType, type[BaseModel]] | None = None,
+        no_auth_required: bool = False,
+        no_authz_required: bool = False,
+        roles: typing.Iterable[str] | None = None,
+    ):
         """
-        All events middleware can send should be registered so they are properly documented
-        and can be browsed in documentation page without source code inspection.
+        All middleware events should be registered, so they are properly documented
+        and can be browsed in the API documentation without having to inspect source code.
         """
-        self.__events.register(name, description, private, returns)
+        roles = roles or []
+        self.events.register(name, description, private, models, no_auth_required, no_authz_required, roles)
 
-    def send_event(self, name, event_type, **kwargs):
+    def send_event(self, name: str, event_type: EventType, **kwargs):
+        """
+        Send the `name` event to every subscriber of it.
 
-        if name not in self.__events:
+        Any keyword argument other than the ones below becomes part of the event payload: `id`
+        identifies the object the event is about, and anything else reaches the subscriber as `extra`.
+
+        :param name: name of the event.
+        :param event_type: one of `ADDED`, `CHANGED` or `REMOVED`.
+        :param should_send_event: called with each subscribed app, which receives the event only if
+            the call returns true. Every subscriber receives the event when this is omitted.
+        :param fields: the new value of the object, identical for every recipient. Mutually exclusive
+            with `fields_factory`.
+        :param fields_factory: builds the new value of the object for a single recipient. Called with
+            the app that receives the event, or with `None` for an internally subscribed plugin, once
+            per recipient. Mutually exclusive with `fields`.
+        """
+        should_send_event = kwargs.pop('should_send_event', None)
+        fields = kwargs.pop('fields', undefined)
+        fields_factory = kwargs.pop('fields_factory', None)
+        if fields is not undefined and fields_factory is not None:
+            raise ValueError('Specify either `fields` or `fields_factory`, not both.')
+
+        if name not in self.events:
             # We should eventually deny events that are not registered to ensure every event is
             # documented but for backward-compatibility and safety just log it for now.
-            self.logger.warning(f'Event {name!r} not registered.')
+            self.logger.warning('Event %r not registered.', name)
 
         assert event_type in ('ADDED', 'CHANGED', 'REMOVED')
 
-        event_data = self.__events.get_event(name)
-        # TODO: Temporarily skip events which are CHANGED but have cleared set for validation as CHANGED
-        # will be removed in next release and this case wouldn't be applicable
-        if event_data and conf.debug_mode and event_type in ('ADDED', 'CHANGED') and 'cleared' not in kwargs:
-            verrors = ValidationErrors()
-            clean_and_validate_arg(verrors, event_data['returns'][0], kwargs.get('fields'))
-            verrors.check()
+        def payload(app: App | None) -> dict[str, typing.Any]:
+            if fields_factory is not None:
+                return dict(kwargs, fields=fields_factory(app))
 
-        self.logger.trace(f'Sending event {name!r}:{event_type!r}:{kwargs!r}')
+            if fields is not undefined:
+                return dict(kwargs, fields=fields)
+
+            return kwargs
+
+        internal_payload = payload(None)
+
+        self.logger.trace('Sending event %r:%r:%r', name, event_type, internal_payload)
 
         for session_id, wsclient in list(self.__wsclients.items()):
             try:
-                wsclient.send_event(name, event_type, **kwargs)
+                if should_send_event is None or should_send_event(wsclient):
+                    wsclient.send_event(name, event_type, **payload(wsclient))
             except Exception:
-                self.logger.warn('Failed to send event {} to {}'.format(name, session_id), exc_info=True)
+                self.logger.warning('Failed to send event %s to %s', name, session_id, exc_info=True)
 
-        async def wrap(handler):
+        async def wrap(handler: _SubHandler):
             try:
-                await handler(self, event_type, kwargs)
+                await handler(self, event_type, internal_payload)
             except Exception:
-                self.logger.error('Unhandled exception in event handler', exc_info=True)
+                self.logger.error('%s: Unhandled exception in event handler', name, exc_info=True)
 
         # Send event also for internally subscribed plugins
         for handler in self.__event_subs.get(name, []):
-            asyncio.run_coroutine_threadsafe(wrap(handler), loop=self.loop)
-
-    def pdb(self):
-        import pdb
-        pdb.set_trace()
+            run_coro_threadsafe(wrap(handler), loop=self.loop, log_exceptions=True)
 
     def log_threads_stacks(self):
         for thread_id, stack in get_threads_stacks().items():
             self.logger.debug('Thread %d stack:\n%s', thread_id, ''.join(stack))
 
-    def _tracemalloc_start(self, limit, interval):
-        """
-        Run an endless loop grabbing snapshots of allocated memory using
-        the python's builtin "tracemalloc" module.
+    def set_mock(self, name: str, args: list, mock: typing.Callable):
+        for _args, _mock in self.mocks[name]:
+            if args == _args:
+                raise ValueError(f'{name!r} is already mocked with {args!r}')
 
-        `limit` integer representing number of lines to print showing
-                highest memory consumer
-        `interval` integer representing the time in seconds to wait
-                before taking another memory snapshot
-        """
-        # set the thread name
-        set_thread_name('tracemalloc_monitor')
-
-        # initalize tracemalloc
-        tracemalloc.start()
-
-        # if given bogus numbers, default both of them respectively
-        if limit <= 0:
-            limit = 5
-        if interval <= 0:
-            interval = 5
-
-        # filters for the snapshots so we can
-        # ignore modules that we don't care about
-        filters = (
-            tracemalloc.Filter(False, '<frozen importlib._bootstrap>'),
-            tracemalloc.Filter(False, '<frozen importlib._bootstrap_external>'),
-            tracemalloc.Filter(False, '<unknown>'),
-            tracemalloc.Filter(False, '*tracemalloc.py'),
-        )
-
-        # start the loop
-        prev = None
-        while True:
-            if prev is None:
-                prev = tracemalloc.take_snapshot()
-                prev = prev.filter_traces(filters)
-            else:
-                curr = tracemalloc.take_snapshot()
-                curr = curr.filter_traces(filters)
-                diff = curr.compare_to(prev, 'lineno')
-
-                prev = curr
-                curr = None
-                stats = f'\nTop {limit} consumers:'
-                for idx, stat in enumerate(diff[:limit], 1):
-                    stats += f'#{idx}: {stat}\n'
-
-                # print the memory used by the tracemalloc module itself
-                tm_mem = tracemalloc.get_tracemalloc_memory()
-                # add a newline at end of output to make logs more readable
-                stats += f'Memory used by tracemalloc module: {tm_mem:.1f} KiB\n'
-
-                self.logger.debug(stats)
-
-            time.sleep(interval)
-
-    def set_mock(self, name, mock):
-        if name in self.mocks:
-            raise ValueError(f'{name!r} is already mocked')
-
-        serviceobj, methodobj = self._method_lookup(name)
+        serviceobj, methodobj = self.get_method(name)
+        mock_return_model = get_mock_return_model(serviceobj, methodobj)
 
         if inspect.iscoroutinefunction(mock):
             async def f(*args, **kwargs):
-                return await mock(serviceobj, *args, **kwargs)
+                result = await mock(serviceobj, *args, **kwargs)
+                return coerce_mock_result(result, mock_return_model)
         else:
             def f(*args, **kwargs):
-                return mock(serviceobj, *args, **kwargs)
+                result = mock(serviceobj, *args, **kwargs)
+                return coerce_mock_result(result, mock_return_model)
 
         if hasattr(methodobj, '_job'):
             f._job = methodobj._job
         copy_function_metadata(mock, f)
 
-        self.mocks[name] = f
+        self.mocks[name].append((args, f))
 
-    def remove_mock(self, name):
-        self.mocks.pop(name)
+    def remove_mock(self, name, args):
+        for i, (_args, _mock) in enumerate(self.mocks[name]):
+            if args == _args:
+                del self.mocks[name][i]
+                break
 
-    def _method_lookup(self, name):
-        serviceobj, methodobj = super()._method_lookup(name)
+    def _mock_method(self, name: str, params: typing.Iterable) -> typing.Callable | None:
+        if mocks := self.mocks.get(name):
+            for args, mock in mocks:
+                if mock_args_match(args, list(params)):
+                    return mock
+            for args, mock in mocks:
+                if args is None:
+                    return mock
 
-        if mock := self.mocks.get(name):
-            return serviceobj, mock
-
-        return serviceobj, methodobj
-
-    async def ws_handler(self, request):
+    async def create_and_prepare_ws(self, request: 'Request') -> tuple[web.WebSocketResponse, bool]:
         ws = web.WebSocketResponse()
-        await ws.prepare(request)
+        prepared = False
+        try:
+            await ws.prepare(request)
+            prepared = True
+        except ConnectionResetError:
+            # happens when we're preparing a new session
+            # and during the time we prepare, the server
+            # is stopped/killed/restarted etc. Ignore these
+            # to prevent log spam
+            pass
 
-        if not await self.ws_can_access(request, ws):
-            return
+        return ws, prepared
 
-        connection = Application(self, self.loop, request, ws)
+    async def ws_handler(self, request: 'Request') -> web.WebSocketResponse:
+        ws, prepared = await self.create_and_prepare_ws(request)
+        if not prepared:
+            return ws
+
+        handler = BaseWebSocketHandler(self)
+        origin = await handler.get_origin(request)
+        if not await self.ws_can_access(ws, origin):
+            return ws
+
+        connection = WebSocketApplication(self, origin, self.loop, request, ws)
         connection.on_open()
 
         try:
@@ -1580,15 +1762,27 @@ class Middleware(LoadPluginsMixin, ServiceCallMixin):
                     )
                     break
 
-                if not connection.authenticated and len(msg.data) > 8192:
+                try:
+                    message = parse_message(connection.authenticated, msg.data)
+                except MsgSizeError as err:
+                    if err.limit is not MsgSizeLimit.UNAUTHENTICATED:
+                        origin = connection.origin.repr if connection.origin else None
+                        if connection.authenticated_credentials:
+                            creds = connection.authenticated_credentials.dump()
+                        else:
+                            creds = None
+
+                        self.logger.error(
+                            'Client using credentials [%s] at [%s] sent message with payload size [%d bytes] '
+                            'exceeding limit of %d for method %s',
+                            creds, origin, err.datalen, err.limit, err.method_name
+                        )
+
                     await ws.close(
-                        code=WSCloseCode.INVALID_TEXT,
-                        message='Anonymous connection max message length is 8 kB'.encode('utf-8'),
+                        code=err.ws_close_code,
+                        message=err.ws_errmsg.encode('utf-8'),
                     )
                     break
-
-                try:
-                    message = json.loads(msg.data)
                 except ValueError as f:
                     await ws.close(
                         code=WSCloseCode.INVALID_TEXT,
@@ -1610,19 +1804,27 @@ class Middleware(LoadPluginsMixin, ServiceCallMixin):
 
         return ws
 
-    async def ws_can_access(self, request, ws):
-        if ui_allowlist := await self.call('system.general.get_ui_allowlist'):
-            sock = request.transport.get_extra_info('socket')
-            if sock.family != socket.AF_UNIX:
-                remote_addr, remote_port = get_remote_addr_port(request)
-                if not addr_in_allowlist(remote_addr, ui_allowlist):
-                    await ws.close(
-                        code=WSCloseCode.POLICY_VIOLATION,
-                        message='You are not allowed to access this resource'.encode('utf-8'),
-                    )
-                    return False
+    async def ws_can_access(self, ws: web.WebSocketResponse, origin: 'ConnectionOrigin | None') -> bool:
+        if await BaseWebSocketHandler(self).can_access(origin):
+            return True
 
-        return True
+        await ws.close(
+            code=WSCloseCode.POLICY_VIOLATION,
+            message='You are not allowed to access this resource'.encode('utf-8'),
+        )
+        return False
+
+    async def boot_id_handler(self, request):
+        return web.Response(
+            body=json.dumps(await self.call("system.boot_id")),
+            content_type="application/json",
+        )
+
+    async def api_versions_handler(self, request):
+        return web.Response(
+            body=json.dumps([version.version for version in self.api_versions]),
+            content_type="application/json",
+        )
 
     _loop_monitor_ignore_frames = (
         LoopMonitorIgnoreFrame(
@@ -1664,7 +1866,7 @@ class Middleware(LoadPluginsMixin, ServiceCallMixin):
                         continue
 
                     if ignore.substitute:
-                        self.logger.warn('%s seems to be blocking event loop', ignore.substitute)
+                        self.logger.warning('%s seems to be blocking event loop', ignore.substitute)
                         skip = True
                     elif ignore.cut_below:
                         stack = stack[:i + 1] + [f'  ... + {len(stack)} lines below ...']
@@ -1672,45 +1874,116 @@ class Middleware(LoadPluginsMixin, ServiceCallMixin):
                     break
 
                 if not skip:
-                    self.logger.warn(''.join(['Task seems blocked:\n'] + stack))
+                    self.logger.warning(''.join(['Task seems blocked:\n'] + stack))
 
             last = current
 
-    def run(self):
+    async def dump_api(self, stream: typing.TextIO, keep_refs: bool = False):
+        self.__plugins_load()
 
+        apis = self._load_apis()
+        current_api = apis.pop("current")
+
+        result = {"versions": []}
+        for version, api in apis.items():
+            version_title = version
+            if api.version == current_api.version:
+                version_title += " (current)"
+
+            dumper = APIDumper(version, version_title, api, self.role_manager, keep_refs=keep_refs)
+            dumped_api = await dumper.dump()
+            result["versions"].append(dumped_api.model_dump())
+
+        # Use async-safe json.dump to prevent blocking on file I/O
+        await asyncio.to_thread(json.dump, result, stream)
+
+    async def dump_methods(self, stream: typing.TextIO):
+        self.__plugins_load()
+
+        # Access the core service directly and call the private method
+        core_service = self.get_services()['core']
+        methods = core_service._get_all_methods()
+
+        json.dump(methods, stream)
+
+    def _save_coverage(self) -> None:
+        # os._exit() skips coverage.py's atexit save, so flush explicitly.
+        if middlewared._coverage is not None:
+            middlewared._coverage.stop()
+            middlewared._coverage.save()
+
+    def run(
+        self,
+        single_task: typing.Callable[[], typing.Coroutine[typing.Any, typing.Any, int]] | None = None,
+    ) -> None:
+        """
+        Run the middleware event loop.
+
+        Args:
+            single_task: Optional coroutine factory that returns a single task to execute.
+                        The task should return an integer exit code. If provided, middleware
+                        will initialize, run this single task, and exit with the returned code.
+                        If None (default), middleware will run indefinitely in normal daemon mode.
+
+        The method initializes the middleware, sets up the event loop, and either:
+        - Runs forever as a daemon (when single_task is None), or
+        - Executes the provided single task and exits with its return code
+        """
         self._console_write('starting')
-
-        set_thread_name('asyncio_loop')
         self.loop = asyncio.get_event_loop()
-
+        self.loop.set_default_executor(io_thread_pool_executor.executor)
         if self.loop_debug:
             self.loop.set_debug(True)
             self.loop.slow_callback_duration = 0.2
 
         self.loop.run_until_complete(self.__initialize())
 
+        if single_task is not None:
+            exit_code = self.loop.run_until_complete(single_task())
+
+            # Kill everyone else in my process group
+            pgid = os.getpgid(0)
+            pid = os.getpid()
+            with os.scandir("/proc") as entries:
+                for entry in entries:
+                    if entry.name.isdigit():
+                        p = int(entry.name)
+                        try:
+                            if p != pid and os.getpgid(p) == pgid:
+                                os.kill(p, signal.SIGKILL)
+                        except Exception:
+                            pass
+
+            self._save_coverage()
+            os._exit(exit_code)
+
+        exitcode = 0
         try:
             self.loop.run_forever()
-        except RuntimeError as e:
-            if e.args[0] != "Event loop is closed":
-                raise
+        except BaseException as e:
+            if not (isinstance(e, RuntimeError) and e.args[0] == "Event loop is closed"):
+                sys.stderr.write("Unhandled exception in event loop:\n")
+                traceback.print_exc(file=sys.stderr)
+                exitcode = 1
 
-        # As we don't do clean shutdown (which will terminate multiprocessing children gracefully),
-        # let's just kill our entire process group
-        os.killpg(os.getpgid(os.getpid()), signal.SIGKILL)
+        self._save_coverage()
 
-        # We use "_exit" specifically as otherwise process pool executor won't let middlewared process die because
-        # it is still active. We don't initiate a shutdown for it because it may hang forever for any reason
-        os._exit(0)
+        # Use os._exit rather than sys.exit to avoid Python-level cleanup (atexit handlers, thread joins, etc.)
+        # that could block in this abnormal shutdown path.
+        os._exit(exitcode)
 
     async def __initialize(self):
+        self._systemd_notifier = SystemdNotifier()
         self.app = app = web.Application(middlewares=[
             normalize_path_middleware(redirect_class=HTTPPermanentRedirect)
         ], loop=self.loop)
+        self.app['middleware'] = self
 
         # Needs to happen after setting debug or may cause race condition
         # http://bugs.python.org/issue30805
-        setup_funcs = await self.__plugins_load()
+        setup_funcs = self.__plugins_load()
+
+        apis = self._load_apis()
 
         self._console_write('registering services')
 
@@ -1718,18 +1991,21 @@ class Middleware(LoadPluginsMixin, ServiceCallMixin):
             # Start monitor thread after plugins have been loaded
             # because of the time spent doing I/O
             t = threading.Thread(target=self._loop_monitor_thread)
-            t.setDaemon(True)
+            t.daemon = True
             t.start()
 
         self.loop.add_signal_handler(signal.SIGINT, self.terminate)
         self.loop.add_signal_handler(signal.SIGTERM, self.terminate)
-        self.loop.add_signal_handler(signal.SIGUSR1, self.pdb)
         self.loop.add_signal_handler(signal.SIGUSR2, self.log_threads_stacks)
 
-        app.router.add_route('GET', '/websocket', self.ws_handler)
+        for version, api in apis.items():
+            self._add_api_route(version, api)
 
-        app.router.add_route('*', '/api/docs{path_info:.*}', WSGIHandler(apidocs_app))
-        app.router.add_route('*', '/ui{path_info:.*}', WebUIAuth(self))
+        # Used by UI team
+        app.router.add_route('GET', '/api/boot_id', self.boot_id_handler)
+        app.router.add_route('GET', '/api/versions', self.api_versions_handler)
+
+        app.router.add_route('GET', '/websocket', self.ws_handler)
 
         self.fileapp = FileApplication(self, self.loop)
         app.router.add_route('*', '/_download{path_info:.*}', self.fileapp.download)
@@ -1738,43 +2014,56 @@ class Middleware(LoadPluginsMixin, ServiceCallMixin):
         shellapp = ShellApplication(self)
         app.router.add_route('*', '/_shell{path_info:.*}', shellapp.ws_handler)
 
-        clustereventsapp = ClusterEventsApplication(self)
-        app.router.add_route('POST', '/_clusterevents{path_info:.*}', clustereventsapp.listener)
+        self.create_task(self.jobs.run())
 
-        restful_api = RESTfulAPI(self, app)
-        await restful_api.register_resources()
-        asyncio.ensure_future(self.jobs.run())
-
-        # Start up middleware worker process pool
-        self.__procpool._start_executor_manager_thread()
-
-        runner = web.AppRunner(app, handle_signals=False, access_log=None)
-        await runner.setup()
-        await web.UnixSite(runner, os.path.join(MIDDLEWARE_RUN_DIR, 'middlewared-internal.sock')).start()
+        self.runner = web.AppRunner(app, handle_signals=False, access_log=None)
+        await self.runner.setup()
+        await web.UnixSite(self.runner, os.path.join(MIDDLEWARE_RUN_DIR, 'middlewared-internal.sock')).start()
 
         await self.__plugins_setup(setup_funcs)
 
         if await self.call('system.state') == 'READY':
             self._setup_periodic_tasks()
 
-        await web.TCPSite(runner, '0.0.0.0', 6000, reuse_address=True, reuse_port=True).start()
-        await web.UnixSite(runner, os.path.join(MIDDLEWARE_RUN_DIR, 'middlewared.sock')).start()
+        # Private socket that nginx reverse-proxies all external API/UI traffic
+        # over. It is owned by the nginx worker uid (www-data) with 0o600 perms.
+        # Connections arriving here are classified as TCP/IP origins from the X-Real-Remote-*
+        # headers (see middlewared.utils.origin.ConnectionOrigin.create).
+        await self.site_manager.add_site(web.UnixSite, MIDDLEWARE_NGINX_SOCK)
 
-        if self.trace_malloc:
-            limit = self.trace_malloc[0]
-            interval = self.trace_malloc[1]
-            _thr = threading.Thread(target=self._tracemalloc_start, args=(limit, interval,))
-            _thr.setDaemon(True)
-            _thr.start()
+        # Public local socket used by midclt and other local clients.
+        unix_socket_path = os.path.join(MIDDLEWARE_RUN_DIR, 'middlewared.sock')
+        await self.site_manager.add_site(web.UnixSite, unix_socket_path)
+
+        # The loopback TCP listener is only consumed by the vendor (HexOS)
+        # websocat tunnel (scripts/vendor_service.py). On non-vendored systems
+        # nothing connects to it (HA binds its own :6000 site on the heartbeat
+        # IP), so we avoid exposing loopback TCP at all.
+        if is_vendored():
+            await self.add_tcp_site('127.0.0.1')
+
+        await self.site_manager.start_sites(self.runner)
+
+        os.chmod(unix_socket_path, 0o666)
+
+        # Restrict the nginx socket to the nginx worker uid now that the site
+        # has been started and the socket file exists. root (middleware) can
+        # still connect regardless of these perms.
+        www_data = getpwnam('www-data')
+        os.chown(MIDDLEWARE_NGINX_SOCK, www_data.pw_uid, www_data.pw_gid)
+        os.chmod(MIDDLEWARE_NGINX_SOCK, 0o600)
 
         self.logger.debug('Accepting connections')
         self._console_write('loading completed\n')
 
         self.__notify_startup_complete()
 
+    async def add_tcp_site(self, host):
+        await self.site_manager.add_site(web.TCPSite, host, 6000, reuse_address=True, reuse_port=True)
+
     def terminate(self):
         self.logger.info('Terminating')
-        self.__terminate_task = self.loop.create_task(self.__terminate())
+        self.__terminate_task = self.create_task(self.__terminate())
 
     async def __terminate(self):
         for service_name, service in self.get_services().items():
@@ -1785,7 +2074,9 @@ class Middleware(LoadPluginsMixin, ServiceCallMixin):
                 timeout = None
                 if hasattr(service, 'terminate_timeout'):
                     try:
-                        timeout = await asyncio.wait_for(self.call(f'{service_name}.terminate_timeout'), 5)
+                        timeout = await asyncio.wait_for(
+                            self.create_task(self.call(f'{service_name}.terminate_timeout')), 5
+                        )
                     except Exception:
                         self.logger.error(
                             'Failed to retrieve terminate timeout value for %s', service_name, exc_info=True
@@ -1795,7 +2086,7 @@ class Middleware(LoadPluginsMixin, ServiceCallMixin):
                 # used, we still give it the standard default 10 seconds timeout to ensure a clean exit
                 timeout = timeout or 10
                 try:
-                    await asyncio.wait_for(service.terminate(), timeout)
+                    await asyncio.wait_for(self.create_task(service.terminate()), timeout)
                 except Exception:
                     self.logger.error('Failed to terminate %s', service_name, exc_info=True)
 
@@ -1808,22 +2099,10 @@ class Middleware(LoadPluginsMixin, ServiceCallMixin):
 
 
 def main():
-    # Workaround for development
-    modpath = os.path.realpath(os.path.join(
-        os.path.dirname(os.path.realpath(__file__)),
-        '..',
-    ))
-    if modpath not in sys.path:
-        sys.path.insert(0, modpath)
-
     parser = argparse.ArgumentParser()
-    parser.add_argument('restart', nargs='?')
     parser.add_argument('--pidfile', '-P', action='store_true')
     parser.add_argument('--disable-loop-monitor', '-L', action='store_true')
     parser.add_argument('--loop-debug', action='store_true')
-    parser.add_argument('--trace-malloc', '-tm', action='store', nargs=2, type=int, default=False)
-    parser.add_argument('--overlay-dirs', '-o', action='append')
-    parser.add_argument('--disable-debug-mode', action='store_true', default=False)
     parser.add_argument('--debug-level', choices=[
         'TRACE',
         'DEBUG',
@@ -1835,38 +2114,103 @@ def main():
         'console',
         'file',
     ], default='console')
-    args = parser.parse_args()
+    # Hidden argument for dumping API models to JSON
+    # This generates a complete JSON representation of all API versions, methods, and models
+    # that is consumed by the middlewared_docs package builder to generate API documentation.
+    parser.add_argument('--dump-api', action='store_true', help=argparse.SUPPRESS)
+    # Hidden modifier for --dump-api: emit each method/event schema as pydantic's native output,
+    # retaining the `$defs` table with named model definitions and resolvable discriminator mappings
+    # instead of inlining every definition at its use site. Consumed by client code generators that
+    # need model identities; the documentation builder uses the default (inlined) output.
+    parser.add_argument('--keep-refs', action='store_true', help=argparse.SUPPRESS)
+    # Hidden argument for dumping all methods metadata to JSON
+    # This generates the complete output of CoreService.get_methods() without any filtering.
+    parser.add_argument('--dump-methods', action='store_true', help=argparse.SUPPRESS)
+    # Hidden argument for running test commands with a fully initialized middleware
+    # Usage: middlewared --test -- python3 runtest.py --ip localhost --password testpass --test test_zfs_snapshot.py
+    # This allows running test commands (like pytest) with access to a running middleware instance.
+    # The middleware will fully initialize (plugins loaded, services available), then execute
+    # the specified command, and exit with the command's exit code.
+    # This is particularly useful for LLM-driven development workflows where rapid feedback
+    # is needed - the LLM can make code changes, then immediately test them by running
+    # pytest or other validation tools in the context of a fully initialized middleware.
+    parser.add_argument('--test', action='store_true', help=argparse.SUPPRESS)
+    parser.add_argument('--coverage', nargs='?', const='middlewared', default=None,
+                        metavar='PACKAGES',
+                        help='Collect coverage.py data for a comma-separated list of packages, '
+                             'written to .coverage in the working directory on exit')
+    args, test_command = parser.parse_known_args()
+
+    # If --test was specified, everything after it is the test command
+    if args.test:
+        # Remove the '--' separator if present
+        if test_command and test_command[0] == '--':
+            test_command = test_command[1:]
+        # Remove mako template cache before it gets used
+        shutil.rmtree("/run/mako", ignore_errors=True)
+    else:
+        # If --test wasn't specified but there are unknown args, it's an error
+        if test_command:
+            parser.error(f"unrecognized arguments: {' '.join(test_command)}")
+
+    if args.keep_refs and not args.dump_api:
+        parser.error('--keep-refs requires --dump-api')
 
     os.makedirs(MIDDLEWARE_RUN_DIR, exist_ok=True)
     pidpath = os.path.join(MIDDLEWARE_RUN_DIR, 'middlewared.pid')
 
-    if args.restart:
-        if os.path.exists(pidpath):
-            with open(pidpath, 'r') as f:
-                pid = int(f.read().strip())
-            try:
-                os.kill(pid, 15)
-            except ProcessLookupError as e:
-                if e.errno != errno.ESRCH:
-                    raise
+    setup_logging('middleware', args.debug_level, args.log_handler)
 
-    logger.setup_logging('middleware', args.debug_level, args.log_handler)
+    middleware = Middleware(
+        loop_debug=args.loop_debug,
+        loop_monitor=not args.disable_loop_monitor,
+        debug_level=args.debug_level,
+        log_handler=args.log_handler,
+        # Otherwise will crash since `/data/manifest.json` does not exist at that build stage
+        print_version=not (args.dump_api or args.dump_methods),
+    )
 
-    setproctitle.setproctitle('middlewared')
+    if args.dump_api:
+        asyncio.get_event_loop().run_until_complete(middleware.dump_api(sys.stdout, keep_refs=args.keep_refs))
+        return
+
+    if args.dump_methods:
+        asyncio.get_event_loop().run_until_complete(middleware.dump_methods(sys.stdout))
+        return
+
+    set_name('middlewared')
+    set_cmdline('middlewared')
+    # In-process PAM modules log through libc syslog(); set_cmdline() broke its default tag.
+    syslog.openlog('middlewared', syslog.LOG_PID)
 
     if args.pidfile:
         with open(pidpath, "w") as _pidfile:
             _pidfile.write(f"{str(os.getpid())}\n")
 
-    conf.debug_mode = not args.disable_debug_mode
+    single_task = None
+    if args.test:
+        async def run_test_command() -> int:
+            try:
+                process = await asyncio.create_subprocess_exec(
+                    *test_command,
+                    stdin=sys.stdin,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                )
+                stdout, stderr = await process.communicate()
+                # Write these after the test is complete to avoid interfering with the middleware’s output.
+                await asyncio.to_thread(sys.stdout.buffer.write, stdout)
+                await asyncio.to_thread(sys.stderr.buffer.write, stderr)
+                await asyncio.to_thread(sys.stdout.buffer.flush)
+                await asyncio.to_thread(sys.stderr.buffer.flush)
+                return process.returncode
+            except Exception as e:
+                await asyncio.to_thread(sys.stderr.write, f"Failed to run test: {e}\n")
+                return 1
 
-    Middleware(
-        loop_debug=args.loop_debug,
-        loop_monitor=not args.disable_loop_monitor,
-        trace_malloc=args.trace_malloc,
-        debug_level=args.debug_level,
-        log_handler=args.log_handler,
-    ).run()
+        single_task = run_test_command
+
+    middleware.run(single_task)
 
 
 if __name__ == '__main__':

@@ -1,23 +1,19 @@
+import contextlib
 from logging.config import fileConfig
 import os
-import sys
 
 from alembic import context
 from alembic.operations import ops
 from alembic.operations.base import BatchOperations, Operations
 from alembic.operations.batch import ApplyBatchImpl, BatchOperationsImpl
 from sqlalchemy import engine_from_config, ForeignKeyConstraint, pool
+import sqlalchemy as sa
 
 from middlewared.plugins.config import FREENAS_DATABASE
-from middlewared.sqlalchemy import JSON, Model
-from middlewared.utils import osc
+from middlewared.sqlalchemy import EncryptedText, JSON, Model, MultiSelectField
 from middlewared.utils.plugins import load_modules
 from middlewared.utils.python import get_middlewared_dir
 
-# freenasOS
-if osc.IS_FREEBSD:
-    if '/usr/local/lib' not in sys.path:
-        sys.path.append('/usr/local/lib')
 
 # this is the Alembic Config object, which provides
 # access to the values within the .ini file in use.
@@ -39,6 +35,16 @@ list(load_modules(os.path.join(get_middlewared_dir(), "plugins"), depth=1))
 # my_important_option = config.get_main_option("my_important_option")
 # ... etc.
 DATABASE_URL = f"sqlite:///{os.environ.get('FREENAS_DATABASE', FREENAS_DATABASE)}"
+
+original_batch_alter_table = Operations.batch_alter_table
+
+
+@contextlib.contextmanager
+def batch_alter_table_impl(self, *args, **kwargs):
+    # https://github.com/sqlalchemy/alembic/issues/380
+    kwargs["table_kwargs"] = {"sqlite_autoincrement": True, **kwargs.get("table_kwargs", {})}
+    with original_batch_alter_table(self, *args, **kwargs) as result:
+        yield result
 
 
 @Operations.register_operation("drop_references")
@@ -80,11 +86,12 @@ def drop_references_impl(self, column_name):
                 break
 
 
+Operations.batch_alter_table = batch_alter_table_impl
 BatchOperationsImpl.drop_references = lambda self, column: self.batch.append(("drop_references", (column,), {}))
 ApplyBatchImpl.drop_references = drop_references_impl
 
 
-def include_object(object, name, type_, reflected, compare_to):
+def include_object(object_, name, type_, reflected, compare_to):
     if type_ == "table" and name in {"sqlite_sequence"}:
         return False
     else:
@@ -99,6 +106,22 @@ def render_item(type_, obj, autogen_context):
 
     # default rendering for other objects
     return False
+
+
+def compare_type(context, inspected_column, metadata_column, inspected_type, metadata_type):
+    if isinstance(metadata_type, EncryptedText) and isinstance(inspected_type, (sa.String, sa.Text, sa.VARCHAR)):
+        return False
+
+    if isinstance(metadata_type, MultiSelectField) and isinstance(inspected_type, sa.VARCHAR):
+        return False
+
+    if isinstance(metadata_type, (sa.String, sa.VARCHAR)) and isinstance(inspected_type, (sa.String, sa.VARCHAR)):
+        # SQLite does not enforce VARCHAR length, so the inconsistencies between our metadata and our database
+        # do not matter
+        if metadata_type.length != inspected_type.length:
+            return False
+
+    return None
 
 
 def run_migrations_offline():
@@ -149,6 +172,7 @@ def run_migrations_online():
             render_as_batch=True,
             include_object=include_object,
             render_item=render_item,
+            compare_type=compare_type,
         )
 
         with context.begin_transaction():

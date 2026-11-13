@@ -1,0 +1,33 @@
+import contextlib
+import typing
+
+
+def safely_retrieve_dimension(
+    all_metrics: dict[str, typing.Any], chart: str, dimension: str | None = None, default: typing.Any = None
+) -> typing.Any:
+    """
+    Safely retrieve a dimension from a chart. If the dimension is not found, return the default value
+    and if no dimension is explicitly provided, return all the dimensions found for the chart.
+    """
+    with contextlib.suppress(KeyError):
+        if dimension:
+            value = all_metrics[chart]['dimensions'][dimension]['value']
+            return value if value is not None else default
+        else:
+            return {
+                dimension_name: value['value']
+                for dimension_name, value in all_metrics[chart]['dimensions'].items()
+            }
+
+    return default
+
+
+def normalize_value(
+    value: float, multiplier: int = 1, divisor: int = 1, absolute: bool = True, round_value: bool = True,
+) -> int | float:
+    normalized: float = (value / divisor) * multiplier
+    if absolute:
+        normalized = abs(normalized)
+    if round_value:
+        normalized = round(normalized)
+    return normalized

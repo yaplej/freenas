@@ -1,0 +1,154 @@
+name: mypy static type checks
+
+on:
+  push:
+    branches: [ "master" ]
+  pull_request:
+    branches: [ "master" ]
+
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    container:
+      image: ghcr.io/truenas/middleware:master
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Test
+        run: |
+          cd src/middlewared
+          PYTHONPATH=. mypy \
+            middlewared/alert/ \
+            middlewared/api/base/ \
+            middlewared/common/ \
+            middlewared/plugins/account/ \
+            middlewared/plugins/acme_protocol/ \
+            middlewared/plugins/acme_dns_authenticator/ \
+            middlewared/plugins/acme_registration/ \
+            middlewared/plugins/alert/ \
+            middlewared/plugins/api_key/ \
+            middlewared/plugins/app_registry/ \
+            middlewared/plugins/apps/ \
+            middlewared/plugins/apps_images/ \
+            middlewared/plugins/boot/ \
+            middlewared/plugins/boot_environment/ \
+            middlewared/plugins/catalog/ \
+            middlewared/plugins/cloud/ \
+            middlewared/plugins/cloud_backup/ \
+            middlewared/plugins/cloud_credentials/ \
+            middlewared/plugins/cloud_sync/ \
+            middlewared/plugins/container/ \
+            middlewared/plugins/cron/ \
+            middlewared/plugins/docker/ \
+            middlewared/plugins/ftp/ \
+            middlewared/plugins/hardware/ \
+            middlewared/plugins/init_shutdown_script/ \
+            middlewared/plugins/kmip/ \
+            middlewared/plugins/keychain/ \
+            middlewared/plugins/mail/ \
+            middlewared/plugins/nfs_/ \
+            middlewared/plugins/network_routes/ \
+            middlewared/plugins/ntp/ \
+            middlewared/plugins/ports/ \
+            middlewared/plugins/replication/ \
+            middlewared/plugins/reporting/ \
+            middlewared/plugins/rsync/ \
+            middlewared/plugins/security/ \
+            middlewared/plugins/service/ \
+            middlewared/plugins/snapshot/ \
+            middlewared/plugins/snmp/ \
+            middlewared/plugins/ssh/ \
+            middlewared/plugins/support/ \
+            middlewared/plugins/sysctl/ \
+            middlewared/plugins/system_advanced/ \
+            middlewared/plugins/system_vendor/ \
+            middlewared/plugins/truecommand/ \
+            middlewared/plugins/truenas/ \
+            middlewared/plugins/truenas_connect/ \
+            middlewared/plugins/truenas_s3/ \
+            middlewared/plugins/truesearch.py \
+            middlewared/plugins/tunable/ \
+            middlewared/plugins/webshare/ \
+            middlewared/plugins/webui/dataset.py \
+            middlewared/plugins/webui/dataset_consumers.py \
+            middlewared/plugins/webui/dataset_details.py \
+            middlewared/plugins/update_/ \
+            middlewared/plugins/ups/ \
+            middlewared/plugins/usage/ \
+            middlewared/plugins/vm/ \
+            middlewared/plugins/zettarepl/ \
+            middlewared/plugins/zfs/ \
+            middlewared/plugins/dns_client.py \
+            middlewared/plugins/filesystem.py \
+            middlewared/plugins/keyvalue.py \
+            middlewared/plugins/pwenc.py \
+            middlewared/service/generic_sharing_service.py \
+            middlewared/service/ha_synchronization.py \
+            middlewared/service/sharing_task_service_part.py \
+            middlewared/utils/ \
+            middlewared/test/integration/runner/ \
+            middlewared/test/linter/ \
+            middlewared/auth.py \
+            middlewared/job.py \
+            --exclude middlewared/etc_files \
+            --exclude middlewared/utils/directoryservices \
+            --exclude middlewared/utils/lio \
+            --exclude middlewared/utils/nvmet \
+            --follow-imports silent \
+            --strict
+
+      - name: mypy mako templates
+        run: |
+          cd src/middlewared
+          python3 -m middlewared.test.linter.mypy_mako \
+            middlewared/etc_files/chrony \
+            middlewared/etc_files/cron.d \
+            middlewared/etc_files/default \
+            middlewared/etc_files/dhcpcd.conf.mako \
+            middlewared/etc_files/exports.mako \
+            middlewared/etc_files/fstab.mako \
+            middlewared/etc_files/ftpusers.mako \
+            middlewared/etc_files/hosts.mako \
+            middlewared/etc_files/idmapd.conf.mako \
+            middlewared/etc_files/initiators.allow.mako \
+            middlewared/etc_files/initiators.deny.mako \
+            middlewared/etc_files/local/nut \
+            middlewared/etc_files/local/openldap \
+            middlewared/etc_files/local/smb4.conf.mako \
+            middlewared/etc_files/local/snmpd.conf.mako \
+            middlewared/etc_files/local/ssh \
+            middlewared/etc_files/local/sudoers.mako \
+            middlewared/etc_files/local/users.oath.mako \
+            middlewared/etc_files/login_banner.mako \
+            middlewared/etc_files/mail \
+            middlewared/etc_files/motd.mako \
+            middlewared/etc_files/netdata \
+            middlewared/etc_files/nfs.conf.mako \
+            middlewared/etc_files/nscd.conf.mako \
+            middlewared/etc_files/nsswitch.conf.mako \
+            middlewared/etc_files/pam.d \
+            middlewared/etc_files/proftpd \
+            middlewared/etc_files/scst.direct.mako \
+            middlewared/etc_files/scst.env.mako \
+            middlewared/etc_files/security \
+            middlewared/etc_files/subgid.mako \
+            middlewared/etc_files/subuid.mako \
+            middlewared/etc_files/sysctl.d \
+            middlewared/etc_files/syslog-ng/conf.d/tnaudit.conf.mako \
+            middlewared/etc_files/syslog-ng/conf.d/tndestinations.conf.mako \
+            middlewared/etc_files/truenas_s3 \
+            middlewared/etc_files/truenas_smbhad.conf.mako \
+            middlewared/etc_files/wireguard \
+            --follow-imports silent \
+            --strict
+
+      - name: mypy middlewared_docs
+        run: |
+          mypy \
+            --follow-imports silent \
+            --ignore-missing-imports \
+            src/middlewared_docs/changelog.py \
+            src/middlewared_docs/generate_docs.py

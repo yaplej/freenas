@@ -1,11 +1,14 @@
 from concurrent.futures import ThreadPoolExecutor
 import re
+import shutil
+import time
 
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, text
 
-from middlewared.service import private, Service
+from middlewared.service import Service, private
+from middlewared.utils.db import FREENAS_DATABASE
 
-from middlewared.plugins.config import FREENAS_DATABASE
+thread_pool = ThreadPoolExecutor(1)
 
 
 def regexp(expr, item):
@@ -20,72 +23,97 @@ class DatastoreService(Service):
 
     class Config:
         private = True
-
-    thread_pool = ThreadPoolExecutor(1)
+        thread_pool = thread_pool
 
     engine = None
     connection = None
 
     @private
-    async def setup(self):
-        await self.middleware.run_in_executor(self.thread_pool, self._setup)
+    def handle_constraint_violation(self, row, journal):
+        self.logger.warning("Row %d in table %s violates foreign key constraint on table %s.",
+                            row.rowid, row.table, row.parent)
 
-    def _setup(self):
-        if self.engine is not None:
-            self.engine.dispose()
+        self.logger.warning("Deleting row %d from table %s.", row.rowid, row.table)
+        op = f"DELETE FROM {row.table} WHERE rowid = {row.rowid}"
+        self.connection.execute(text(op))
+        journal.write(f'{op}\n')
 
+    @private
+    def setup(self):
+        # In SQLAlchemy 2.0, we must close connections before disposing the engine
+        # to avoid "Cannot operate on a closed database" errors
         if self.connection is not None:
             self.connection.close()
 
-        self.engine = create_engine(f'sqlite:///{FREENAS_DATABASE}')
+        if self.engine is not None:
+            self.engine.dispose()
 
+        self.engine = create_engine(f'sqlite:///{FREENAS_DATABASE}')
         self.connection = self.engine.connect()
+        self.connection = self.connection.execution_options(isolation_level="AUTOCOMMIT")
         self.connection.connection.create_function("REGEXP", 2, regexp)
         self.connection.connection.execute("PRAGMA foreign_keys=ON")
+
+        if constraint_violations := self.connection.execute(text("PRAGMA foreign_key_check")).fetchall():
+            ts = int(time.time())
+            shutil.copy(FREENAS_DATABASE, f'{FREENAS_DATABASE}_{ts}.bak')
+
+            with open(f'{FREENAS_DATABASE}_{ts}_journal.txt', 'w') as f:
+                for row in constraint_violations:
+                    self.handle_constraint_violation(row, f)
+
         self.connection.connection.execute("VACUUM")
 
     @private
-    async def execute(self, *args):
-        return await self.middleware.run_in_executor(self.thread_pool, self.connection.execute, *args)
+    def execute(self, query, *params):
+        if len(params) == 1 and isinstance(params[0], (list, tuple)):
+            params = tuple(params[0])
+
+        return self.connection.exec_driver_sql(query, params)
 
     @private
-    async def execute_write(self, stmt, options=None):
+    def execute_write(self, stmt, options=None):
         options = options or {}
         options.setdefault('ha_sync', True)
         options.setdefault('return_last_insert_rowid', False)
 
-        compiled = stmt.compile(self.engine)
+        compiled = stmt.compile(self.engine, compile_kwargs={"render_postcompile": True})
+
+        param_to_bind = {}
+        if compiled._post_compile_expanded_state:
+            for bind, parameters in compiled._post_compile_expanded_state.parameter_expansion.items():
+                for parameter in parameters:
+                    param_to_bind[parameter] = bind
 
         sql = compiled.string
         binds = []
         for param in compiled.positiontup:
-            bind = compiled.binds[param]
-            value = bind.value
-            bind_processor = compiled.binds[param].type.bind_processor(self.engine.dialect)
+            if compiled._post_compile_expanded_state:
+                bind = compiled.binds[param_to_bind[param]]
+                value = compiled._post_compile_expanded_state.parameters[param]
+            else:
+                bind = compiled.binds[param]
+                value = bind.value
+
+            bind_processor = bind.type.bind_processor(self.engine.dialect)
             if bind_processor:
                 binds.append(bind_processor(value))
             else:
                 binds.append(value)
 
-        return await self.middleware.run_in_executor(self.thread_pool, self._execute_write, sql, binds, options)
-
-    def _execute_write(self, sql, binds, options):
-        result = self.connection.execute(sql, binds)
+        result = self.connection.exec_driver_sql(sql, tuple(binds))
 
         self.middleware.call_hook_inline("datastore.post_execute_write", sql, binds, options)
 
         if options['return_last_insert_rowid']:
-            return self._fetchall("SELECT last_insert_rowid()")[0][0]
+            return self.connection.execute(text("SELECT last_insert_rowid() as rowid")).scalar_one()
 
         return result
 
     @private
-    async def fetchall(self, *args):
-        return await self.middleware.run_in_executor(self.thread_pool, self._fetchall, *args)
-
-    def _fetchall(self, query, params=None):
-        cursor = self.connection.execute(query, params or [])
+    def fetchall(self, query, params=None):
+        cursor = self.connection.execute(text(query) if isinstance(query, str) else query, params or {})
         try:
-            return cursor.fetchall()
+            return list(cursor.mappings())
         finally:
             cursor.close()

@@ -1,34 +1,37 @@
-from middlewared.service import private, Service
+from middlewared.service import Service, private
+from middlewared.service_exception import CallError
 from middlewared.utils.asyncio_ import asyncio_map
 
 
 class PoolService(Service):
 
     @private
-    async def format_disks(self, job, disks):
+    async def format_disks(self, job, disks, base_percentage=0, upper_percentage=100):
         """
-        Format all disks, putting all freebsd-zfs partitions created
-        into their respective vdevs and encrypting disks if specified for FreeBSD.
+        Format all disks, putting all ZFS partitions created into their respective vdevs.
         """
-        # Make sure all SED disks are unlocked
-        await self.middleware.call('disk.sed_unlock_all')
-        swapgb = (await self.middleware.call('system.advanced.config'))['swapondrive']
         formatted = 0
+        len_disks = len(disks)
+        current_percentage = base_percentage
+        single_disk_percentage = (upper_percentage - base_percentage) / len_disks
 
-        async def format_disk(arg):
-            nonlocal formatted
+        async def unlock_and_format_disk(arg):
+            nonlocal formatted, current_percentage
             disk, config = arg
-            await self.middleware.call(
-                'disk.format', disk, swapgb if config['create_swap'] else 0, False,
-            )
-            devname = await self.middleware.call(
-                'disk.gptid_from_part_type', disk, await self.middleware.call('disk.get_zfs_part_type')
-            )
+            if await self.middleware.call('disk.sed_unlock_impl', disk, True) is False:
+                # returns None or boolean, None we can safely ignore
+                raise CallError(f"Failed to unlock {disk!r}. Check /var/log/middlewared.log")
+            await self.middleware.call('disk.format', disk, config.get('size'))
             formatted += 1
-            job.set_progress(15, f'Formatting disks ({formatted}/{len(disks)})')
-            config['vdev'].append(f'/dev/{devname}')
+            current_percentage += single_disk_percentage
+            job.set_progress(current_percentage, f'Formatting disks ({formatted}/{len_disks})')
 
-        await asyncio_map(format_disk, disks.items(), limit=16)
+        await asyncio_map(unlock_and_format_disk, disks.items(), limit=16)
 
         disk_sync_job = await self.middleware.call('disk.sync_all')
-        await job.wrap(disk_sync_job)
+        await disk_sync_job.wait(raise_error=True)
+
+        zfs_part_type = await self.middleware.call('disk.get_zfs_part_type')
+        for disk, config in disks.items():
+            devname = await self.middleware.call('disk.gptid_from_part_type', disk, zfs_part_type)
+            config['vdev'].append(f'/dev/{devname}')

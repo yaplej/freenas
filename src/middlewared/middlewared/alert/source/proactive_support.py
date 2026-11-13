@@ -1,38 +1,54 @@
-from middlewared.alert.base import AlertClass, AlertCategory, AlertLevel, Alert, AlertSource
+# Copyright (c) - iXsystems Inc. dba TrueNAS
+#
+# Licensed under the terms of the TrueNAS Enterprise License Agreement
+# See the file LICENSE.IX for complete terms and conditions
+
+from typing import Any
+
+from middlewared.alert.applicability import ANY_LICENSE
+from middlewared.alert.base import (
+    Alert,
+    AlertCategory,
+    AlertClass,
+    AlertClassConfig,
+    AlertLevel,
+    AlertSource,
+    NonDataclassAlertClass,
+)
 
 
-class ProactiveSupportAlertClass(AlertClass):
-    category = AlertCategory.SYSTEM
-    level = AlertLevel.WARNING
-    title = "Proactive Support Is Not Configured"
-    text = "%s"
-
-    products = ("SCALE_ENTERPRISE",)
+class ProactiveSupportAlert(NonDataclassAlertClass[str], AlertClass):
+    config = AlertClassConfig(
+        category=AlertCategory.SYSTEM,
+        level=AlertLevel.WARNING,
+        title="Proactive Support Is Not Configured",
+        text="%s",
+        applies_to=ANY_LICENSE,
+    )
 
 
 class ProactiveSupportAlertSource(AlertSource):
-    products = ("SCALE_ENTERPRISE",)
+    applies_to = ANY_LICENSE
     run_on_backup_node = False
 
-    async def check(self):
-        support = await self.middleware.call('support.config')
-        available = await self.middleware.call('support.is_available')
-        if available and support['enabled'] is None:
-            return Alert(
-                ProactiveSupportAlertClass,
-                'Proactive Support is not configured. Please see the System/Proactive Support page.'
-            )
+    async def check(self) -> list[Alert[Any]] | Alert[Any] | None:
+        webui_page = 'System Settings->General->Support page'
+        support = await self.call2(self.s.support.config)
+        available = await self.call2(self.s.support.is_available)
+        if available and support.enabled is None:
+            return Alert(ProactiveSupportAlert(f'Proactive support is not configured. Review the {webui_page}.'))
 
-        if support['enabled']:
+        if support.enabled:
             # This is for people who had ix alert enabled before Proactive Support
             # feature and have not filled all the new fields.
             unfilled = []
-            for name, verbose_name in await self.middleware.call('support.fields'):
-                if not support[name]:
+            for name, verbose_name in await self.call2(self.s.support.fields):
+                if not getattr(support, name):
                     unfilled.append(verbose_name)
 
             if unfilled:
                 return Alert(
-                    ProactiveSupportAlertClass,
-                    'Please complete these fields on the System/Proactive Support page: %s.' % ', '.join(unfilled)
+                    ProactiveSupportAlert(f'Please complete these fields on the {webui_page}: {", ".join(unfilled)}')
                 )
+
+        return None

@@ -1,19 +1,21 @@
-from middlewared.alert.base import AlertClass, OneShotAlertClass, AlertCategory, AlertLevel, Alert, ThreadedAlertSource
+from dataclasses import dataclass
+from typing import Any
+
+from middlewared.alert.base import AlertCategory, AlertClassConfig, AlertLevel, OneShotAlertClass
 
 
-class VMWareLoginFailedAlertClass(AlertClass, OneShotAlertClass):
-    category = AlertCategory.TASKS
-    level = AlertLevel.WARNING
-    title = "VMWare Login Failed"
-    text = "VMWare login to %(hostname)s failed: %(error)s."
+@dataclass(kw_only=True)
+class VMWareLoginFailedAlert(OneShotAlertClass):
+    config = AlertClassConfig(
+        category=AlertCategory.TASKS,
+        level=AlertLevel.WARNING,
+        title="VMWare Login Failed",
+        text="VMWare login to %(hostname)s failed: %(error)s.",
+    )
 
-    async def create(self, args):
-        return Alert(VMWareLoginFailedAlertClass, args)
+    hostname: str
+    error: str
 
-    async def delete(self, alerts, query):
-        hostname = query
-
-        return list(filter(
-            lambda alert: alert.args["hostname"] != hostname,
-            alerts
-        ))
+    @classmethod
+    def key_from_args(cls, args: Any) -> Any:
+        return args['hostname']

@@ -1,0 +1,26 @@
+name: pytest CI
+
+on:
+  push:
+    branches: [ "master" ]
+  pull_request:
+    branches: [ "master" ]
+
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    container:
+      image: ghcr.io/truenas/middleware:master
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Test
+        run: |
+          cd src/middlewared
+          PYTHONPATH=. FAKE_ENV=1 pytest-3 -v --disable-pytest-warnings middlewared/pytest
+
+      - name: Docs changelog tests
+        run: pytest-3 -v --disable-pytest-warnings src/middlewared_docs/tests/

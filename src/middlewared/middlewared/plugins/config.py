@@ -1,30 +1,94 @@
-import asyncio
 import contextlib
+from datetime import datetime
 import glob
 import os
+import pathlib
 import re
 import shutil
 import sqlite3
+import subprocess
 import tarfile
 import tempfile
 
-from datetime import datetime
-
-from middlewared.schema import accepts, Bool, Dict, returns
+from middlewared.api import api_method
+from middlewared.api.current import (
+    ConfigResetArgs,
+    ConfigResetResult,
+    ConfigSaveArgs,
+    ConfigSaveResult,
+    ConfigUploadArgs,
+    ConfigUploadResult,
+)
 from middlewared.service import CallError, Service, job, private
-from middlewared.plugins.pwenc import PWENC_FILE_SECRET
-from middlewared.plugins.pool import GELI_KEYPATH
-from middlewared.utils.db import FREENAS_DATABASE
-from middlewared.utils.python import get_middlewared_dir
+from middlewared.utils.db import FREENAS_DATABASE, UPLOADED_DB_PATH, query_config_table
+from middlewared.utils.privilege import credential_has_full_admin
+from middlewared.utils.pwenc import (
+    PWENC_FILE_SECRET,
+    PWENC_FILE_SECRET_MODE,
+    pwenc_generate_secret,
+    pwenc_rename,
+    pwenc_secret_matches,
+)
 
 CONFIG_FILES = {
     'pwenc_secret': PWENC_FILE_SECRET,
-    'geli': GELI_KEYPATH,
+    'admin_authorized_keys': '/home/admin/.ssh/authorized_keys',
+    'truenas_admin_authorized_keys': '/home/truenas_admin/.ssh/authorized_keys',
     'root_authorized_keys': '/root/.ssh/authorized_keys',
+    'snmp_engine_id': '/data/subsystems/snmp/truenas_pysnmp.conf',
 }
-NEED_UPDATE_SENTINEL = '/data/need-update'
 RE_CONFIG_BACKUP = re.compile(r'.*(\d{4}-\d{2}-\d{2})-(\d+)\.db$')
-UPLOADED_DB_PATH = '/data/uploaded.db'
+PWENC_UPLOADED = '/data/pwenc_secret_uploaded'
+ADMIN_KEYS_UPLOADED = '/data/admin_authorized_keys_uploaded'
+TRUENAS_ADMIN_KEYS_UPLOADED = '/data/truenas_admin_authorized_keys_uploaded'
+ROOT_KEYS_UPLOADED = '/data/root_authorized_keys_uploaded'
+SNMP_ENGINE_ID_UPLOADED = '/data/snmp_engine_id_uploaded'
+DATABASE_NAME = os.path.basename(FREENAS_DATABASE)
+PWENC_SECRET_NAME = os.path.basename(PWENC_FILE_SECRET)
+CONFIGURATION_UPLOAD_REBOOT_REASON = 'Configuration upload'
+CONFIGURATION_RESET_REBOOT_REASON = 'Configuration reset'
+
+
+def _check_uploaded_secret(secret_path, db_path):
+    if not os.path.exists(secret_path):
+        raise CallError(
+            'The uploaded configuration file does not include the password secret seed. Without it every password, '
+            'private key and API key it contains is unrecoverable. Save the configuration again with "Export Password '
+            'Secret Seed" selected and upload that file instead.'
+        )
+
+    try:
+        pwenc_check = query_config_table('system_settings', db_path)['stg_pwenc_check']
+    except (sqlite3.Error, LookupError) as e:
+        raise CallError(
+            f'Uploaded TrueNAS database file is not valid: unable to read the password secret seed check value: {e}'
+        ) from e
+
+    if not isinstance(pwenc_check, str) or not pwenc_check:
+        raise CallError(
+            'Uploaded TrueNAS database file is not valid: the password secret seed check value is missing or is '
+            'not text.'
+        )
+
+    if not pwenc_secret_matches(secret_path, pwenc_check):
+        raise CallError(
+            'The password secret seed in the uploaded configuration file is not the one that encrypted its database. '
+            'Upload the configuration file and the password secret seed that were saved together.'
+        )
+
+
+@contextlib.contextmanager
+def _vacuumed_db_copy():
+    """Yield the path to a temporary vacuumed copy of the database.
+
+    Uses VACUUM INTO so the copy is produced in a single read pass without
+    modifying the source.
+    """
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        tmp_path = os.path.join(tmp_dir, 'freenas-v1.db')
+        with sqlite3.connect(FREENAS_DATABASE) as conn:
+            conn.execute(f"VACUUM INTO '{tmp_path}'")
+        yield tmp_path
 
 
 class ConfigService(Service):
@@ -32,256 +96,225 @@ class ConfigService(Service):
     class Config:
         cli_namespace = 'system.config'
 
-    @accepts(Dict(
-        'configsave',
-        Bool('secretseed', default=False),
-        Bool('pool_keys', default=False),
-        Bool('root_authorized_keys', default=False),
-    ))
-    @returns()
+    @private
+    def save_db_only(self, options, job):
+        with _vacuumed_db_copy() as path:
+            with open(path, 'rb') as f:
+                shutil.copyfileobj(f, job.pipes.output.w)
+
+    @private
+    def save_tar_file(self, options, job):
+        with _vacuumed_db_copy() as db_path:
+            with tempfile.NamedTemporaryFile(delete=True) as ntf:
+                with tarfile.open(ntf.name, 'w') as tar:
+                    files = {'freenas-v1.db': db_path}
+                    if options['secretseed']:
+                        files['pwenc_secret'] = CONFIG_FILES['pwenc_secret']
+                    if options['root_authorized_keys'] and os.path.exists(CONFIG_FILES['admin_authorized_keys']):
+                        files['admin_authorized_keys'] = CONFIG_FILES['admin_authorized_keys']
+                    if options['root_authorized_keys'] and os.path.exists(
+                        CONFIG_FILES['truenas_admin_authorized_keys']
+                    ):
+                        files['truenas_admin_authorized_keys'] = CONFIG_FILES['truenas_admin_authorized_keys']
+                    if options['root_authorized_keys'] and os.path.exists(CONFIG_FILES['root_authorized_keys']):
+                        files['root_authorized_keys'] = CONFIG_FILES['root_authorized_keys']
+                    if os.path.exists(CONFIG_FILES['snmp_engine_id']):
+                        files['snmp_engine_id'] = CONFIG_FILES['snmp_engine_id']
+                    for arcname, path in files.items():
+                        tar.add(path, arcname=arcname)
+
+                with open(ntf.name, 'rb') as f:
+                    shutil.copyfileobj(f, job.pipes.output.w)
+
+    @api_method(ConfigSaveArgs, ConfigSaveResult, roles=['FULL_ADMIN'])
     @job(pipes=["output"])
     async def save(self, job, options):
         """
-        Create a bundle of security-sensitive information. These options select which information
-        is included in the bundle:
+        Create a tar file of security-sensitive information.
 
-        `secretseed`: include password secret seed.
-
-        `pool_keys`: include GELI encryption keys.
-
-        `root_authorized_keys`: include "authorized_keys" file for the root user.
-
-        If none of these options are set, the bundle is not generated and the database file is provided.
+        If none of these options are set, the tar file is not generated and the database file is returned.
         """
+        self._check_access(job, 'save')
 
-        if all(not options[k] for k in options):
-            bundle = False
-            filename = FREENAS_DATABASE
-        else:
-            bundle = True
-            files = CONFIG_FILES.copy()
-            if not options['secretseed']:
-                files['pwenc_secret'] = None
-            if not options['root_authorized_keys'] or not os.path.exists(files['root_authorized_keys']):
-                files['root_authorized_keys'] = None
-            if not options['pool_keys'] or not os.path.exists(files['geli']) or not os.listdir(files['geli']):
-                files['geli'] = None
+        options.pop('pool_keys')  # ignored, doesn't apply on SCALE
 
-            fd, filename = tempfile.mkstemp()
-            os.close(fd)
-            os.chmod(filename, 0o600)
-            with tarfile.open(filename, 'w') as tar:
-                tar.add(FREENAS_DATABASE, arcname='freenas-v1.db')
-                for arcname, path in files.items():
-                    if path:
-                        tar.add(path, arcname=arcname)
+        method = self.save_db_only if not any(options.values()) else self.save_tar_file
+        await self.middleware.run_in_thread(method, options, job)
 
-        with open(filename, 'rb') as f:
-            await self.middleware.run_in_thread(shutil.copyfileobj, f, job.pipes.output.w)
-
-        if bundle:
-            os.remove(filename)
-
-    @accepts()
-    @returns()
+    @api_method(ConfigUploadArgs, ConfigUploadResult, roles=['FULL_ADMIN'], pass_app=True)
     @job(pipes=["input"])
-    def upload(self, job):
+    def upload(self, app, job):
         """
         Accepts a configuration file via job pipe.
+
+        The file must be an archive saved by :method:`config.save` that carries the password secret seed belonging to
+        the database it contains. A bare database, or one accompanied by a different seed, is rejected before anything
+        on this system is replaced.
         """
-        filename = tempfile.mktemp(dir='/var/tmp/firmware')
+        self._check_access(job, "upload")
 
-        try:
-            nreads = 0
-            with open(filename, 'wb') as f_tmp:
+        job.set_progress(0, 'Reading database file')
+        chunk = 1024
+        max_size = 10485760  # 10MB
+        with tempfile.NamedTemporaryFile() as stf:
+            with open(stf.name, 'wb') as f:
                 while True:
-                    read = job.pipes.input.r.read(1024)
-                    if read == b'':
+                    data_in = job.pipes.input.r.read(chunk)
+                    if data_in == b'':
                         break
-                    f_tmp.write(read)
-                    nreads += 1
-                    if nreads > 10240:
-                        # FIXME: transfer to a file on disk
-                        raise ValueError('File is bigger than 10MiB')
-
-            self.__upload(filename)
-        finally:
-            with contextlib.suppress(OSError):
-                os.unlink(filename)
-
-        self.middleware.run_coroutine(self.middleware.call('system.reboot', {'delay': 10}), wait=False)
-
-    def __upload(self, config_file_name):
-        tar_error = None
-        try:
-            """
-            First we try to open the file as a tar file.
-            We expect the tar file to contain at least the freenas-v1.db.
-            It can also contain the pwenc_secret file.
-            If we cannot open it as a tar, we try to proceed as it was the
-            raw database file.
-            """
-            try:
-                with tarfile.open(config_file_name) as tar:
-                    bundle = True
-                    tmpdir = tempfile.mkdtemp(dir='/var/tmp/firmware')
-                    tar.extractall(path=tmpdir)
-                    config_file_name = os.path.join(tmpdir, 'freenas-v1.db')
-            except tarfile.ReadError as e:
-                tar_error = str(e)
-                bundle = False
-            # Currently we compare only the number of migrations for south and django
-            # of new and current installed database.
-            # This is not bullet proof as we can eventually have more migrations in a stable
-            # release compared to a older nightly and still be considered a downgrade, however
-            # this is simple enough and works in most cases.
-            alembic_version = None
-            conn = sqlite3.connect(config_file_name)
-            try:
-                cur = conn.cursor()
-                try:
-                    cur.execute(
-                        "SELECT version_num FROM alembic_version"
-                    )
-                    alembic_version = cur.fetchone()[0]
-                except sqlite3.OperationalError as e:
-                    if e.args[0] == "no such table: alembic_version":
-                        # FN/TN < 12
-                        # Let's just ensure it's not a random SQLite file
-                        cur.execute("SELECT 1 FROM django_migrations")
                     else:
-                        raise
-                finally:
-                    cur.close()
-            except sqlite3.OperationalError as e:
-                if tar_error:
-                    raise CallError(
-                        f"Uploaded file is neither a valid .tar file ({tar_error}) nor valid FreeNAS/TrueNAS database "
-                        f"file ({e})."
-                    )
-                else:
-                    raise CallError(f"Uploaded file is not a valid FreeNAS/TrueNAS database file ({e}).")
-            finally:
-                conn.close()
-            if alembic_version is not None:
-                for root, dirs, files in os.walk(os.path.join(get_middlewared_dir(), "alembic", "versions")):
-                    found = False
-                    for name in files:
-                        if name.endswith(".py"):
-                            with open(os.path.join(root, name)) as f:
-                                if any(
-                                    line.strip() == f"Revision ID: {alembic_version}"
-                                    for line in f.read().splitlines()
-                                ):
-                                    found = True
-                                    break
-                    if found:
-                        break
-                else:
-                    raise CallError(
-                        'Failed to upload config, version newer than the '
-                        'current installed.'
-                    )
-        except Exception as e:
-            os.unlink(config_file_name)
-            if isinstance(e, CallError):
-                raise
-            else:
-                raise CallError(f'The uploaded file is not valid: {e}')
+                        f.write(data_in)
 
-        upload = []
+                    if f.tell() > max_size:
+                        raise CallError(f'Uploaded config is greater than maximum allowed size ({max_size} Bytes)')
 
-        def move(src, dst):
-            shutil.move(src, dst)
-            upload.append(dst)
+            if not tarfile.is_tarfile(stf.name):
+                raise CallError(
+                    'The uploaded file is not a configuration archive. Save the configuration again with "Export '
+                    'Password Secret Seed" selected and upload that file instead.'
+                )
 
-        move(config_file_name, UPLOADED_DB_PATH)
-        if bundle:
-            for filename, destination in CONFIG_FILES.items():
-                file_path = os.path.join(tmpdir, filename)
-                if os.path.exists(file_path):
-                    if filename == 'geli':
-                        # Let's only copy the geli keys and not overwrite the entire directory
-                        os.makedirs(CONFIG_FILES['geli'], exist_ok=True)
-                        for key_path in os.listdir(file_path):
-                            move(
-                                os.path.join(file_path, key_path), os.path.join(destination, key_path)
-                            )
-                    elif filename == 'pwenc_secret':
-                        move(file_path, '/data/pwenc_secret_uploaded')
-                    else:
-                        move(file_path, destination)
+            self.upload_impl(job, stf.name)
 
-        # Now we must run the migrate operation in the case the db is older
-        open(NEED_UPDATE_SENTINEL, 'w+').close()
-        upload.append(NEED_UPDATE_SENTINEL)
+        self.middleware.run_coroutine(
+            self.middleware.call('system.reboot', CONFIGURATION_UPLOAD_REBOOT_REASON, {'delay': 10}, app=app),
+            wait=False,
+        )
 
+    @private
+    def upload_impl(self, job, tar_path):
+        job.set_progress(15, 'Replacing database file')
+        with tempfile.TemporaryDirectory() as temp_dir:
+            with tarfile.open(tar_path, 'r') as tar:
+                tar.extractall(temp_dir, filter='tar')
+
+            pathobj = pathlib.Path(temp_dir)
+            found_db_file = None
+            for i in pathobj.iterdir():
+                if i.name == DATABASE_NAME or i.suffix == '.db':
+                    # when user saves their config, we put the db in the
+                    # archive using the same name as the db on the local
+                    # filesystem, however, in the past we did not do this
+                    # so the db was named in an unstructured mannner. We
+                    # already make the assumption that the user doesn't
+                    # change the name of the pwenc_secret file so we'll
+                    # make the assumption that the user can change the
+                    # name of the db but doesn't change the suffix.
+                    found_db_file = i
+                    break
+
+            if found_db_file is None:
+                raise CallError('The uploaded configuration archive does not contain a TrueNAS database.')
+
+            _check_uploaded_secret(f'{temp_dir}/{PWENC_SECRET_NAME}', str(found_db_file.absolute()))
+
+            p = subprocess.run([
+                'migrate',
+                str(found_db_file.absolute()),
+                f'{temp_dir}/{PWENC_SECRET_NAME}',
+            ], capture_output=True, text=True)
+            if p.returncode != 0:
+                raise CallError(
+                    f'Uploaded TrueNAS database file is not valid:\n{p.stderr}'
+                )
+
+            # now copy uploaded files/dirs to respective location
+            send_to_remote = []
+            for i in pathobj.iterdir():
+                abspath = str(i.absolute())
+                if i.name == found_db_file.name:
+                    shutil.move(abspath, UPLOADED_DB_PATH)
+
+                if i.name == 'pwenc_secret':
+                    shutil.move(abspath, PWENC_UPLOADED)
+                    os.chmod(PWENC_UPLOADED, PWENC_FILE_SECRET_MODE)
+                    os.chown(PWENC_UPLOADED, 0, 0)
+                    send_to_remote.append(PWENC_UPLOADED)
+
+                if i.name == 'admin_authorized_keys':
+                    shutil.move(abspath, ADMIN_KEYS_UPLOADED)
+                    send_to_remote.append(ADMIN_KEYS_UPLOADED)
+
+                if i.name == 'truenas_admin_authorized_keys':
+                    shutil.move(abspath, TRUENAS_ADMIN_KEYS_UPLOADED)
+                    send_to_remote.append(TRUENAS_ADMIN_KEYS_UPLOADED)
+
+                if i.name == 'root_authorized_keys':
+                    shutil.move(abspath, ROOT_KEYS_UPLOADED)
+                    send_to_remote.append(ROOT_KEYS_UPLOADED)
+
+                if i.name == 'snmp_engine_id':
+                    shutil.move(abspath, SNMP_ENGINE_ID_UPLOADED)
+                    send_to_remote.append(SNMP_ENGINE_ID_UPLOADED)
+
+            # The standby applies the uploaded database at its next boot even if the files that
+            # accompany it never arrived, so it has to be the last thing we send.
+            send_to_remote.append(UPLOADED_DB_PATH)
+
+        job.set_progress(25, 'Running database upload hooks')
         self.middleware.call_hook_sync('config.on_upload', UPLOADED_DB_PATH)
 
-        if self.middleware.call_sync('failover.licensed'):
-            try:
-                for path in upload:
-                    self.middleware.call_sync('failover.send_small_file', path)
+        self._handle_failover(job, 'uploaded', send_to_remote, UPLOADED_DB_PATH, True,
+                              CONFIGURATION_UPLOAD_REBOOT_REASON)
 
-                self.middleware.call_sync(
-                    'failover.call_remote', 'core.call_hook', ['config.on_upload', [UPLOADED_DB_PATH]],
-                )
-
-                self.middleware.run_coroutine(
-                    self.middleware.call('failover.call_remote', 'system.reboot'),
-                    wait=False,
-                )
-            except Exception as e:
-                raise CallError(
-                    f'Config uploaded successfully, but remote node responded with error: {e}. '
-                    f'Please use Sync to Peer on the System/Failover page to perform a manual sync after reboot.',
-                    CallError.EREMOTENODEERROR,
-                )
-
-    @accepts(Dict('options', Bool('reboot', default=True)))
-    @returns()
+    @api_method(ConfigResetArgs, ConfigResetResult, roles=['FULL_ADMIN'], pass_app=True)
     @job(lock='config_reset', logs=True)
-    def reset(self, job, options):
+    def reset(self, app, job, options):
         """
         Reset database to configuration defaults.
 
-        If `reboot` is true this job will reboot the system after its completed with a delay of 10
-        seconds.
+        When configured to reboot, this job reboots the system after it has completed with a delay of 10 seconds.
         """
-        job.set_progress(0, 'Replacing database file')
+        self._check_access(job, 'reset')
+
+        job.set_progress(15, 'Replacing database file')
         shutil.copy('/data/factory-v1.db', FREENAS_DATABASE)
 
-        job.set_progress(10, 'Running database upload hooks')
+        job.set_progress(25, 'Running database upload hooks')
         self.middleware.call_hook_sync('config.on_upload', FREENAS_DATABASE)
 
-        if self.middleware.call_sync('failover.licensed'):
-            job.set_progress(30, 'Sending database to the other node')
-            try:
-                self.middleware.call_sync('failover.send_small_file', FREENAS_DATABASE)
-
-                self.middleware.call_sync(
-                    'failover.call_remote', 'core.call_hook', ['config.on_upload', [FREENAS_DATABASE]],
-                )
-
-                if options['reboot']:
-                    self.middleware.run_coroutine(
-                        self.middleware.call('failover.call_remote', 'system.reboot'),
-                        wait=False,
-                    )
-            except Exception as e:
-                raise CallError(
-                    f'Config reset successfully, but remote node responded with error: {e}. '
-                    f'Please use Sync to Peer on the System/Failover page to perform a manual sync after reboot.',
-                    CallError.EREMOTENODEERROR,
-                )
-
-        job.set_progress(50, 'Updating initramfs')
-        self.middleware.call_sync('boot.update_initramfs')
+        self._handle_failover(job, 'reset', [FREENAS_DATABASE], FREENAS_DATABASE, options['reboot'],
+                              CONFIGURATION_RESET_REBOOT_REASON)
 
         if options['reboot']:
             job.set_progress(95, 'Will reboot in 10 seconds')
             self.middleware.run_coroutine(
-                self.middleware.call('system.reboot', {'delay': 10}), wait=False,
+                self.middleware.call('system.reboot', CONFIGURATION_RESET_REBOOT_REASON, {'delay': 10}, app=app),
+                wait=False,
+            )
+
+    def _check_access(self, job, verb):
+        if job.credentials is None:
+            raise CallError('Unable to check credentials')
+
+        if job.credentials.is_user_session and not credential_has_full_admin(job.credentials):
+            raise CallError(f'Configuration {verb} is limited to full administrators')
+
+    def _handle_failover(self, job, verb, files, db_path, reboot, reboot_reason):
+        if not self.middleware.call_sync('failover.licensed'):
+            return
+
+        try:
+            job.set_progress(50, 'Sending configuration files to the other node')
+            for _file in files:
+                self.middleware.call_sync('failover.send_small_file', _file)
+
+            job.set_progress(75, 'Running database upload hooks on the other node')
+            self.middleware.call_sync(
+                'failover.call_remote', 'core.call_hook', ['config.on_upload', [db_path]],
+                {'timeout': 300},  # Give more time for potential initrd update
+            )
+
+            if reboot:
+                self.middleware.run_coroutine(
+                    self.middleware.call('failover.call_remote', 'system.reboot', [reboot_reason]),
+                    wait=False,
+                )
+        except Exception as e:
+            raise CallError(
+                f'Config {verb} successfully, but remote node responded with error: {e}. '
+                f'Please use Sync to Peer on the System/Failover page to perform a manual sync after reboot.',
+                CallError.EREMOTENODEERROR,
             )
 
     @private
@@ -313,3 +346,48 @@ class ConfigService(Service):
             os.makedirs(dirname)
 
         shutil.copy(FREENAS_DATABASE, newfile)
+
+
+def handle_db_upload_path(middleware):
+    if os.path.exists(UPLOADED_DB_PATH):
+        middleware.logger.info('Handling uploaded database')
+
+        shutil.move(UPLOADED_DB_PATH, FREENAS_DATABASE)
+
+        if os.path.exists(PWENC_UPLOADED):
+            pwenc_rename(PWENC_UPLOADED)
+        else:
+            with contextlib.suppress(FileNotFoundError):
+                middleware.logger.debug('Database uploaded without pwenc secret. Forcing generation of new secret.')
+                # We immediately generate a fresh (incorrect) secret so that any calls to read an encrypted field
+                # between datastore plugin load and pwenc plugin load (where we reset) will not raise a
+                # truenas_pypwenc.PwencError with code PWENC_ERROR_SECRET_NOT_FOUND
+                pwenc_generate_secret()
+
+        if os.path.exists(ADMIN_KEYS_UPLOADED):
+            shutil.move(ADMIN_KEYS_UPLOADED, CONFIG_FILES['admin_authorized_keys'])
+        else:
+            with contextlib.suppress(FileNotFoundError):
+                os.unlink(CONFIG_FILES['admin_authorized_keys'])
+
+        if os.path.exists(TRUENAS_ADMIN_KEYS_UPLOADED):
+            shutil.move(TRUENAS_ADMIN_KEYS_UPLOADED, CONFIG_FILES['truenas_admin_authorized_keys'])
+        else:
+            with contextlib.suppress(FileNotFoundError):
+                os.unlink(CONFIG_FILES['truenas_admin_authorized_keys'])
+
+        if os.path.exists(ROOT_KEYS_UPLOADED):
+            shutil.move(ROOT_KEYS_UPLOADED, CONFIG_FILES['root_authorized_keys'])
+        else:
+            with contextlib.suppress(FileNotFoundError):
+                os.unlink(CONFIG_FILES['root_authorized_keys'])
+
+        if os.path.exists(SNMP_ENGINE_ID_UPLOADED):
+            os.makedirs(os.path.dirname(CONFIG_FILES['snmp_engine_id']), exist_ok=True)
+            shutil.move(SNMP_ENGINE_ID_UPLOADED, CONFIG_FILES['snmp_engine_id'])
+
+
+async def setup(middleware):
+    # WARNING: the order in which this setup method is run is critical. It must be executed
+    # prior to setup of the datastore plugin.
+    await middleware.run_in_thread(handle_db_upload_path, middleware)

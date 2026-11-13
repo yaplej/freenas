@@ -1,0 +1,266 @@
+import ipaddress
+import os
+import subprocess
+import tempfile
+import textwrap
+
+from truenas_pynetif.address.address import add_address
+from truenas_pynetif.address.get_links import get_link
+from truenas_pynetif.address.netlink import netlink_route
+from truenas_pynetif.configure import BridgeConfig, configure_bridge
+from truenas_pynetif.netlink import DeviceNotFound
+
+from middlewared.service import ServiceContext
+from middlewared.utils.cgroups import move_to_root_cgroups
+
+BRIDGE_AUTO = '[AUTO]'
+BRIDGE_NAME = "truenasbr0"
+# This is intentionally kept on the boot drive because placing
+# it on the system dataset prevents unmounting during system
+# dataset migration. We don't care about DHCP lease files being
+# persistent across updates or HA failovers.
+FS_PATH = "/var/lib/dnsmasq"
+DNSMASQ_CONF_FILE = f"{FS_PATH}/test.dnsmasq.raw"
+DOMAIN_NAME = "tn-container"
+
+__all__ = (
+    "BRIDGE_AUTO",
+    "bridge_choices",
+    "configure_container_bridge",
+)
+
+
+async def bridge_choices(context: ServiceContext) -> dict[str, str]:
+    choices = {BRIDGE_AUTO: "Automatic"}
+    # We do not allow custom bridge on HA because it might have bridge STP issues
+    # causing failover problems.
+    if not await context.middleware.call("failover.licensed"):
+        choices.update({
+            i["name"]: i["name"]
+            for i in await context.middleware.call("interface.query", [["type", "=", "BRIDGE"]])
+        })
+
+    return choices
+
+
+def _bridge_impl(
+    ip4: ipaddress.IPv4Interface | None, ip6: ipaddress.IPv6Interface | None
+) -> bool:
+    was_created = False
+    with netlink_route() as sock:
+        try:
+            get_link(sock, BRIDGE_NAME)
+        except DeviceNotFound:
+            # only create if doesn't already exist
+            configure_bridge(
+                sock,
+                BridgeConfig(name=BRIDGE_NAME, members=[], stp=False),
+            )
+            was_created = True
+            link = get_link(sock, BRIDGE_NAME)
+            if ip4:
+                # Use first host address (.1), not the network address (.0),
+                # to match the --listen-address passed to dnsmasq.
+                v4_listen_addr = ip4.network[1].exploded
+                add_address(
+                    sock,
+                    v4_listen_addr,
+                    ip4.network.prefixlen,
+                    index=link.index,
+                    broadcast=ip4.network.broadcast_address.exploded,
+                )
+            if ip6:
+                # Use first host address (::1), not the network address (::).
+                v6_listen_addr = ip6.network[1].exploded
+                add_address(
+                    sock,
+                    v6_listen_addr,
+                    ip6.network.prefixlen,
+                    index=link.index,
+                )
+    return was_created
+
+
+def _start_dnsmasq(ctx: ServiceContext, dnsmasq_args: list[str]) -> None:
+    with open(DNSMASQ_CONF_FILE, "w"):
+        pass
+
+    cmd = [
+        "dnsmasq",
+        "--keep-in-foreground",
+        "--strict-order",
+        "--bind-dynamic",
+        "--except-interface=lo",
+        "--pid-file=",
+        "--no-ping",
+        f"--interface={BRIDGE_NAME}",
+        "--dhcp-rapid-commit",
+        "--no-negcache",
+        "--dhcp-no-override",
+        "--dhcp-authoritative",
+        f"--dhcp-leasefile={FS_PATH}/dnsmasq.leases",
+        f"--dhcp-hostsfile={FS_PATH}/test.dnsmasq.hosts",
+    ]
+    cmd.extend(dnsmasq_args)
+    cmd.extend(
+        [
+            "-s",
+            DOMAIN_NAME,
+            "--interface-name",
+            f"_gateway.{DOMAIN_NAME},{BRIDGE_NAME}",
+            "-S",
+            f"/{DOMAIN_NAME}/",
+            f"--conf-file={DNSMASQ_CONF_FILE}",
+            "-u",
+            "nobody",
+            "-g",
+            "nogroup",
+        ]
+    )
+    dnsmasq = subprocess.Popen(
+        cmd,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        preexec_fn=os.setsid,
+    )
+    try:
+        move_to_root_cgroups(dnsmasq.pid)
+    except Exception as e:
+        ctx.logger.warning(
+            "Unable to move dnsmasq pid=%r to root cgroups: %r", dnsmasq.pid, e
+        )
+
+
+def _enable_ipv6_forwarding() -> None:
+    # Enabling forwarding makes the kernel ignore router advertisements on any
+    # interface still at accept_ra=1, which can strip a SLAAC-derived address
+    # from the host's own uplink. Bump those interfaces to accept_ra=2 first so
+    # the host keeps honouring RAs while forwarding is on. Leave 0 (RA disabled
+    # on purpose) and 2 (already safe) untouched.
+    conf_dir = "/proc/sys/net/ipv6/conf"
+    with os.scandir(conf_dir) as it:
+        for entry in it:
+            accept_ra_path = os.path.join(entry.path, "accept_ra")
+            try:
+                with open(accept_ra_path) as f:
+                    current = f.read().strip()
+                if current == "1":
+                    with open(accept_ra_path, "w") as f:
+                        f.write("2\n")
+            except (FileNotFoundError, PermissionError):
+                continue
+
+    with open(f"{conf_dir}/all/forwarding", "w") as f:
+        f.write("1\n")
+
+
+def _configure_nft(ipv4_masquerade: str, ipv6_masquerade: str) -> None:
+    if ipv4_masquerade:
+        with open("/proc/sys/net/ipv4/ip_forward", "w") as f:
+            f.write("1\n")
+    if ipv6_masquerade:
+        _enable_ipv6_forwarding()
+
+    icmp_type = "destination-unreachable, time-exceeded, parameter-problem"
+    icmpv6_type = (
+        "destination-unreachable, packet-too-big, time-exceeded, parameter-problem, nd-router-solicit, "
+        "nd-neighbor-solicit, nd-neighbor-advert, mld2-listener-report"
+    )
+    with tempfile.NamedTemporaryFile("w+") as f:
+        f.write(
+            textwrap.dedent(
+                """\
+            table inet truenas {
+                chain pstrt.%(bridge_name)s {
+                    type nat hook postrouting priority srcnat; policy accept;
+                    %(ipv4_masquerade)s
+                    %(ipv6_masquerade)s
+                }
+
+                chain fwd.%(bridge_name)s {
+                    type filter hook forward priority filter; policy accept;
+                    ip version 4 oifname "%(bridge_name)s" accept
+                    ip version 4 iifname "%(bridge_name)s" accept
+                    ip6 version 6 oifname "%(bridge_name)s" accept
+                    ip6 version 6 iifname "%(bridge_name)s" accept
+                }
+
+                chain in.%(bridge_name)s {
+                    type filter hook input priority filter; policy accept;
+                    iifname "%(bridge_name)s" tcp dport 53 accept
+                    iifname "%(bridge_name)s" udp dport 53 accept
+                    iifname "%(bridge_name)s" icmp type { %(icmp_type)s } accept
+                    iifname "%(bridge_name)s" udp dport 67 accept
+                    iifname "%(bridge_name)s" icmpv6 type { %(icmpv6_type)s } accept
+                    iifname "%(bridge_name)s" udp dport 547 accept
+                }
+
+                chain out.%(bridge_name)s {
+                    type filter hook output priority filter; policy accept;
+                    oifname "%(bridge_name)s" tcp sport 53 accept
+                    oifname "%(bridge_name)s" udp sport 53 accept
+                    oifname "%(bridge_name)s" icmp type { %(icmp_type)s } accept
+                    oifname "%(bridge_name)s" udp sport 67 accept
+                    oifname "%(bridge_name)s" icmpv6 type { %(icmpv6_type)s } accept
+                    oifname "%(bridge_name)s" udp sport 547 accept
+                }
+            }
+        """
+                % {
+                    "bridge_name": BRIDGE_NAME,
+                    "ipv4_masquerade": ipv4_masquerade,
+                    "ipv6_masquerade": ipv6_masquerade,
+                    "icmp_type": icmp_type,
+                    "icmpv6_type": icmpv6_type,
+                }
+            )
+        )
+        f.flush()
+        subprocess.check_call(["nft", "-f", f.name])
+
+
+def configure_container_bridge(ctx: ServiceContext) -> None:
+    config = ctx.middleware.call_sync("lxc.config")
+
+    # FIXME: what user and group whould we use to run dnsmasq?
+    os.makedirs(FS_PATH, exist_ok=True)
+
+    ip4 = ipaddress.IPv4Interface(config.v4_network) if config.v4_network else None
+    ip6 = ipaddress.IPv6Interface(config.v6_network) if config.v6_network else None
+
+    was_created = _bridge_impl(ip4, ip6)
+    if not was_created:
+        return
+
+    ipv4_masquerade = ""
+    ipv6_masquerade = ""
+    dnsmasq_args = []
+    if ip4:
+        ip, prefix = ip4.ip.exploded, ip4.network.prefixlen
+        ipv4_masquerade = f"ip saddr {ip}/{prefix} ip daddr != {ip}/{prefix} masquerade"
+        dnsmasq_args.extend(
+            [
+                "--quiet-dhcp",
+                f"--listen-address={ip4.network[1]!s}",
+                "--dhcp-range",
+                f"{ip4.network[2]!s},{ip4.network[-2]!s},1h",
+            ]
+        )
+    if ip6:
+        ip, prefix = ip6.ip.exploded, ip6.network.prefixlen
+        ipv6_masquerade = (
+            f"ip6 saddr {ip}/{prefix} ip6 daddr != {ip}/{prefix} masquerade"
+        )
+        dnsmasq_args.extend(
+            [
+                "--quiet-dhcp6",
+                "--quiet-ra",
+                f"--listen-address={ip6.network[1]!s}",
+                "--enable-ra",
+                "--dhcp-range",
+                f"::,constructor:{BRIDGE_NAME},ra-stateless,ra-names",
+            ]
+        )
+
+    _configure_nft(ipv4_masquerade, ipv6_masquerade)
+    _start_dnsmasq(ctx, dnsmasq_args)

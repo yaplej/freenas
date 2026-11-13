@@ -1,15 +1,25 @@
+from __future__ import annotations
+
 import asyncio
-import os
 import re
+import tempfile
+import textwrap
+from typing import Any
 import warnings
 
-from copy import deepcopy
-
+from middlewared.api.current import SystemAdvancedEntry, SystemAdvancedUpdate
+from middlewared.plugins.initramfs import write_initramfs_flags
+from middlewared.service import ConfigServicePart, ValidationErrors
 import middlewared.sqlalchemy as sa
+from middlewared.utils import run
+from middlewared.utils.boot.models import BootUpdateInitramfsOptions
+from middlewared.utils.service.entitlement import validate_sed_license
+from middlewared.utils.service.settings import SettingsHelper
 
-from middlewared.schema import accepts, Bool, Dict, Int, List, Patch, returns, Str
-from middlewared.service import ConfigService, private, ValidationErrors
-from middlewared.validators import Range
+from .nvidia import handle_nvidia_toggle
+from .serial import configure_tty, serial_port_choices
+
+settings = SettingsHelper()
 
 
 class SystemAdvancedModel(sa.Model):
@@ -21,7 +31,6 @@ class SystemAdvancedModel(sa.Model):
     adv_serialport = sa.Column(sa.String(120), default='ttyS0')
     adv_serialspeed = sa.Column(sa.String(120), default='9600')
     adv_powerdaemon = sa.Column(sa.Boolean(), default=False)
-    adv_swapondrive = sa.Column(sa.Integer(), default=2)
     adv_overprovision = sa.Column(sa.Integer(), nullable=True, default=None)
     adv_traceback = sa.Column(sa.Boolean(), default=True)
     adv_advancedmode = sa.Column(sa.Boolean(), default=False)
@@ -31,314 +40,261 @@ class SystemAdvancedModel(sa.Model):
     adv_anonstats = sa.Column(sa.Boolean(), default=True)
     adv_anonstats_token = sa.Column(sa.Text())
     adv_motd = sa.Column(sa.Text(), default='Welcome')
+    adv_login_banner = sa.Column(sa.Text(), default='')
     adv_boot_scrub = sa.Column(sa.Integer(), default=7)
     adv_fqdn_syslog = sa.Column(sa.Boolean(), default=False)
     adv_sed_user = sa.Column(sa.String(120), default='user')
     adv_sed_passwd = sa.Column(sa.EncryptedText(), default='')
     adv_sysloglevel = sa.Column(sa.String(120), default='f_info')
-    adv_syslogserver = sa.Column(sa.String(120), default='')
-    adv_syslog_transport = sa.Column(sa.String(12), default='UDP')
-    adv_syslog_tls_certificate_id = sa.Column(sa.ForeignKey('system_certificate.id'), index=True, nullable=True)
-    adv_syslog_tls_certificate_authority_id = sa.Column(
-        sa.ForeignKey('system_certificateauthority.id'), index=True, nullable=True
-    )
+    adv_syslogservers = sa.Column(sa.JSON(list), default=[])
+    adv_syslog_audit = sa.Column(sa.Boolean(), default=False)
     adv_kmip_uid = sa.Column(sa.String(255), nullable=True, default=None)
     adv_kdump_enabled = sa.Column(sa.Boolean(), default=False)
-    adv_isolated_gpu_pci_ids = sa.Column(sa.JSON(), default=[])
+    adv_isolated_gpu_pci_ids = sa.Column(sa.JSON(list), default=[])
     adv_kernel_extra_options = sa.Column(sa.Text(), default='', nullable=False)
+    adv_nvidia = sa.Column(sa.Boolean(), default=False)
 
 
-class SystemAdvancedService(ConfigService):
+def syslogd_changes(orig_config: dict[str, Any], new_config: dict[str, Any]) -> bool:
+    """Return `True` if syslogd should be restarted to apply the new configuration."""
+    if (
+        orig_config['fqdn_syslog'] != new_config['fqdn_syslog']
+        or orig_config['sysloglevel'].lower() != new_config['sysloglevel'].lower()
+        or orig_config['syslog_audit'] != new_config['syslog_audit']
+    ):
+        return True
+    # Convert syslogservers to sets to disregard ordering for the comparison
+    orig_items_set = {frozenset(d.items()) for d in orig_config['syslogservers']}
+    new_items_set = {frozenset(d.items()) for d in new_config['syslogservers']}
+    return orig_items_set != new_items_set
 
-    class Config:
-        datastore = 'system.advanced'
-        datastore_prefix = 'adv_'
-        datastore_extend = 'system.advanced.system_advanced_extend'
-        namespace = 'system.advanced'
-        cli_namespace = 'system.advanced'
 
-    ENTRY = Dict(
-        'system_advanced_entry',
-        Bool('advancedmode', required=True),
-        Bool('autotune', required=True),
-        Bool('kdump_enabled', required=True),
-        Int('boot_scrub', validators=[Range(min=1)], required=True),
-        Bool('consolemenu', required=True),
-        Bool('consolemsg', required=True),
-        Bool('debugkernel', required=True),
-        Bool('fqdn_syslog', required=True),
-        Str('motd', required=True),
-        Bool('powerdaemon', required=True),
-        Bool('serialconsole', required=True),
-        Str('serialport', required=True),
-        Str('anonstats_token', required=True),
-        Str('serialspeed', enum=['9600', '19200', '38400', '57600', '115200'], required=True),
-        Int('swapondrive', validators=[Range(min=0)], required=True),
-        Int('overprovision', validators=[Range(min=0)], null=True, required=True),
-        Bool('traceback', required=True),
-        Bool('uploadcrash', required=True),
-        Bool('anonstats', required=True),
-        Str('sed_user', enum=['USER', 'MASTER'], required=True),
-        Str('sysloglevel', enum=[
-            'F_EMERG', 'F_ALERT', 'F_CRIT', 'F_ERR', 'F_WARNING', 'F_NOTICE', 'F_INFO', 'F_DEBUG',
-        ], required=True),
-        Str('syslogserver'),
-        Str('syslog_transport', enum=['UDP', 'TCP', 'TLS'], required=True),
-        Int('syslog_tls_certificate', null=True, required=True),
-        Int('syslog_tls_certificate_authority', null=True, required=True),
-        List('isolated_gpu_pci_ids', items=[Str('pci_id')], required=True),
-        Str('kernel_extra_options', required=True),
-        Int('id', required=True),
-    )
+class SystemAdvancedConfigServicePart(ConfigServicePart[SystemAdvancedEntry]):
+    _datastore = 'system.advanced'
+    _datastore_prefix = 'adv_'
+    _entry = SystemAdvancedEntry
 
-    @private
-    async def system_advanced_extend(self, data):
+    async def extend(self, data: dict[str, Any]) -> dict[str, Any]:
         data['consolemsg'] = (await self.middleware.call('system.general.config'))['ui_consolemsg']
 
         if data.get('sed_user'):
-            data['sed_user'] = data.get('sed_user').upper()
-
-        for k in filter(lambda k: data[k], ['syslog_tls_certificate_authority', 'syslog_tls_certificate']):
-            data[k] = data[k]['id']
-
-        if data['swapondrive'] and (await self.middleware.call('system.product_type')) == 'ENTERPRISE':
-            data['swapondrive'] = 0
+            data['sed_user'] = data['sed_user'].upper()
 
         data.pop('sed_passwd')
         data.pop('kmip_uid')
 
         return data
 
-    async def __validate_fields(self, schema, data):
-        verrors = ValidationErrors()
+    async def sed_global_password(self) -> str:
+        """Returns the configured global SED password in clear-text if one is set, otherwise an empty string."""
+        passwd = (await self.middleware.call(
+            'datastore.config', self._datastore, {'prefix': self._datastore_prefix}
+        ))['sed_passwd']
+        if passwd:
+            return str(passwd)
+        return str(await self.middleware.call('kmip.sed_global_password'))
 
-        serial_choice = data.get('serialport')
-        if data.get('serialconsole'):
-            if not serial_choice:
+    def login_banner(self) -> str:
+        return str(self.middleware.call_sync('datastore.config', self._datastore)['adv_login_banner'])
+
+    @settings.fields_validator('serialport', 'serialconsole')
+    async def _validate_serial(self, verrors: ValidationErrors, /, serialport: str, serialconsole: bool) -> None:
+        if serialconsole:
+            if not serialport:
                 verrors.add(
-                    f'{schema}.serialport',
+                    'serialport',
                     'Please specify a serial port when serial console option is checked'
                 )
-            elif serial_choice not in await self.middleware.call('system.advanced.serial_port_choices'):
+            elif serialport not in await serial_port_choices(self):
                 verrors.add(
-                    f'{schema}.serialport',
+                    'serialport',
                     'Serial port specified has not been identified by the system'
                 )
 
-        ups_port = (await self.middleware.call('ups.config'))['port']
-        if not verrors and os.path.join('/dev', serial_choice or '') == ups_port:
-            verrors.add(
-                f'{schema}.serialport',
-                'Serial port must be different then the port specified for UPS Service'
-            )
-
-        syslog_server = data.get('syslogserver')
-        if syslog_server:
-            match = re.match(r"^[\w\.\-]+(\:\d+)?$", syslog_server)
-            if not match:
+            ups_port = (await self.middleware.call('ups.config')).port
+            if f'/dev/{serialport}' == ups_port:
                 verrors.add(
-                    f'{schema}.syslogserver',
-                    'Invalid syslog server format'
+                    'serialport',
+                    'Serial port must be different than the port specified for UPS Service'
                 )
-            elif ':' in syslog_server:
-                port = int(syslog_server.split(':')[-1])
+
+    @settings.fields_validator('syslogservers')
+    async def _validate_syslogserver(self, verrors: ValidationErrors, /, syslogservers: list[dict[str, Any]]) -> None:
+        seen_hosts = set()
+        for i, server in enumerate(syslogservers):
+            host = server['host']
+            if host in seen_hosts:
+                verrors.add(f'syslogservers.{i}.host', 'Duplicate host in syslogservers array')
+
+            elif not re.match(r"^\[?[\w.\-:%]+]?(:\d+)?$", host):
+                verrors.add(f'syslogservers.{i}.host', 'Invalid syslog server format')
+
+            elif ']:' in host or (':' in host and ']' not in host):
+                port = int(host.split(':')[-1])
                 if port < 0 or port > 65535:
-                    verrors.add(
-                        f'{schema}.syslogserver',
-                        'Port must be in the range of 0 to 65535.'
-                    )
+                    verrors.add(f'syslogservers.{i}.host', 'Port must be in the range of 0 to 65535.')
 
-        if data['syslog_transport'] == 'TLS':
-            if not data['syslog_tls_certificate_authority']:
-                verrors.add(
-                    f'{schema}.syslog_tls_certificate_authority', 'This is required when using TLS as syslog transport'
+            seen_hosts.add(host)
+
+            cert_id: int = server['tls_certificate']
+            if server['transport'] == 'TLS' and cert_id:
+                cert_verrors = await self.call2(
+                    self.s.certificate.cert_services_validation,
+                    cert_id, f'syslogservers.{i}.tls_certificate', False,
                 )
-            ca_cert = await self.middleware.call(
-                'certificateauthority.query', [['id', '=', data['syslog_tls_certificate_authority']]]
+                if cert_verrors:
+                    verrors.extend(cert_verrors)
+
+    @settings.fields_validator('kernel_extra_options')
+    async def _validate_kernel_extra_options(self, verrors: ValidationErrors, /, kernel_extra_options: str) -> None:
+        for invalid_char in ('\n', '"'):
+            if invalid_char in kernel_extra_options:
+                verrors.add('kernel_extra_options', f'{invalid_char!r} is an invalid character and not allowed')
+
+        with tempfile.NamedTemporaryFile(mode="w+", encoding="utf-8") as f:
+            f.write(textwrap.dedent(f"""\
+                menuentry 'TrueNAS' {{
+                    linux /boot/vmlinuz {kernel_extra_options}
+                }}
+            """))
+            f.flush()
+
+            result = await run(["grub-script-check", f.name], check=False)
+            if result.returncode != 0:
+                verrors.add('kernel_extra_options', 'Invalid syntax')
+
+        invalid_param = 'systemd.unified_cgroup_hierarchy'
+        if invalid_param in kernel_extra_options:
+            # TODO: we don't normalize values being passed into us which allows a comical amount of potential
+            #  foot-shooting
+            verrors.add('kernel_extra_options', f'Modifying {invalid_param!r} is not allowed')
+
+    @settings.fields_validator('nvidia')
+    async def _validate_nvidia(self, verrors: ValidationErrors, /, nvidia: bool) -> None:
+        # Only validate when nvidia is being disabled
+        if nvidia is True:
+            return
+
+        container_ids = {
+            device.container for device in await self.call2(
+                self.s.container.device.query,
+                [['attributes.dtype', '=', 'GPU'], ['attributes.gpu_type', '=', 'NVIDIA']],
             )
-            if not ca_cert:
-                verrors.add(f'{schema}.syslog_tls_certificate_authority', 'Unable to locate specified CA')
-            elif ca_cert[0]['revoked']:
-                verrors.add(f'{schema}.syslog_tls_certificate_authority', 'Specified CA has been revoked')
+        }
+        if containers := await self.call2(
+            self.s.container.query, [['id', 'in', container_ids], ['status.state', '=', 'RUNNING']]
+        ):
+            verrors.add(
+                'nvidia',
+                f'NVIDIA GPU support cannot be disabled while the following containers are using '
+                f'NVIDIA GPUs: {", ".join(c.name for c in containers)}. Please stop these containers first.'
+            )
 
-            if data['syslog_tls_certificate']:
-                verrors.extend(await self.middleware.call(
-                    'certificate.cert_services_validation', data['syslog_tls_certificate'],
-                    f'{schema}.syslog_tls_certificate', False
-                ))
+    @settings.fields_validator('sed_user')
+    async def _validate_sed_user(self, verrors: ValidationErrors, /, sed_user: str) -> None:
+        await validate_sed_license(self.middleware, verrors, 'sed_user')
 
-        if data['isolated_gpu_pci_ids']:
-            verrors = await self.validate_gpu_pci_ids(data['isolated_gpu_pci_ids'], verrors, schema)
+    @settings.fields_validator('sed_passwd')
+    async def _validate_sed_passwd(self, verrors: ValidationErrors, /, sed_passwd: str) -> None:
+        if not sed_passwd:
+            # Clearing stays available unconditionally so a system without the entitlement can
+            # still drop a secret it is no longer allowed to use.
+            return
 
-        for ch in ('\n', '"'):
-            if ch in data['kernel_extra_options']:
-                verrors.add('kernel_extra_options', f'{ch!r} not allowed')
+        await validate_sed_license(self.middleware, verrors, 'sed_passwd')
 
-        return verrors, data
+    async def do_update(self, data: SystemAdvancedUpdate) -> SystemAdvancedEntry:
+        old_config = await self.config()
+        old_sed = await self.sed_global_password()
 
-    @accepts(
-        Patch(
-            'system_advanced_entry', 'system_advanced_update',
-            ('rm', {'name': 'id'}),
-            ('rm', {'name': 'anonstats_token'}),
-            ('add', Str('sed_passwd', private=True)),
-            ('attr', {'update': True}),
-        )
-    )
-    async def do_update(self, data):
-        """
-        Update System Advanced Service Configuration.
+        # `sed_passwd` is not a field on the entry and `consolemsg` lives in `system.general`; read both
+        # side-channel values here since they are handled separately from the entry merge below.
+        update = data.model_dump(expose_secrets=True)
+        new_sed = update.get('sed_passwd', old_sed)
 
-        `consolemenu` should be disabled if the menu at console is not desired. It will default to standard login
-        in the console if disabled.
-
-        `autotune` when enabled executes autotune script which attempts to optimize the system based on the installed
-        hardware.
-
-        When `syslogserver` is defined, logs of `sysloglevel` or above are sent.
-
-        `consolemsg` is a deprecated attribute and will be removed in further releases. Please, use `consolemsg`
-        attribute in the `system.general` plugin.
-
-        `isolated_gpu_pci_ids` is a list of PCI ids which are isolated from host system.
-        """
         consolemsg = None
-        if 'consolemsg' in data:
-            consolemsg = data.pop('consolemsg')
+        if 'consolemsg' in update:
+            consolemsg = update['consolemsg']
             warnings.warn("`consolemsg` has been deprecated and moved to `system.general`", DeprecationWarning)
 
-        config_data = await self.config()
-        config_data['sed_passwd'] = await self.sed_global_password()
-        config_data.pop('consolemsg')
-        original_data = deepcopy(config_data)
-        config_data.update(data)
+        new_config = old_config.updated(data)
+        new_config = new_config.model_copy(update={
+            # consolemsg lives in system.general, so it must not count as an advanced change
+            'consolemsg': old_config.consolemsg,
+            # a non-TLS server can't carry a client certificate
+            'syslogservers': [
+                server if server.transport == 'TLS' else server.model_copy(update={'tls_certificate': None})
+                for server in new_config.syslogservers
+            ],
+        })
 
-        verrors, config_data = await self.__validate_fields('advanced_settings_update', config_data)
-        if verrors:
-            raise verrors
+        # `sed_passwd` is not on the entry, so it is merged in here to be visible to its validator.
+        await settings.validate(
+            self,
+            'system_advanced_update',
+            old_config.model_dump() | {'sed_passwd': old_sed},
+            new_config.model_dump() | {'sed_passwd': new_sed},
+        )
 
-        if config_data != original_data:
-            if original_data.get('sed_user'):
-                original_data['sed_user'] = original_data['sed_user'].lower()
-            if config_data.get('sed_user'):
-                config_data['sed_user'] = config_data['sed_user'].lower()
-            if not config_data['sed_passwd'] and config_data['sed_passwd'] != original_data['sed_passwd']:
+        if new_config != old_config or new_sed != old_sed:
+            write = new_config.model_dump()
+            write.pop('id', None)
+            write.pop('consolemsg', None)
+            write['sed_user'] = write['sed_user'].lower()
+            write['sed_passwd'] = new_sed
+
+            if not new_sed and new_sed != old_sed:
                 # We want to make sure kmip uid is None in this case
-                adv_config = await self.middleware.call('datastore.config', self._config.datastore)
-                asyncio.ensure_future(
-                    self.middleware.call('kmip.reset_sed_global_password', adv_config['adv_kmip_uid'])
-                )
-                config_data['kmip_uid'] = None
+                adv_kmip_uid = (await self.middleware.call(
+                    'datastore.config', self._datastore, {'prefix': self._datastore_prefix}
+                ))['kmip_uid']
+                self.create_task(self.middleware.call('kmip.reset_sed_global_password', adv_kmip_uid))
+                write['kmip_uid'] = None
 
             await self.middleware.call(
-                'datastore.update',
-                self._config.datastore,
-                config_data['id'],
-                config_data,
-                {'prefix': self._config.datastore_prefix}
+                'datastore.update', self._datastore, old_config.id, write, {'prefix': self._datastore_prefix}
             )
 
-            if original_data['boot_scrub'] != config_data['boot_scrub']:
-                await self.middleware.call('service.restart', 'cron')
+            if old_config.boot_scrub != new_config.boot_scrub:
+                await (await self.call2(self.s.service.control, 'RESTART', 'cron')).wait(raise_error=True)
 
-            generate_grub = original_data['kernel_extra_options'] != config_data['kernel_extra_options']
-            if original_data['motd'] != config_data['motd']:
+            generate_grub = old_config.kernel_extra_options != new_config.kernel_extra_options
+            if old_config.motd != new_config.motd:
                 await self.middleware.call('etc.generate', 'motd')
 
-            if original_data['powerdaemon'] != config_data['powerdaemon']:
-                await self.middleware.call('service.restart', 'powerd')
+            if old_config.login_banner != new_config.login_banner:
+                await (await self.call2(self.s.service.control, 'RELOAD', 'ssh')).wait(raise_error=True)
 
-            if original_data['fqdn_syslog'] != config_data['fqdn_syslog']:
-                await self.middleware.call('service.restart', 'syslogd')
+            if old_config.powerdaemon != new_config.powerdaemon:
+                await (await self.call2(self.s.service.control, 'RESTART', 'powerd')).wait(raise_error=True)
 
-            if (
-                original_data['sysloglevel'].lower() != config_data['sysloglevel'].lower() or
-                original_data['syslogserver'] != config_data['syslogserver'] or
-                original_data['syslog_transport'] != config_data['syslog_transport'] or
-                original_data['syslog_tls_certificate'] != config_data['syslog_tls_certificate'] or
-                original_data['syslog_tls_certificate_authority'] != config_data['syslog_tls_certificate_authority']
-            ):
-                await self.middleware.call('service.restart', 'syslogd')
+            if syslogd_changes(old_config.model_dump(), new_config.model_dump()):
+                await (await self.call2(self.s.service.control, 'RESTART', 'syslogd')).wait(raise_error=True)
 
-            if config_data['sed_passwd'] and original_data['sed_passwd'] != config_data['sed_passwd']:
+            if new_sed and old_sed != new_sed:
                 await self.middleware.call('kmip.sync_sed_keys')
 
-            if config_data['kdump_enabled'] != original_data['kdump_enabled']:
+            if new_config.kdump_enabled != old_config.kdump_enabled:
                 # kdump changes require a reboot to take effect. So just generating the kdump config
                 # should be enough
                 await self.middleware.call('etc.generate', 'kdump')
                 generate_grub = True
 
-            if original_data['isolated_gpu_pci_ids'] != config_data['isolated_gpu_pci_ids']:
-                await self.middleware.call('boot.update_initramfs')
+            if old_config.debugkernel != new_config.debugkernel:
+                generate_grub = True
+                # Keep the on-disk flag in sync on every transition so
+                # truenas-initrd.py reads the right value on the next regen.
+                await asyncio.to_thread(write_initramfs_flags, self.middleware)
 
-            await self.middleware.call('system.advanced.configure_tty', original_data, config_data, generate_grub)
+            if old_config.nvidia != new_config.nvidia:
+                await handle_nvidia_toggle(self)
+
+            await configure_tty(self, old_config.model_dump(), new_config.model_dump(), generate_grub)
+
+            if new_config.debugkernel and not old_config.debugkernel:
+                await self.call2(self.s.boot.update_initramfs, BootUpdateInitramfsOptions())
 
         if consolemsg is not None:
             await self.middleware.call('system.general.update', {'ui_consolemsg': consolemsg})
 
         return await self.config()
-
-    @accepts()
-    @returns(Str('sed_global_password'))
-    async def sed_global_password(self):
-        """
-        Returns configured global SED password.
-        """
-        passwd = (await self.middleware.call(
-            'datastore.config', 'system.advanced', {'prefix': self._config.datastore_prefix}
-        ))['sed_passwd']
-        return passwd if passwd else await self.middleware.call('kmip.sed_global_password')
-
-    @private
-    async def validate_gpu_pci_ids(self, isolated_gpu_pci_ids, verrors, schema):
-        available = set()
-        critical_gpus = set()
-        for gpu in await self.middleware.call('device.get_gpus'):
-            available.add(gpu['addr']['pci_slot'])
-            if gpu['uses_system_critical_devices']:
-                critical_gpus.add(gpu['addr']['pci_slot'])
-
-        provided = set(isolated_gpu_pci_ids)
-        not_available = provided - available
-        cannot_isolate = provided & critical_gpus
-        if not_available:
-            verrors.add(
-                f'{schema}.isolated_gpu_pci_ids',
-                f'{", ".join(not_available)} GPU pci slot(s) are not available or a GPU is not configured.'
-            )
-
-        if cannot_isolate:
-            verrors.add(
-                f'{schema}.isolated_gpu_pci_ids',
-                f'{", ".join(cannot_isolate)} GPU pci slot(s) consists of devices '
-                'which cannot be isolated from host.'
-            )
-
-        if len(available - provided) < 1:
-            verrors.add(
-                f'{schema}.isolated_gpu_pci_ids',
-                'A minimum of 1 GPU is required for the host to ensure it functions as desired.'
-            )
-
-        return verrors
-
-    @accepts(List('isolated_gpu_pci_ids', items=[Str('pci_id')], required=True))
-    @returns()
-    async def update_gpu_pci_ids(self, isolated_gpu_pci_ids):
-        """
-        `isolated_gpu_pci_ids` is a list of PCI ids which are isolated from host system.
-        """
-        verrors = ValidationErrors()
-        if isolated_gpu_pci_ids:
-            verrors = await self.validate_gpu_pci_ids(isolated_gpu_pci_ids, verrors, 'gpu_settings')
-
-        verrors.check()
-
-        await self.middleware.call(
-            'datastore.update',
-            self._config.datastore,
-            (await self.middleware.call('system.advanced.config'))['id'],
-            {'isolated_gpu_pci_ids': isolated_gpu_pci_ids},
-            {'prefix': self._config.datastore_prefix}
-        )

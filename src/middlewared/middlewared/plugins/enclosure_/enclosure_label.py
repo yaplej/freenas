@@ -1,0 +1,48 @@
+from middlewared.api import api_method
+from middlewared.api.current import EnclosureLabelSetArgs, EnclosureLabelSetResult
+from middlewared.service import Service, private
+from middlewared.service_exception import MatchNotFound, ValidationError
+import middlewared.sqlalchemy as sa
+
+
+class EnclosureLabelModel(sa.Model):
+    __tablename__ = "enclosure_label"
+
+    id = sa.Column(sa.Integer(), primary_key=True)
+    encid = sa.Column(sa.String(200), unique=True)
+    label = sa.Column(sa.String(200))
+
+
+class EnclosureLabelService(Service):
+    class Config:
+        namespace = "enclosure.label"
+        cli_namespace = "storage.enclosure.label"
+
+    @private
+    async def get_all(self):
+        return {
+            label["encid"]: label["label"]
+            for label in await self.middleware.call("datastore.query", "enclosure.label")
+        }
+
+    @api_method(EnclosureLabelSetArgs, EnclosureLabelSetResult, roles=["ENCLOSURE_WRITE"])
+    async def set(self, id_, label):
+        """
+        Set a user-defined label for the enclosure identified by ``id``.
+
+        A JSON-RPC ``error`` response (code ``-32602``, *Invalid params*) is returned when no
+        enclosure with the given ``id`` exists.
+        """
+        try:
+            await self.middleware.call("enclosure2.query", [["id", "=", id_]], {"get": True})
+        except MatchNotFound:
+            raise ValidationError("id", f'Enclosure with id: {id_!r} not found')
+
+        await self.middleware.call(
+            "datastore.delete", "enclosure.label", [["encid", "=", id_]]
+        )
+        await self.middleware.call(
+            "datastore.insert",
+            "enclosure.label",
+            {"encid": id_, "label": label},
+        )

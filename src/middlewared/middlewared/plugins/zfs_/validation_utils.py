@@ -1,13 +1,24 @@
-import libzfs
+import truenas_pylibzfs
+
+from middlewared.utils.boot.pool import boot_pool
+
+
+def check_zvol_in_boot_pool_using_name(zvol_name: str) -> bool:
+    from .utils import zvol_name_to_path  # lazy import to avoid circular import when running `alembic merge heads`
+    return check_zvol_in_boot_pool_using_path(zvol_name_to_path(zvol_name))
+
+
+def check_zvol_in_boot_pool_using_path(zvol_path: str) -> bool:
+    return zvol_path.startswith(f'/dev/zvol/{boot_pool.get_name()}/')
 
 
 def validate_pool_name(name: str) -> bool:
-    return libzfs.validate_pool_name(name)
+    return truenas_pylibzfs.name_is_valid(name=name, type=truenas_pylibzfs.ZFSType.ZFS_TYPE_POOL)
 
 
 def validate_dataset_name(name: str) -> bool:
-    return libzfs.validate_dataset_name(name)
+    return truenas_pylibzfs.name_is_valid(name=name, type=truenas_pylibzfs.ZFSType.ZFS_TYPE_FILESYSTEM)
 
 
 def validate_snapshot_name(name: str) -> bool:
-    return libzfs.validate_snapshot_name(name)
+    return truenas_pylibzfs.name_is_valid(name=name, type=truenas_pylibzfs.ZFSType.ZFS_TYPE_SNAPSHOT)

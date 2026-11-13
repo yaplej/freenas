@@ -1,23 +1,100 @@
+from __future__ import annotations
+
 import asyncio
-import contextlib
 from collections import OrderedDict
+import contextlib
 import copy
-from datetime import datetime
 import enum
+import errno
+from functools import cache, partial
 import logging
 import os
 import shutil
 import sys
+import threading
 import time
 import traceback
-import threading
+import typing
 
-from middlewared.service_exception import CallError, ValidationError, ValidationErrors, adapt_exception
 from middlewared.pipe import Pipes
+from middlewared.service_exception import CallError, ValidationError, ValidationErrors, adapt_exception
+from middlewared.utils.asyncio_ import ThreadsafeTimer
+from middlewared.utils.privilege import (
+    app_can_see_secrets,
+    credential_has_full_admin,
+    credential_is_limited_to_own_jobs,
+)
+from middlewared.utils.threading import thread_local_storage
+from middlewared.utils.time_utils import utc_now
+
+if typing.TYPE_CHECKING:
+    from asyncio import Task
+    from datetime import datetime
+
+    from middlewared.api.base.server.app import App
+    from middlewared.api.base.server.ws_handler.rpc import RpcWebSocketApp
+    from middlewared.auth import SessionManagerCredentials
+    from middlewared.main import Middleware
+    from middlewared.service import Service
+    from middlewared.utils.types import EventType, ExcInfo
+
+
+class _Progress(typing.TypedDict):
+    percent: int
+    description: str
+    extra: typing.Any
+
 
 logger = logging.getLogger(__name__)
 
 LOGS_DIR = '/var/log/jobs'
+
+
+class JobCancelledException(Exception):
+    """Sync job must raise this exception after handling `job.aborted_event`"""
+    pass
+
+
+def send_job_event(
+    middleware: Middleware, event_type: EventType, job: Job, fields: dict[str, typing.Any] | None = None
+) -> None:
+    """
+    Report a change of `job` to every subscriber that may read it.
+
+    :param middleware: `Middleware` instance.
+    :param event_type: `core.get_jobs` event type, either `ADDED` or `CHANGED`.
+    :param job: the job that changed.
+    :param fields: the job already encoded with its secrets exposed, when the caller needed that
+        encoding anyway. Encoded on demand when omitted.
+    """
+    if job.options['transient']:
+        return
+
+    # A job result may contain `Secret` values, and this event reaches every subscriber that may
+    # read the job. Each subscriber gets the encoding its credential may see.
+    @cache
+    def encode(with_secrets: bool) -> dict[str, typing.Any]:
+        if with_secrets and fields is not None:
+            return fields
+        return job.__encode__(raw_result=with_secrets)
+
+    def fields_factory(app: App | None) -> dict[str, typing.Any]:
+        return encode(app_can_see_secrets(app, job.serviceobj._config.role_prefix))
+
+    middleware.send_event(
+        'core.get_jobs',
+        event_type,
+        id=job.id,
+        fields_factory=fields_factory,
+        should_send_event=partial(should_send_job_event, job),
+    )
+
+
+def should_send_job_event(job: Job, wsclient: RpcWebSocketApp) -> bool:
+    if wsclient.authenticated_credentials:
+        return job.credential_can_access(wsclient.authenticated_credentials, JobAccess.READ)
+
+    return False
 
 
 class State(enum.Enum):
@@ -28,7 +105,7 @@ class State(enum.Enum):
     ABORTED = 5
 
 
-class JobSharedLock(object):
+class JobSharedLock:
     """
     Shared lock for jobs.
     Each job method can specify a lock which will be shared
@@ -36,93 +113,131 @@ class JobSharedLock(object):
     for this lock.
     """
 
-    def __init__(self, queue, name, *, loop=None):
+    def __init__(self, queue: JobsQueue, name: str):
         self.queue = queue
         self.name = name
-        self.jobs = set()
-        # Once we upgrade to python 3.10 and it starts crashing here, just revert a commit that introduced `loop=loop`
-        self.lock = asyncio.Lock(loop=loop)
+        self.jobs: set[Job] = set()
+        self.lock = asyncio.Lock()
 
-    def add_job(self, job):
+    def add_job(self, job: Job) -> None:
         self.jobs.add(job)
 
-    def get_jobs(self):
+    def get_jobs(self) -> set[Job]:
         return self.jobs
 
-    def remove_job(self, job):
+    def remove_job(self, job: Job) -> None:
         self.jobs.discard(job)
 
-    def locked(self):
+    def locked(self) -> bool:
         return self.lock.locked()
 
-    async def acquire(self):
+    async def acquire(self) -> typing.Literal[True]:
         return await self.lock.acquire()
 
-    def release(self):
-        return self.lock.release()
+    def release(self) -> None:
+        self.lock.release()
 
 
-class JobsQueue(object):
+class JobAccess(enum.Enum):
+    READ = "READ"
+    ABORT = "ABORT"
 
-    def __init__(self, middleware):
+
+class JobsQueue:
+    def __init__(self, middleware: Middleware):
         self.middleware = middleware
         self.deque = JobsDeque()
-        self.queue = []
+        self.queue: list[Job] = []
 
         # Event responsible for the job queue schedule loop.
         # This event is set and a new job is potentially ready to run
         self.queue_event = asyncio.Event()
 
         # Shared lock (JobSharedLock) dict
-        self.job_locks = {}
+        self.job_locks: dict[str, JobSharedLock] = {}
 
-        self.middleware.event_register('core.get_jobs', 'Updates on job changes.')
-
-    def __getitem__(self, item):
+    def __getitem__(self, item: int) -> Job:
         return self.deque[item]
 
-    def get(self, item):
+    def get(self, item: int) -> Job | None:
         return self.deque.get(item)
 
-    def all(self):
+    def all(self) -> dict[int, Job]:
         return self.deque.all()
 
-    def add(self, job):
+    def for_credential(self, credential: SessionManagerCredentials, access: JobAccess) -> dict[int, Job]:
+        if not credential_is_limited_to_own_jobs(credential):
+            return self.all()
+
+        out = {}
+        for jid, job in self.all().items():
+            if not job.credential_can_access(credential, access):
+                continue
+
+            out[jid] = job
+
+        return out
+
+    def add(self, job: Job) -> Job:
         self.handle_lock(job)
         if job.options["lock_queue_size"] is not None:
-            queued_jobs = [another_job for another_job in self.queue if another_job.lock is job.lock]
-            if len(queued_jobs) >= job.options["lock_queue_size"]:
-                return queued_jobs[-1]
+            if job.options["lock_queue_size"] == 0:
+                for another_job in self.all().values():
+                    if another_job.state == State.RUNNING and another_job.lock is job.lock:
+                        raise CallError("This job is already being performed", errno.EBUSY)
+            else:
+                queued_jobs = [another_job for another_job in self.queue if another_job.lock is job.lock]
+                if len(queued_jobs) >= job.options["lock_queue_size"]:
+                    for queued_job in reversed(queued_jobs):
+                        job_creds = job.credentials
+                        queued_creds = queued_job.credentials
+                        if (
+                            not credential_is_limited_to_own_jobs(job_creds)
+                            or (
+                                job_creds is not None and job_creds.is_user_session
+                                and queued_creds is not None and queued_creds.is_user_session
+                                and (
+                                    job_creds.user['username']  # type: ignore[attr-defined]
+                                    == queued_creds.user['username']  # type: ignore[attr-defined]
+                                )
+                            )
+                        ):
+                            if job.message_ids:
+                                queued_job.message_ids += job.message_ids
+                                queued_job.send_changed_event()
+
+                            return queued_job
+
+                    raise CallError('This job is already being performed by another user', errno.EBUSY)
 
         self.deque.add(job)
         self.queue.append(job)
-
-        job.send_event('ADDED', job.__encode__())
+        send_job_event(self.middleware, 'ADDED', job)
 
         # A job has been added to the queue, let the queue scheduler run
         self.queue_event.set()
 
         return job
 
-    def remove(self, job_id):
+    def remove(self, job_id: int) -> None:
         self.deque.remove(job_id)
 
-    def handle_lock(self, job):
+    def handle_lock(self, job: Job) -> None:
         name = job.get_lock_name()
         if name is None:
             return
 
         lock = self.job_locks.get(name)
         if lock is None:
-            lock = JobSharedLock(self, name, loop=self.middleware.loop)
+            lock = JobSharedLock(self, name)
             self.job_locks[lock.name] = lock
 
         lock.add_job(job)
         job.lock = lock
 
-    def release_lock(self, job):
+    def release_lock(self, job: Job) -> None:
         lock = job.lock
-        if job.lock is None:
+        if lock is None:
             return
 
         # Remove job from lock list and release it so another job can use it
@@ -136,7 +251,7 @@ class JobsQueue(object):
         # waiting for the same lock
         self.queue_event.set()
 
-    async def next(self):
+    async def next(self) -> Job:
         """
         Returns when there is a new job ready to run.
         """
@@ -162,37 +277,43 @@ class JobsQueue(object):
                 # No jobs available to run, clear the event
                 self.queue_event.clear()
 
-    async def run(self):
+    async def run(self) -> typing.NoReturn:
         while True:
             job = await self.next()
-            asyncio.ensure_future(job.run(self))
+            self.middleware.create_task(job.run(self))
+
+    async def receive(self, job: dict[str, typing.Any], logs: bytes | None) -> None:
+        await self.deque.receive(self.middleware, job, logs)
 
 
-class JobsDeque(object):
+class JobsDeque:
     """
     A jobs deque to do not keep more than `maxlen` in memory
     with a `id` assigner.
     """
 
-    def __init__(self, maxlen=1000):
+    def __init__(self, maxlen: int = 1000):
         self.maxlen = maxlen
-        self.count = 0
-        self.__dict = OrderedDict()
+        self.count: int = 0
+        self.__dict: OrderedDict[int, Job] = OrderedDict()
         with contextlib.suppress(FileNotFoundError):
             shutil.rmtree(LOGS_DIR)
 
-    def __getitem__(self, item):
+    def __getitem__(self, item: int) -> Job:
         return self.__dict[item]
 
-    def get(self, item):
+    def get(self, item: int) -> Job | None:
         return self.__dict.get(item)
 
-    def all(self):
+    def all(self) -> OrderedDict[int, Job]:
         return self.__dict.copy()
 
-    def add(self, job):
+    def _get_next_id(self) -> int:
         self.count += 1
-        job.set_id(self.count)
+        return self.count
+
+    def add(self, job: Job) -> None:
+        job.id = self._get_next_id()
         if len(self.__dict) > self.maxlen:
             for old_job_id, old_job in self.__dict.items():
                 if old_job.state in (State.SUCCESS, State.FAILED, State.ABORTED):
@@ -202,15 +323,24 @@ class JobsDeque(object):
                 logger.warning("There are %d jobs waiting or running", len(self.__dict))
         self.__dict[job.id] = job
 
-    def remove(self, job_id):
+    def remove(self, job_id: int) -> None:
         if job_id in self.__dict:
             self.__dict[job_id].cleanup()
             del self.__dict[job_id]
 
+    async def receive(self, middleware: Middleware, job_dict: dict[str, typing.Any], logs: bytes | None) -> None:
+        job_dict['id'] = self._get_next_id()
+        job = await Job.receive(middleware, job_dict, logs)
+        assert job.id is not None
+        self.__dict[job.id] = job
 
-class Job:
+
+OnFinishCallback: typing.TypeAlias = typing.Callable[['Job[typing.Any]'], typing.Awaitable[None]] | None
+
+
+class Job[T = typing.Any]:
     """
-    Represents a long running call, methods marked with @job decorator.
+    Represents a long-running call, methods marked with @job decorator.
 
     :ivar pipes: :class:`middlewared.pipe.Pipes` object containing job's opened pipes.
 
@@ -218,42 +348,65 @@ class Job:
     """
 
     pipes: Pipes
-    logs_fd: None
+    logs_fd: typing.BinaryIO | None
 
-    def __init__(self, middleware, method_name, serviceobj, method, args, options, pipes, on_progress_cb):
-        self._finished = asyncio.Event(loop=middleware.loop)
+    def __init__(
+        self,
+        middleware: Middleware,
+        method_name: str,
+        serviceobj: Service,
+        method: typing.Callable[..., typing.Any],  # FIXME: Once main.py gets converted, fix this
+        args: list[typing.Any],
+        options: dict[str, typing.Any],
+        pipes: Pipes | None = None,
+        on_progress_cb: typing.Callable[[dict[str, typing.Any]], None] | None = None,
+        silent: bool = False,
+        app: App | None = None,
+        message_id: str | None = None,
+        audit_callback: typing.Callable[[typing.Any], None] | None = None,
+    ):
+        self._finished = asyncio.Event()
         self.middleware = middleware
         self.method_name = method_name
         self.serviceobj = serviceobj
         self.method = method
         self.args = args
         self.options = options
-        self.pipes = pipes or Pipes(input=None, output=None)
+        self.pipes = pipes or Pipes(inputs=None, output=None)
         self.on_progress_cb = on_progress_cb
+        self.app = app
+        self.message_ids = [message_id] if message_id else []
+        self.audit_callback = audit_callback
+        self.silent = silent
 
-        self.id = None
-        self.lock = None
-        self.result = None
-        self.error = None
-        self.exception = None
-        self.exc_info = None
-        self.aborted = False
-        self.state = State.WAITING
-        self.description = None
-        self.progress = {
+        self.id: int | None = None
+        self.lock: JobSharedLock | None = None
+        self.result: T | None = None
+        self.error: str | None = None
+        self.exception: str | None = None
+        self.exc_info: ExcInfo | None = None
+        self.aborted: bool = False
+        # Synchronous job must watch this event and shut down and raise `JobCancelledException` when this event is set
+        self.aborted_event = threading.Event()
+        self.state: State = State.WAITING
+        self.description: str | None = None
+        self.progress: _Progress = {
             'percent': 0,
             'description': '',
             'extra': None,
         }
-        self.internal_data = {}
-        self.time_started = datetime.utcnow()
-        self.time_finished = None
+        self.internal_data: dict[str, typing.Any] = {}
+        self.time_started = utc_now()
+        self.time_finished: datetime | None = None
         self.loop = self.middleware.loop
-        self.future = None
+        self.future: Task[None] | None = None
+        self.wrapped: list[Job[typing.Any]] = []
+        self.on_finish_cb: OnFinishCallback = None
+        self.on_finish_cb_called: bool = False
 
-        self.logs_path = None
+        self.logs_path: str | None = None
         self.logs_fd = None
-        self.logs_excerpt = None
+        self.logs_excerpt: str | None = None
 
         if self.options["check_pipes"]:
             for pipe in self.options["pipes"]:
@@ -265,7 +418,38 @@ class Job:
             except Exception:
                 logger.error("Error setting job description", exc_info=True)
 
-    def check_pipe(self, pipe):
+    @property
+    def credentials(self) -> SessionManagerCredentials | None:
+        if self.app is None:
+            return None
+
+        return self.app.authenticated_credentials
+
+    def credential_can_access(self, credential: SessionManagerCredentials, access: JobAccess) -> bool:
+        return self.credential_access_error(credential, access) is None
+
+    def credential_access_error(self, credential: SessionManagerCredentials, access: JobAccess) -> str | None:
+        if not credential_is_limited_to_own_jobs(credential):
+            return None
+
+        if access == JobAccess.READ:
+            if credential.is_user_session and any(
+                credential.has_role(role) for role in self.options['read_roles']
+            ):
+                return None
+
+        if not credential.is_user_session or credential_has_full_admin(credential):
+            return None
+
+        if self.credentials is None or not self.credentials.is_user_session:
+            return 'Only users with full administrative privileges can access internally ran jobs'
+
+        if self.credentials.user['username'] == credential.user['username']:  # type: ignore[attr-defined]
+            return None
+
+        return 'Job is not owned by current session'
+
+    def check_pipe(self, pipe: str) -> None:
         """
         Check if pipe named `pipe` was opened by caller. Will raise a `ValueError` if it was not.
 
@@ -274,24 +458,26 @@ class Job:
         if getattr(self.pipes, pipe) is None:
             raise ValueError("Pipe %r is not open" % pipe)
 
-    def get_lock_name(self):
+    def get_lock_name(self) -> str | None:
         lock_name = self.options.get('lock')
         if callable(lock_name):
-            lock_name = lock_name(self.args)
+            try:
+                lock_name = lock_name(self.args)
+            except Exception:
+                self.middleware.logger.error("Error handling job lock", exc_info=True)
+                raise CallError("Error handling job lock. This is most likely caused by invalid call arguments.",
+                                errno.EINVAL)
         return lock_name
 
-    def set_id(self, id):
-        self.id = id
-
-    def set_result(self, result):
+    def set_result(self, result: T) -> None:
         self.result = result
 
-    def set_exception(self, exc_info):
+    def set_exception(self, exc_info: ExcInfo) -> None:
         self.error = str(exc_info[1])
         self.exception = ''.join(traceback.format_exception(*exc_info))
         self.exc_info = exc_info
 
-    def set_state(self, state):
+    def set_state(self, state: typing.Literal['WAITING', 'RUNNING', 'SUCCESS', 'FAILED', 'ABORTED']) -> None:
         if self.state == State.WAITING:
             assert state not in ('WAITING', 'SUCCESS')
         if self.state == State.RUNNING:
@@ -299,9 +485,12 @@ class Job:
         assert self.state not in (State.SUCCESS, State.FAILED, State.ABORTED)
         self.state = State.__members__[state]
         if self.state in (State.SUCCESS, State.FAILED, State.ABORTED):
-            self.time_finished = datetime.utcnow()
+            self.time_finished = utc_now()
 
-    def set_description(self, description):
+    def send_changed_event(self) -> None:
+        send_job_event(self.middleware, 'CHANGED', self)
+
+    def set_description(self, description: str | None) -> None:
         """
         Sets a human-readable job description for the task manager UI. Use this if you need to build a job description
         with more advanced logic that a simple lambda function given to `@job` decorator can provide.
@@ -310,9 +499,14 @@ class Job:
         """
         if self.description != description:
             self.description = description
-            self.send_event('CHANGED', self.__encode__())
+            self.send_changed_event()
 
-    def set_progress(self, percent=None, description=None, extra=None):
+    def set_progress(
+        self,
+        percent: int | float | None = None,
+        description: str | None = None,
+        extra: typing.Any = None,
+    ) -> None:
         """
         Sets job completion progress. All arguments are optional and only passed arguments will be changed in the
         whole job progress state.
@@ -321,13 +515,15 @@ class Job:
         throttle progress reporting if you are receiving it from an external source (e.g. network response reading
         progress).
 
-        :param percent: Job progress [0-100]
+        :param percent: Job progress [0-100]. It will be rounded down to an integer as precision is not required here,
+            and also to avoid sending extra events when progress is changed from, e.g. 73.11 to 73.64
         :param description: Human-readable description of what the job is currently doing.
         :param extra: Extra data (any type) that can be used by specific job progress bar in the UI.
         """
         changed = False
         if percent is not None:
             assert isinstance(percent, (int, float))
+            percent = int(percent)
             if self.progress['percent'] != percent:
                 self.progress['percent'] = percent
                 changed = True
@@ -347,64 +543,92 @@ class Job:
             except Exception:
                 logger.warning('Failed to run on progress callback', exc_info=True)
 
-        if changed:
-            self.send_event('CHANGED', encoded)
+        # `run` sends the single event that reports the final state of a finished job.
+        if changed and self.state not in (State.SUCCESS, State.FAILED, State.ABORTED):
+            send_job_event(self.middleware, 'CHANGED', self, encoded)
 
-    async def wait(self, timeout=None, raise_error=False):
+        for wrapped in self.wrapped:
+            wrapped.set_progress(
+                percent=self.progress['percent'],
+                description=self.progress['description'],
+                extra=self.progress['extra'],
+            )
+
+    async def wait(
+        self,
+        timeout: float | None = None,
+        raise_error: bool = False,
+        raise_error_forward_classes: tuple[type[BaseException], ...] = (CallError, ValidationErrors,),
+    ) -> T:
         if timeout is None:
             await self._finished.wait()
         else:
-            await asyncio.wait_for(asyncio.shield(self._finished.wait()), timeout)
+            await asyncio.wait_for(self.middleware.create_task(self._finished.wait()), timeout)
         if raise_error:
             if self.error:
-                if isinstance(self.exc_info[1], CallError):
+                assert self.exc_info is not None
+                if isinstance(self.exc_info[1], raise_error_forward_classes):
                     raise self.exc_info[1]
 
                 raise CallError(self.error)
-        return self.result
+        # result is T | None but guaranteed to be T after successful completion (set_result was called)
+        return self.result  # type: ignore[return-value]
 
-    def wait_sync(self, raise_error=False):
+    def wait_sync(
+        self,
+        timeout: float | None = None,
+        raise_error: bool = False,
+        raise_error_forward_classes: tuple[type[BaseException], ...] = (CallError,),
+    ) -> T:
         """
         Synchronous method to wait for a job in another thread.
         """
         fut = asyncio.run_coroutine_threadsafe(self._finished.wait(), self.loop)
         event = threading.Event()
 
-        def done(_):
+        def done(_: typing.Any) -> None:
             event.set()
 
         fut.add_done_callback(done)
-        event.wait()
+        if not event.wait(timeout):
+            fut.cancel()
+            raise TimeoutError()
         if raise_error:
             if self.error:
-                if isinstance(self.exc_info[1], CallError):
+                assert self.exc_info is not None
+                if isinstance(self.exc_info[1], raise_error_forward_classes):
                     raise self.exc_info[1]
 
                 raise CallError(self.error)
-        return self.result
+        # result is T | None but guaranteed to be T after successful completion (set_result was called)
+        return self.result  # type: ignore[return-value]
 
-    def abort(self):
+    def abort(self) -> None:
+        self.aborted_event.set()
         if self.loop is not None and self.future is not None:
-            self.loop.call_soon_threadsafe(self.future.cancel)
+            # Only cancel the future for coroutine methods
+            # For non-coroutine methods, it's the method's responsibility to watch `aborted_event` and shut down
+            if asyncio.iscoroutinefunction(self.method):
+                self.loop.call_soon_threadsafe(self.future.cancel)
         elif self.state == State.WAITING:
             self.aborted = True
 
-    async def run(self, queue):
+    async def run(self, queue: JobsQueue) -> None:
         """
         Run a Job and set state/result accordingly.
         This method is supposed to run in a greenlet.
         """
 
         if self.options["logs"]:
-            self.logs_path = os.path.join(LOGS_DIR, f"{self.id}.log")
-            self.start_logging()
+            self.logs_path = self._logs_path()
+            await self.middleware.run_in_thread(self.start_logging)
 
         try:
             if self.aborted:
                 raise asyncio.CancelledError()
             else:
                 self.set_state('RUNNING')
-                self.send_event('CHANGED', self.__encode__())
+                self.send_changed_event()
 
             self.future = asyncio.ensure_future(self.__run_body())
             try:
@@ -415,50 +639,74 @@ class Job:
                     raise handled
                 else:
                     raise
-        except asyncio.CancelledError:
+        except (asyncio.CancelledError, JobCancelledException):
             self.set_state('ABORTED')
-        except Exception:
+        except Exception as e:
             self.set_state('FAILED')
-            self.set_exception(sys.exc_info())
-            logger.error("Job %r failed", self.method, exc_info=True)
+            ei = sys.exc_info()
+            assert ei[0] is not None
+            self.set_exception(ei)
+            if not self.silent:
+                if isinstance(e, CallError):
+                    logger.error("Job %r failed: %r", self.method, e)
+                else:
+                    logger.error("Job %r failed", self.method, exc_info=True)
         finally:
             await self.__close_logs()
             await self.__close_pipes()
 
             queue.release_lock(self)
             self._finished.set()
-            self.send_event('CHANGED', self.__encode__())
+            await self.call_on_finish_cb()
+            send_job_event(self.middleware, 'CHANGED', self)
             if self.options['transient']:
+                assert self.id is not None
                 queue.remove(self.id)
 
-    async def __run_body(self):
+    async def __run_body(self) -> None:
         """
-        If job is flagged as process a new process is spawned
-        with the job id which will in turn run the method
-        and return the result as a json
+        Run this job's method and set the result, injecting
+        any necessary arguments like app and tls.
         """
-        if self.options.get('process'):
-            rv = await self.middleware._call_worker(self.method_name, *self.args, job={'id': self.id})
+        prepend: list[typing.Any] = []
+        if hasattr(self.method, '_pass_app'):
+            prepend.append(self.app)
+        prepend.append(self)
+        if getattr(self.method, 'audit_callback', None):
+            prepend.append(self.audit_callback)
+        if hasattr(self.method, '_pass_thread_local_storage'):
+            prepend.append(thread_local_storage)
+        # Make sure args are not altered during job run
+        args = prepend + copy.deepcopy(self.args)
+
+        if asyncio.iscoroutinefunction(self.method):
+            rv = await self.method(*args)
         else:
-            # Make sure args are not altered during job run
-            args = copy.deepcopy(self.args)
-            if asyncio.iscoroutinefunction(self.method):
-                rv = await self.method(*([self] + args))
-            else:
-                rv = await self.middleware.run_in_thread(self.method, *([self] + args))
+            rv = await self.middleware.run_in_thread(self.method, *args)
+
         self.set_result(rv)
         self.set_state('SUCCESS')
         if self.progress['percent'] != 100:
             self.set_progress(100, '')
 
-    async def __close_logs(self):
-        if self.logs_fd:
-            self.logs_fd.close()
+    def _logs_path(self) -> str:
+        return os.path.join(LOGS_DIR, f"{self.id}.log")
 
-            def get_logs_excerpt():
-                head = []
-                tail = []
-                lines = 0
+    async def __close_logs(self) -> None:
+        if not self.logs_fd:
+            return
+
+        self.logs_fd.close()
+
+        if self.logs_excerpt:
+            return
+
+        def get_logs_excerpt() -> str:
+            head: list[str] = []
+            tail: list[str] = []
+            lines = 0
+            assert self.logs_path is not None
+            try:
                 with open(self.logs_path, "r", encoding="utf-8", errors="ignore") as f:
                     for line in f:
                         if len(head) < 10:
@@ -468,110 +716,226 @@ class Job:
                             tail = tail[-10:]
 
                         lines += 1
+            except FileNotFoundError:
+                return "Log file was removed"
 
-                if lines > 20:
-                    excerpt = "%s... %d more lines ...\n%s" % ("".join(head), lines - 20, "".join(tail))
-                else:
-                    excerpt = "".join(head + tail)
+            if lines > 20:
+                excerpt = "%s... %d more lines ...\n%s" % ("".join(head), lines - 20, "".join(tail))
+            else:
+                excerpt = "".join(head + tail)
 
-                return excerpt
+            return excerpt
 
-            self.logs_excerpt = await self.middleware.run_in_thread(get_logs_excerpt)
+        self.logs_excerpt = await self.middleware.run_in_thread(get_logs_excerpt)
 
-    async def __close_pipes(self):
-        def close_pipes():
-            if self.pipes.input:
-                self.pipes.input.r.close()
+    async def __close_pipes(self) -> None:
+        def close_pipes() -> None:
+            if self.pipes.inputs:
+                for pipe in self.pipes.inputs.pipes_to_close:
+                    pipe.r.close()
             if self.pipes.output:
                 self.pipes.output.w.close()
 
         await self.middleware.run_in_thread(close_pipes)
 
-    def __encode__(self, raw_result=True):
+    def __encode__(self, raw_result: bool = True, app: App | None = None) -> dict[str, typing.Any]:
+        """
+        Serialize this job for external consumption, as a `core.get_jobs` item.
+
+        :param raw_result: if false, `Secret` values in the result are redacted regardless of `app`.
+            `core.get_jobs` passes false when generating debug files.
+        :param app: app that receives the encoded job, or `None` for an internal call. A credential
+            that may not see secrets gets them redacted even when `raw_result` is true.
+        :return: the encoded job.
+        """
         exc_info = None
         if self.exc_info:
-            etype = self.exc_info[0]
+            etype_cls = self.exc_info[0]
             evalue = self.exc_info[1]
+            etype_name: str
             if isinstance(evalue, ValidationError):
                 extra = [(evalue.attribute, evalue.errmsg, evalue.errno)]
-                etype = 'VALIDATION'
+                errno: int | None = evalue.errno
+                errname: str | None = evalue.errname
+                etype_name = 'VALIDATION'
             elif isinstance(evalue, ValidationErrors):
                 extra = list(evalue)
-                etype = 'VALIDATION'
+                errno = None
+                errname = None
+                etype_name = 'VALIDATION'
             elif isinstance(evalue, CallError):
-                etype = etype.__name__
+                etype_name = etype_cls.__name__
+                errno = evalue.errno
+                errname = evalue.errname
                 extra = evalue.extra
             else:
-                etype = etype.__name__
+                etype_name = etype_cls.__name__
+                errno = None
+                errname = None
                 extra = None
             exc_info = {
                 'repr': repr(evalue),
-                'type': etype,
+                'type': etype_name,
+                'errno': errno,
+                'errname': errname,
                 'extra': extra,
             }
+
+        result_encoding_error = None
+
+        # The result goes through the method's return model, exactly like a non-job result does.
+        # `self.result` is a raw python value for middleware itself (see `Job.wait`). It can hold
+        # objects that JSON encoding rejects, such as a `Secret`.
+        #
+        # Changes to how we generate results must be validated against both the raw and the
+        # redacted case. Redaction is critically important because we include core.get_jobs
+        # output in our debug files.
+        if self.state == State.SUCCESS:
+            try:
+                result = self.middleware.dump_result(
+                    self.serviceobj,
+                    self.method,
+                    app,
+                    self.result,
+                    expose_secrets=raw_result,
+                )
+            except Exception as e:
+                result = None
+                result_encoding_error = repr(e)
+        else:
+            result = None
+
         return {
             'id': self.id,
+            'message_ids': self.message_ids,
             'method': self.method_name,
             'arguments': self.middleware.dump_args(self.args, method=self.method),
+            'transient': self.options['transient'],
             'description': self.description,
             'abortable': self.options['abortable'],
             'logs_path': self.logs_path,
             'logs_excerpt': self.logs_excerpt,
             'progress': self.progress,
-            'result': self.result if raw_result else self.middleware.dump_result(self.result, method=self.method),
+            'result': result,
+            'result_encoding_error': result_encoding_error,
             'error': self.error,
             'exception': self.exception,
             'exc_info': exc_info,
             'state': self.state.name,
             'time_started': self.time_started,
             'time_finished': self.time_finished,
+            'credentials': (
+                {
+                    'type': self.credentials.class_name(),
+                    'data': self.credentials.dump(),
+                } if self.credentials is not None
+                else None
+            )
         }
 
-    async def wrap(self, subjob):
+    @staticmethod
+    async def receive(middleware: Middleware, job_dict: dict[str, typing.Any], logs: bytes | None) -> Job[typing.Any]:
+        service_name, method_name = job_dict['method'].rsplit(".", 1)
+        serviceobj = middleware._services[service_name]
+        methodobj = getattr(serviceobj, method_name)
+        job = Job(middleware, job_dict['method'], serviceobj, methodobj, job_dict['arguments'], methodobj._job, None,
+                  None, False, None, None, None)
+        job.id = job_dict['id']
+        job.description = job_dict['description']
+        if logs is not None:
+            job.logs_path = job._logs_path()
+        job.logs_excerpt = job_dict['logs_excerpt']
+        job.progress = job_dict['progress']
+        job.result = job_dict['result']
+        job.error = job_dict['error']
+        job.exception = job_dict['exception']
+        job.state = State.__members__[job_dict['state']]
+        job.time_started = job_dict['time_started']
+        job.time_finished = job_dict['time_finished']
+
+        if logs is not None:
+            def write_logs() -> None:
+                os.makedirs(LOGS_DIR, exist_ok=True)
+                os.chmod(LOGS_DIR, 0o700)
+                assert job.logs_path is not None
+                with open(job.logs_path, "wb") as f:
+                    f.write(logs)
+
+            await middleware.run_in_thread(write_logs)
+
+        return job
+
+    async def wrap[U](
+        self,
+        subjob: Job[U],
+        raise_error_forward_classes: tuple[type[BaseException], ...] = (CallError, ValidationErrors,),
+    ) -> U:
         """
         Wrap a job in another job, proxying progress and result/error.
         This is useful when we want to run a job inside a job.
 
         :param subjob: The job to wrap.
+        :param raise_error_forward_classes: tuple containing classes to re-raise from
+            the job result. If the exception type does not match, then a CallError will be raised
         """
-        while not subjob.time_finished:
-            try:
-                await subjob.wait(1)
-            except asyncio.TimeoutError:
-                pass
-            self.set_progress(**subjob.progress)
-        if subjob.exception:
-            raise CallError(subjob.exception)
-        return subjob.result
+        self.set_progress(
+            percent=subjob.progress['percent'],
+            description=subjob.progress['description'],
+            extra=subjob.progress['extra'],
+        )
+        subjob.wrapped.append(self)
 
-    def cleanup(self):
+        return await subjob.wait(raise_error=True, raise_error_forward_classes=raise_error_forward_classes)
+
+    def wrap_sync[U](
+        self,
+        subjob: Job[U],
+        raise_error_forward_classes: tuple[type[BaseException], ...] = (CallError, ValidationErrors,),
+    ) -> U:
+        """
+        Wrap a job in another job, proxying progress and result/error.
+        This is useful when we want to run a job inside a job.
+
+        :param subjob: The job to wrap.
+        :param raise_error_forward_classes: tuple containing classes to re-raise from
+        the job result. If the exception type does not match, then a CallError will be raised
+        """
+        self.set_progress(
+            percent=subjob.progress['percent'],
+            description=subjob.progress['description'],
+            extra=subjob.progress['extra'],
+        )
+        subjob.wrapped.append(self)
+
+        return subjob.wait_sync(raise_error=True, raise_error_forward_classes=raise_error_forward_classes)
+
+    def cleanup(self) -> None:
         if self.logs_path:
-            try:
+            with contextlib.suppress(Exception):
                 os.unlink(self.logs_path)
-            except Exception:
-                pass
 
-    def stop_logging(self):
-        fd = self.logs_fd
-        if fd is not None:
-            # This is only for a short amount of time when moving system dataset
-            # We could use io.BytesIO() for a temporary buffer but if a bad job produces lots of logs
-            # and system dataset move crashes, we don't want these logs to clog up the RAM.
-            self.logs_fd = open('/dev/null', 'wb')
-            fd.close()
-
-    def start_logging(self):
+    def start_logging(self) -> None:
         if self.logs_path is not None:
-            fd = self.logs_fd
-            os.makedirs(LOGS_DIR, exist_ok=True)
-            os.chmod(LOGS_DIR, 0o700)
+            os.makedirs(LOGS_DIR, mode=0o700, exist_ok=True)
             self.logs_fd = open(self.logs_path, 'ab', buffering=0)
-            if fd is not None:
-                fd.close()
 
-    def send_event(self, name, fields):
-        if not self.options['transient']:
-            self.middleware.send_event('core.get_jobs', name, id=self.id, fields=fields)
+    async def logs_fd_write(self, data: bytes) -> None:
+        assert self.logs_fd is not None
+        await self.middleware.run_in_thread(self.logs_fd.write, data)
+
+    async def set_on_finish_cb(self, cb: OnFinishCallback) -> None:
+        self.on_finish_cb = cb
+        if self.on_finish_cb_called:
+            await self.call_on_finish_cb()
+
+    async def call_on_finish_cb(self) -> None:
+        if self.on_finish_cb:
+            try:
+                await self.on_finish_cb(self)
+            except Exception:
+                logger.warning('Failed to run on finish callback', exc_info=True)
+
+        self.on_finish_cb_called = True
 
 
 class JobProgressBuffer:
@@ -581,17 +945,22 @@ class JobProgressBuffer:
     connections.
     """
 
-    def __init__(self, job, interval=1):
+    def __init__(self, job: Job[typing.Any], interval: float = 1):
         self.job = job
 
         self.interval = interval
 
-        self.last_update_at = 0
+        self.last_update_at: float = 0
 
-        self.pending_update_body = None
-        self.pending_update = None
+        self.pending_update_body: tuple[int | float | None, str | None, typing.Any] | None = None
+        self.pending_update: ThreadsafeTimer[()] | None = None
 
-    def set_progress(self, *args, **kwargs):
+    def set_progress(
+        self,
+        percent: int | float | None = None,
+        description: str | None = None,
+        extra: typing.Any = None,
+    ) -> None:
         t = time.monotonic()
 
         if t - self.last_update_at >= self.interval:
@@ -602,29 +971,30 @@ class JobProgressBuffer:
                 self.pending_update = None
 
             self.last_update_at = t
-            self.job.set_progress(*args, **kwargs)
+            self.job.set_progress(percent, description, extra)
         else:
-            self.pending_update_body = args, kwargs
+            self.pending_update_body = percent, description, extra
 
             if self.pending_update is None:
-                self.pending_update = asyncio.get_event_loop().call_later(self.interval, self._do_pending_update)
+                self.pending_update = ThreadsafeTimer(self.job.loop, self.interval, self._do_pending_update)
 
-    def cancel(self):
+    def cancel(self) -> None:
         if self.pending_update is not None:
             self.pending_update.cancel()
 
             self.pending_update_body = None
             self.pending_update = None
 
-    def flush(self):
+    def flush(self) -> None:
         if self.pending_update is not None:
             self.pending_update.cancel()
 
             self._do_pending_update()
 
-    def _do_pending_update(self):
+    def _do_pending_update(self) -> None:
         self.last_update_at = time.monotonic()
-        self.job.set_progress(*self.pending_update_body[0], **self.pending_update_body[1])
+        assert self.pending_update_body is not None
+        self.job.set_progress(*self.pending_update_body)
 
         self.pending_update_body = None
         self.pending_update = None

@@ -1,59 +1,92 @@
-import errno
+# Copyright (c) - iXsystems Inc. dba TrueNAS
+#
+# Licensed under the terms of the TrueNAS Enterprise License Agreement
+# See the file LICENSE.IX for complete terms and conditions
 
-from middlewared.alert.base import AlertClass, AlertCategory, AlertLevel, Alert, AlertSource, UnavailableException
+from dataclasses import dataclass
+from typing import Any
+
+from middlewared.alert.applicability import APPLIANCE_OR_HA_LICENSED, HA_LICENSED
+from middlewared.alert.base import (
+    Alert,
+    AlertCategory,
+    AlertClass,
+    AlertClassConfig,
+    AlertLevel,
+    AlertSource,
+    NonDataclassAlertClass,
+    UnavailableException,
+)
+from middlewared.plugins.failover_.constants import NETWORK_ERRORS
 from middlewared.service_exception import CallError
 
 
-class FailoverInterfaceNotFoundAlertClass(AlertClass):
-    category = AlertCategory.HA
-    level = AlertLevel.CRITICAL
-    title = 'Failover Internal Interface Not Found'
-    text = 'Failover internal interface not found. Contact support.'
-    products = ('SCALE_ENTERPRISE',)
+class FailoverInterfaceNotFoundAlert(AlertClass):
+    config = AlertClassConfig(
+        category=AlertCategory.HA,
+        level=AlertLevel.CRITICAL,
+        title='Failover Internal Interface Not Found',
+        text='Failover internal interface not found. Contact support.',
+        applies_to=APPLIANCE_OR_HA_LICENSED,
+        listed_only_when=HA_LICENSED,
+    )
 
 
-class TrueNASVersionsMismatchAlertClass(AlertClass):
-    category = AlertCategory.HA
-    level = AlertLevel.CRITICAL
-    title = 'TrueNAS Software Versions Must Match Between Storage Controllers'
-    text = 'TrueNAS software versions must match between storage controllers.'
-    products = ('SCALE_ENTERPRISE',)
+class TrueNASVersionsMismatchAlert(AlertClass):
+    config = AlertClassConfig(
+        category=AlertCategory.HA,
+        level=AlertLevel.CRITICAL,
+        title='TrueNAS Software Versions Must Match Between Storage Controllers',
+        text='TrueNAS software versions must match between storage controllers.',
+        applies_to=APPLIANCE_OR_HA_LICENSED,
+        listed_only_when=HA_LICENSED,
+    )
 
 
-class FailoverStatusCheckFailedAlertClass(AlertClass):
-    category = AlertCategory.HA
-    level = AlertLevel.CRITICAL
-    title = 'Failed to Check Failover Status with the Other Controller'
-    text = 'Failed to check failover status with the other controller: %s.'
-    products = ('SCALE_ENTERPRISE',)
+class FailoverStatusCheckFailedAlert(NonDataclassAlertClass[list[str]], AlertClass):
+    config = AlertClassConfig(
+        category=AlertCategory.HA,
+        level=AlertLevel.CRITICAL,
+        title='Failed to Check Failover Status with the Other Controller',
+        text='Failed to check failover status with the other controller: %s.',
+        applies_to=APPLIANCE_OR_HA_LICENSED,
+        listed_only_when=HA_LICENSED,
+    )
 
 
-class FailoverFailedAlertClass(AlertClass):
-    category = AlertCategory.HA
-    level = AlertLevel.CRITICAL
-    title = 'Failover Failed'
-    text = 'Failover failed. Check /root/syslog/failover.log on both controllers.'
-    products = ('SCALE_ENTERPRISE',)
+class FailoverFailedAlert(AlertClass):
+    config = AlertClassConfig(
+        category=AlertCategory.HA,
+        level=AlertLevel.CRITICAL,
+        title='Failover Failed',
+        text='Failover failed. Check /var/log/failover.log on both controllers.',
+        applies_to=APPLIANCE_OR_HA_LICENSED,
+        listed_only_when=HA_LICENSED,
+    )
 
 
-class VRRPStatesDoNotAgreeAlertClass(AlertClass):
-    category = AlertCategory.HA
-    level = AlertLevel.CRITICAL
-    title = 'Controllers VRRP States Do Not Agree'
-    text = 'Controllers VRRP states do not agree: %(error)s.'
-    products = ('SCALE_ENTERPRISE',)
+@dataclass(kw_only=True)
+class VRRPStatesDoNotAgreeAlert(AlertClass):
+    config = AlertClassConfig(
+        category=AlertCategory.HA,
+        level=AlertLevel.CRITICAL,
+        title='Controllers VRRP States Do Not Agree',
+        text='Controllers VRRP states do not agree: %(error)s.',
+        applies_to=APPLIANCE_OR_HA_LICENSED,
+        listed_only_when=HA_LICENSED,
+    )
+
+    error: str
 
 
 class FailoverAlertSource(AlertSource):
-    products = ('SCALE_ENTERPRISE',)
-    failover_related = True
+    applies_to = HA_LICENSED
+    post_failover_blackout = True
     run_on_backup_node = False
 
-    async def check(self):
-        if not await self.middleware.call('failover.licensed'):
-            return []
-        elif not await self.middleware.call('failover.internal_interfaces'):
-            return [Alert(FailoverInterfaceNotFoundAlertClass)]
+    async def check(self) -> list[Alert[Any]]:
+        if not await self.middleware.call('failover.internal_interfaces'):
+            return [Alert(FailoverInterfaceNotFoundAlert())]
 
         try:
             if not await self.middleware.call('failover.call_remote', 'system.ready'):
@@ -62,17 +95,19 @@ class FailoverAlertSource(AlertSource):
             local_version = await self.middleware.call('system.version')
             remote_version = await self.middleware.call('failover.call_remote', 'system.version')
             if local_version != remote_version:
-                return [Alert(TrueNASVersionsMismatchAlertClass)]
+                return [Alert(TrueNASVersionsMismatchAlert())]
 
             local = await self.middleware.call('failover.vip.get_states')
             remote = await self.middleware.call('failover.call_remote', 'failover.vip.get_states')
             if err := await self.middleware.call('failover.vip.check_states', local, remote):
-                return [Alert(VRRPStatesDoNotAgreeAlertClass, {'error': i}) for i in err]
+                return [Alert(VRRPStatesDoNotAgreeAlert(error=i)) for i in err]
         except CallError as e:
-            if e.errno != errno.ECONNREFUSED:
-                return [Alert(FailoverStatusCheckFailedAlertClass, [str(e)])]
+            # Any NETWORK_ERRORS errno means the peer is unreachable. This alert reports misbehaving peers.
+            # Do not report unreachable peers here, they will be reported by `FailoverRemoteSystemInaccessible`.
+            if e.errno not in NETWORK_ERRORS:
+                return [Alert(FailoverStatusCheckFailedAlert([str(e)]))]
 
         if await self.middleware.call('failover.status') in ('ERROR', 'UNKNOWN'):
-            return [Alert(FailoverFailedAlertClass)]
+            return [Alert(FailoverFailedAlert())]
 
         return []

@@ -1,0 +1,106 @@
+from typing import Literal
+
+from middlewared.api.base import BaseModel
+from middlewared.api.base.jsonschema import add_attrs, replace_refs
+from middlewared.utils.pydantic_ import model_json_schema
+
+from .common import AuditEvent, AuditEventVersion, convert_schema_to_set
+
+
+class AuditEventMiddlewareAuthenticationEventDataCredentials(BaseModel):
+    type: str
+    data: dict
+
+
+class AuditEventMiddlewareAuthenticationEventData(BaseModel):
+    credentials: AuditEventMiddlewareAuthenticationEventDataCredentials | None
+    error: str | None
+    vers: AuditEventVersion
+
+
+class AuditEventMiddlewareMethodCallEventData(BaseModel):
+    method: str
+    params: list
+    description: str | None
+    authenticated: bool
+    authorized: bool
+    vers: AuditEventVersion
+
+
+class AuditEventMiddlewareRebootShutdownEventData(BaseModel):
+    reason: str | None
+
+
+class AuditEventMiddlewareWebshellAuthenticationEventData(BaseModel):
+    shell_type: Literal['HOST', 'VM', 'CONTAINER', 'APP']
+    target: dict | None
+    username: str | None
+    error: str | None
+    vers: AuditEventVersion
+
+
+class AuditEventMiddlewareWebshellLogoutEventData(BaseModel):
+    shell_type: Literal['HOST', 'VM', 'CONTAINER', 'APP']
+    target: dict | None
+    username: str
+    vers: AuditEventVersion
+
+
+class AuditEventMiddlewareServiceData(BaseModel):
+    vers: AuditEventVersion
+    origin: str | None
+    protocol: Literal['REST', 'WEBSOCKET']
+    credentials: dict | None
+
+
+class AuditEventMiddleware(AuditEvent):
+    event: Literal['AUTHENTICATION', 'METHOD_CALL', 'REBOOT', 'SHUTDOWN', 'WEBSHELL_AUTHENTICATION', 'WEBSHELL_LOGOUT']
+    event_data: (
+        AuditEventMiddlewareAuthenticationEventData |
+        AuditEventMiddlewareMethodCallEventData |
+        AuditEventMiddlewareRebootShutdownEventData |
+        AuditEventMiddlewareWebshellAuthenticationEventData |
+        AuditEventMiddlewareWebshellLogoutEventData
+    )
+    service: Literal['MIDDLEWARE']
+    service_data: AuditEventMiddlewareServiceData
+
+
+class AuditEventMiddlewareAuthentication(AuditEventMiddleware):
+    event: Literal['AUTHENTICATION']
+    event_data: AuditEventMiddlewareAuthenticationEventData
+
+
+class AuditEventMiddlewareMethodCall(AuditEventMiddleware):
+    event: Literal['METHOD_CALL']
+    event_data: AuditEventMiddlewareMethodCallEventData
+
+
+class AuditEventMiddlewareRebootShutdownCall(AuditEventMiddleware):
+    event: Literal['REBOOT', 'SHUTDOWN']
+    event_data: AuditEventMiddlewareRebootShutdownEventData
+
+
+class AuditEventMiddlewareWebshellAuthentication(AuditEventMiddleware):
+    event: Literal['WEBSHELL_AUTHENTICATION']
+    event_data: AuditEventMiddlewareWebshellAuthenticationEventData
+
+
+class AuditEventMiddlewareWebshellLogout(AuditEventMiddleware):
+    event: Literal['WEBSHELL_LOGOUT']
+    event_data: AuditEventMiddlewareWebshellLogoutEventData
+
+
+AUDIT_EVENT_MIDDLEWARE_JSON_SCHEMAS = [
+    add_attrs(replace_refs(model_json_schema(event_model)))
+    for event_model in (
+        AuditEventMiddlewareAuthentication,
+        AuditEventMiddlewareMethodCall,
+        AuditEventMiddlewareRebootShutdownCall,
+        AuditEventMiddlewareWebshellAuthentication,
+        AuditEventMiddlewareWebshellLogout,
+    )
+]
+
+
+AUDIT_EVENT_MIDDLEWARE_PARAM_SET = convert_schema_to_set(AUDIT_EVENT_MIDDLEWARE_JSON_SCHEMAS)

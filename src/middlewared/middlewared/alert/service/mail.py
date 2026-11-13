@@ -1,28 +1,30 @@
-from middlewared.alert.base import AlertService
-from middlewared.schema import Dict, Str
+from __future__ import annotations
+
+from typing import Any
+
+from middlewared.alert.base import Alert, AlertService
+from middlewared.api.current import MailSendMessage, MailServiceModel
+from middlewared.plugins.mail.config import sender_configured
 
 
-class MailAlertService(AlertService):
+class MailAlertService(AlertService[MailServiceModel]):
     title = "Email"
-
-    schema = Dict(
-        "mail_attributes",
-        Str("email", default=""),
-        strict=True,
-    )
 
     html = True
 
-    async def send(self, alerts, gone_alerts, new_alerts):
-        email = self.attributes["email"]
-        if not email:
-            email = (await self.middleware.call("user.query", [("username", "=", "root")], {"get": True}))["email"]
-        if not email:
-            self.logger.trace("Email address for root not configured, not sending email")
+    async def send(self, alerts: list[Alert[Any]], gone_alerts: list[Alert[Any]], new_alerts: list[Alert[Any]]) -> None:
+        if self.attributes.email:
+            emails = [self.attributes.email]
+        else:
+            emails = await self.middleware.call("mail.local_administrators_emails")
+            if not emails:
+                return
+
+        if not sender_configured(await self.call2(self.s.mail.config)):
             return
 
-        await self.middleware.call("mail.send", {
-            "subject": "Alerts",
-            "html": await self._format_alerts(alerts, gone_alerts, new_alerts),
-            "to": [email],
-        })
+        await self.call2(self.s.mail.send, MailSendMessage(
+            subject="Alerts",
+            html=await self._format_alerts(alerts, gone_alerts, new_alerts),
+            to=emails,
+        ))

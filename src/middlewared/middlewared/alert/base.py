@@ -1,20 +1,31 @@
-from datetime import timedelta
+from __future__ import annotations
+
+from abc import ABC, abstractmethod
+import dataclasses
+from datetime import datetime, timedelta
 import enum
 import json
 import logging
-import os
+from typing import TYPE_CHECKING, Any, ClassVar, Self, TypeAlias
 
 import html2text
 
-from middlewared.alert.schedule import IntervalSchedule
-from middlewared.utils.lang import undefined
+from middlewared.alert.applicability.engine import Rule
+from middlewared.alert.schedule import BaseSchedule, CrontabSchedule, IntervalSchedule
+from middlewared.api.base import BaseModel
+from middlewared.api.current import MailSendMessage
+from middlewared.utils import ProductName
+from middlewared.utils.service.call_mixin import CallMixin
 
-__all__ = ["UnavailableException",
-           "AlertClass", "OneShotAlertClass", "SimpleOneShotAlertClass", "DismissableAlertClass",
-           "AlertCategory", "AlertLevel", "Alert",
-           "AlertSource", "FilePresenceAlertSource", "ThreadedAlertSource",
-           "AlertService", "ThreadedAlertService", "ProThreadedAlertService",
-           "format_alerts", "ellipsis"]
+if TYPE_CHECKING:
+    from middlewared.main import Middleware
+
+__all__ = [
+    "UnavailableException", "AlertClassConfig", "AlertClass", "NonDataclassAlertClass", "OneShotAlertClass",
+    "DismissableAlertClass", "AlertCategory", "AlertLevel", "Alert", "AlertSource", "ThreadedAlertSource",
+    "AlertService", "ThreadedAlertService", "ProThreadedAlertService", "format_alerts", "ellipsis",
+    "alert_category_names", "CrontabSchedule", "IntervalSchedule",
+]
 
 logger = logging.getLogger(__name__)
 
@@ -23,84 +34,208 @@ class UnavailableException(Exception):
     pass
 
 
-class AlertClassMeta(type):
-    def __init__(cls, name, bases, dct):
-        super().__init__(name, bases, dct)
+@dataclasses.dataclass(slots=True, frozen=True, kw_only=True)
+class AlertClassConfig:
+    """
+    Configuration for an AlertClass.
 
-        if cls.__name__ != "AlertClass":
-            if not cls.__name__.endswith("AlertClass"):
+    :param category: `AlertCategory` value.
+
+    :param level: Default `AlertLevel` value (alert level can be later changed by user).
+
+    :param title: Short description of the alert class (e.g. "An SSL certificate is expiring").
+
+    :param text: Format string for the alert class instance (e.g. "%(name)s SSL certificate is expiring").
+
+    :param exclude_from_list: Set this to `true` to exclude the alert from the UI configuration. For example, you might
+        want to hide some rare legacy hardware-specific alert. It will still be sent if it occurs, but users won't be
+        able to disable it or change its level.
+
+    :param applies_to: a population from `middlewared.alert.applicability.vocabulary` naming the systems this alert
+        class is meaningful on, or `None` for all of them. It governs running the source, displaying the alert,
+        sending it, and listing the class.
+
+    :param listed_only_when: a population narrowing `applies_to` further, applied *only* in `alert.list_categories`. An
+        alert class excluded by it is still displayed and still sent; it is only hidden from the settings catalogue.
+
+    :param proactive_support: Set this to `true` if, upon creation of the alert, a support ticket should be open for
+        the systems that have a corresponding support license.
+
+    :param proactive_support_notify_gone: Set this to `true` if, upon removal of the alert, a support ticket should be
+        open for the systems that have a corresponding support license.
+
+    :param deleted_automatically: (OneShotAlertClass) Set this to `false` if there is no one to call
+        `alert.oneshot_delete` when the alert situation is resolved. In that case, the alert will be deleted when the
+        user dismisses it.
+
+    :param expires_after: (OneShotAlertClass) Lifetime for the alert.
+
+    :param keys: (OneShotAlertClass) Controls how alerts are deleted:
+        `keys = ["id", "name"]` When deleting an alert, only these keys will be compared
+        `keys = []`             When deleting an alert, all alerts of this class will be deleted
+        `keys = None`           Use `key()` method for matching (default)
+
+    :param name: class name (without Alert suffix). Will be set by `AlertClassMeta` on each class creation.
+    """
+
+    category: AlertCategory
+    level: AlertLevel
+    title: str
+    text: str | None = None
+    exclude_from_list: bool = False
+    applies_to: Rule | None = None
+    listed_only_when: Rule | None = None
+    proactive_support: bool = False
+    proactive_support_notify_gone: bool = False
+    deleted_automatically: bool = True
+    expires_after: timedelta | None = None
+    keys: list[str] | None = None
+    name: str = "NOTSET"
+
+
+class AlertClass:
+    """
+    Alert class: a description of a specific type of issue that can exist in the system.
+
+    Subclasses must define a `config` class variable of type `AlertClassConfig`.
+
+    Subclasses may be:
+    - A `@dataclass` with named fields (for alerts with dict args)
+    - A `NonDataclassAlertClass[T]` subclass (for alerts with string or list args)
+    - A plain class with no fields (for alerts with no args)
+    """
+
+    classes: list[type[AlertClass]] = []
+    by_name: dict[str, type[AlertClass]] = {}
+
+    config: AlertClassConfig
+
+    def __init_subclass__(cls: type[AlertClass]) -> None:
+        super().__init_subclass__()
+
+        if cls.__name__ not in ["DismissableAlertClass", "OneShotAlertClass"]:
+            if not cls.__name__.endswith("Alert"):
                 raise NameError(f"Invalid alert class name {cls.__name__}")
 
-            cls.name = cls.__name__.replace("AlertClass", "")
+            name = cls.__name__.removesuffix("Alert")
+            cls.config = dataclasses.replace(cls.config, name=name)
 
             AlertClass.classes.append(cls)
-            AlertClass.class_by_name[cls.name] = cls
+            AlertClass.by_name[name] = cls
 
+    def args(self) -> Any:
+        if dataclasses.is_dataclass(self):
+            return dataclasses.asdict(self)
 
-class AlertClass(metaclass=AlertClassMeta):
-    classes = []
-    class_by_name = {}
-
-    category = NotImplemented
-    level = NotImplemented
-    title = NotImplemented
-    text = None
-
-    exclude_from_list = False
-    products = ("CORE", "ENTERPRISE", "SCALE", "SCALE_ENTERPRISE")
-    proactive_support = False
-
-    def __init__(self, middleware):
-        self.middleware = middleware
+        return None
 
     @classmethod
-    def format(cls, args):
-        if cls.text is None:
-            return cls.title
+    def from_args(cls, args: Any) -> Self:
+        if dataclasses.is_dataclass(cls):
+            return cls(**args)
+
+        return cls()
+
+    @classmethod
+    def key_from_args(cls, args: Any) -> Any:
+        """Return the deduplication key for an alert with the given args.
+
+        Override this to customize which fields are used for deduplication.
+        Default: the full args value.
+        """
+        return args
+
+    @classmethod
+    def format(cls, args: Any) -> str:
+        if cls.config.text is None:
+            return cls.config.title
 
         if args is None:
-            return cls.text
+            return cls.config.text
 
-        return cls.text % (tuple(args) if isinstance(args, list) else args)
-
-
-class OneShotAlertClass:
-    deleted_automatically = True
-    expires_after = None
-
-    async def create(self, args):
-        raise NotImplementedError
-
-    async def delete(self, alerts, query):
-        raise NotImplementedError
+        return cls.config.text % (tuple(args) if isinstance(args, list) else args)
 
 
-class SimpleOneShotAlertClass(OneShotAlertClass):
-    # keys = ["id", "name"] When deleting an alert, only this keys will be compared
-    # keys = []             When deleting an alert, all alerts of this class will be deleted
-    # keys = None           All present alert keys must be equal to the delete query (default)
-    keys = None
+class NonDataclassAlertClass[T]:
+    """Mixin for alert classes that use positional format strings (string or list args).
 
-    async def create(self, args):
-        return Alert(self.__class__, args)
+    Must be listed FIRST in bases (before AlertClass) for correct MRO::
 
-    async def delete(self, alerts, query):
-        return list(filter(
-            lambda alert: (
-                any(alert.args[k] != query[k] for k in self.keys) if self.keys is not None
-                else alert.args != query
-            ),
-            alerts
-        ))
+        class MyAlert(NonDataclassAlertClass[str], AlertClass): ...
+    """
+
+    def __init_subclass__(cls: type[NonDataclassAlertClass[Any]]) -> None:
+        super().__init_subclass__()
+
+        mro = cls.__mro__
+        if AlertClass in mro:
+            if mro.index(NonDataclassAlertClass) > mro.index(AlertClass):
+                raise TypeError(
+                    f"{cls.__name__}: NonDataclassAlertClass must be listed before AlertClass in bases for correct MRO"
+                )
+
+    def __init__(self, args: T):
+        self._args = args
+
+    def args(self) -> T:
+        return self._args
+
+    @classmethod
+    def from_args(cls, args: Any) -> Self:
+        return cls(args)
 
 
-class DismissableAlertClass:
-    async def dismiss(self, alerts, alert):
-        raise NotImplementedError
+class OneShotAlertClass(AlertClass):
+    """
+    One-shot alert mixin: add this to `AlertClass` superclass list for alerts that are created not by an
+    `AlertSource` but using `alert.oneshot_create` API method.
+
+    Configure `deleted_automatically`, `expires_after`, and `keys` via `AlertClassConfig`.
+
+    Override `AlertClass.key_from_args()` to set a custom deduplication key derived from `args`.
+    """
+
+    @classmethod
+    async def delete(cls, alerts: list[Alert[Self]], query: dict[str, Any] | None) -> list[Alert[Self]]:
+        """
+        Returns only those `alerts` that do not match `query` that was passed to `alert.oneshot_delete`.
+
+        :param alerts: all the alerts of this class.
+        :param query: free-form data that was passed to `alert.oneshot_delete`.
+        :return: `alerts` that do not match query (e.g. `query` specifies `{"certificate_id": "xxx"}` and the method
+            implementation returns all `alerts` except the ones related to the certificate `xxx`).
+        """
+        if cls.config.keys is not None:
+            if query is None:
+                return []
+
+            return [alert for alert in alerts if any(getattr(alert.instance, k) != query[k] for k in cls.config.keys)]
+
+        return [alert for alert in alerts if cls.key_from_args(alert.instance.args()) != query]
+
+    @classmethod
+    async def load(cls, middleware: Middleware, alerts: list[Alert[Self]]) -> list[Alert[Self]]:
+        """
+        This is called on system startup. Returns only those `alerts` that are still applicable to this system (i.e.,
+        corresponding resources still exist).
+
+        :param middleware: the middleware instance.
+        :param alerts: all the existing alerts of the class.
+        :return: `alerts` that should exist on this system.
+        """
+        return alerts
+
+
+class DismissableAlertClass(AlertClass, ABC):
+    @classmethod
+    @abstractmethod
+    async def dismiss(cls, middleware: Middleware, alerts: list[Alert[Self]], alert: Alert[Self]) -> list[Alert[Self]]:
+        ...
 
 
 class AlertCategory(enum.Enum):
     APPLICATIONS = "APPLICATIONS"
+    AUDIT = "Audit"
     CERTIFICATES = "CERTIFICATES"
     CLUSTERING = "CLUSTERING"
     DIRECTORY_SERVICE = "DIRECTORY_SERVICE"
@@ -110,15 +245,18 @@ class AlertCategory(enum.Enum):
     PLUGINS = "PLUGINS"
     NETWORK = "NETWORK"
     REPORTING = "REPORTING"
+    SECURITY = "SECURITY"
     SHARING = "SHARING"
     STORAGE = "STORAGE"
     SYSTEM = "SYSTEM"
     TASKS = "TASKS"
+    TRUENAS_CONNECT = "TRUENAS_CONNECT"
     UPS = "UPS"
 
 
 alert_category_names = {
     AlertCategory.APPLICATIONS: "Applications",
+    AlertCategory.AUDIT: "Audit",
     AlertCategory.CERTIFICATES: "Certificates",
     AlertCategory.CLUSTERING: "Clustering",
     AlertCategory.DIRECTORY_SERVICE: "Directory Service",
@@ -128,10 +266,12 @@ alert_category_names = {
     AlertCategory.PLUGINS: "Plugins",
     AlertCategory.NETWORK: "Network",
     AlertCategory.REPORTING: "Reporting",
+    AlertCategory.SECURITY: "Security",
     AlertCategory.SHARING: "Sharing",
     AlertCategory.STORAGE: "Storage",
     AlertCategory.SYSTEM: "System",
     AlertCategory.TASKS: "Tasks",
+    AlertCategory.TRUENAS_CONNECT: "TrueNAS Connect Service",
     AlertCategory.UPS: "UPS",
 }
 
@@ -146,125 +286,208 @@ class AlertLevel(enum.Enum):
     EMERGENCY = 7
 
 
-class Alert:
-    def __init__(self, klass, args=None, key=undefined, datetime=None, last_occurrence=None, node=None, dismissed=None,
-                 mail=None, _uuid=None, _source=None, _key=None, _text=None):
-        self.uuid = _uuid
-        self.source = _source
-        self.klass = klass
-        self.args = args
+DateTimeType: TypeAlias = datetime
 
-        self.node = node
-        if _key is None:
-            if key is undefined:
-                key = args
-            self.key = json.dumps(key, sort_keys=True)
-        else:
-            self.key = _key
-        self.datetime = datetime
-        self.last_occurrence = last_occurrence or datetime
-        self.dismissed = dismissed
+
+class Alert[T: AlertClass]:
+    """
+    Alert: a message about a single issues in the system (or a group of similar issues that can be potentially resolved
+    with a single action).
+
+    :ivar klass: Alert class: generic description of the alert (e.g. `CertificateIsExpiringAlert`)
+
+    :ivar args: specific description of the alert (e.g. `{"name": "my certificate", "days": 3}`).
+        The resulting alert text will be obtained by doing `klass.text % args`
+
+    :ivar key: the information that will be used to distinguish this alert from the others of the same class. If empty,
+        will default to `args`, which is the most common use case. Can be anything that can be JSON serialized.
+
+        However, for some alerts it makes sense to pass only a subset of args as the key. For example, for a
+        `CertificateIsExpiringAlert` you may only want to include the certificate name as the key and omit how
+        many days are left before the certificate expires. That way, at day change, the alerts "certificate xxx expires
+        in 3 days" and "certificate xxx expires in 2 days" will be considered the same alert (as only certificate name
+        will be compared) and the newer one will silently replace the old one (in opposite case, an E-Mail would be
+        sent claiming that one alert was cleared and another one was added).
+
+    :ivar datetime: timestamp when the alert was first seen.
+
+    :ivar last_occurrence: timestamp when the alert was last seen.
+
+    :ivar node: HA node when the alert was seen.
+
+    :ivar dismissed: whether the alert was dismissed by user.
+
+    :ivar mail: if this parameter is not null, it will be an argument to an extra call to `mail.send` that will be made
+        when the alert is first seen.
+    """
+
+    def __init__(
+        self,
+        instance: T,
+        datetime: datetime | None = None,
+        last_occurrence: datetime | None = None,
+        node: str | None = None,
+        dismissed: bool | None = None,
+        mail: MailSendMessage | None = None,
+        _uuid: str | None = None,
+        _source: str | None = None,
+        _key: str | None = None,
+        _text: str | None = None,
+    ):
+        self.instance = instance
+        self.datetime: DateTimeType = datetime  # type: ignore[assignment]
+        self.last_occurrence: DateTimeType = last_occurrence or datetime  # type: ignore[assignment]
+        self.node: str = node  # type: ignore[assignment]
+        self.dismissed: bool = dismissed  # type: ignore[assignment]
         self.mail = mail
 
-        self.text = _text or self.klass.text or self.klass.title
+        self.uuid: str = _uuid  # type: ignore[assignment]
+        self.source: str = _source  # type: ignore[assignment]
 
-    def __eq__(self, other):
+        self.key: str
+        if _key is None:
+            self.key = json.dumps(self.instance.key_from_args(self.instance.args()), sort_keys=True)
+        else:
+            self.key = _key
+
+        self.text: str = _text or self.instance.config.text or self.instance.config.title
+
+    def __eq__(self, other: object) -> bool:
+        if not isinstance(other, Alert):
+            return NotImplemented
+
         return self.__dict__ == other.__dict__
 
-    def __repr__(self):
+    def __repr__(self) -> str:
         return repr(self.__dict__)
 
     @property
-    def formatted(self):
+    def formatted(self) -> str:
         try:
-            return self.klass.format(self.args)
+            return self.instance.format(self.instance.args())
         except Exception:
-            logger.debug("Alert class %r was unable to format args %r, falling back to default formatter",
-                         self.klass, self.args, exc_info=True)
-
-            if self.args:
-                try:
-                    return self.text % (tuple(self.args) if isinstance(self.args, list) else self.args)
-                except Exception:
-                    logger.error("Error formatting alert: %r, %r", self.text, self.args, exc_info=True)
-
             return self.text
 
 
-class AlertSource:
-    schedule = IntervalSchedule(timedelta())
+class AlertSource(CallMixin, ABC):
+    """
+    Alert source: a class that periodically checks for a specific erroneous condition and returns one or multiple
+    `Alert` instances.
 
-    products = ("CORE", "ENTERPRISE", "SCALE", "SCALE_ENTERPRISE")
-    failover_related = False
+    :cvar schedule: `BaseSchedule` instance that will be used to determine whether this alert source should be ran at
+        any given moment. By default, alert checkers are ran every minute.
+
+    :cvar applies_to: a population from `middlewared.alert.applicability.vocabulary` naming the systems this source is
+        meaningful on, or `None` for all of them. The source is not ran where it does not apply.
+
+    :cvar post_failover_blackout: set this to `true` if this source's answer is unreliable for a while after a
+        failover. Such a source is not ran until the blackout window following the last failover event has passed,
+        which prevents false positives from a system still settling.
+
+    :cvar run_on_backup_node: set this to `false` to prevent running this alert on HA `BACKUP` node.
+    """
+
+    by_name: dict[str, type[AlertSource]] = {}
+
+    schedule: BaseSchedule = IntervalSchedule(timedelta())
+
+    applies_to: ClassVar[Rule | None] = None
+    post_failover_blackout = False
     run_on_backup_node = True
+    require_stable_peer = False
 
-    def __init__(self, middleware):
+    def __init_subclass__(cls) -> None:
+        super().__init_subclass__()
+
+        if cls.__name__ not in ["ThreadedAlertSource"]:
+            if not cls.__name__.endswith("AlertSource"):
+                raise NameError(f"Invalid alert source name {cls.__name__}")
+
+            name = cls.__name__.removesuffix("AlertSource")
+
+            if name in AlertSource.by_name:
+                raise RuntimeError(f"Alert source {name} is already registered")
+
+            AlertSource.by_name[name] = cls
+
+    def __init__(self, middleware: Middleware):
         self.middleware = middleware
 
     @property
-    def name(self):
-        return self.__class__.__name__.replace("AlertSource", "")
+    def name(self) -> str:
+        return self.__class__.__name__.removesuffix("AlertSource")
 
-    async def check(self):
-        raise NotImplementedError
+    @abstractmethod
+    async def check(self) -> list[Alert[Any]] | Alert[Any] | None:
+        """
+        This method will be called on the specific `schedule` to check for the alert conditions.
 
-
-class FilePresenceAlertSource(AlertSource):
-    path = NotImplemented
-    klass = NotImplemented
-
-    async def check(self):
-        if os.path.exists(self.path):
-            return Alert(self.klass)
+        :return: an `Alert` instance, or a list of `Alert` instances, or `None` for no alerts.
+        """
+        ...
 
 
 class ThreadedAlertSource(AlertSource):
-    async def check(self):
+    async def check(self) -> list[Alert[Any]] | Alert[Any] | None:
         return await self.middleware.run_in_thread(self.check_sync)
 
-    def check_sync(self):
-        raise NotImplementedError
+    @abstractmethod
+    def check_sync(self) -> list[Alert[Any]] | Alert[Any] | None:
+        ...
 
 
-class AlertService:
-    title = NotImplementedError
+class AlertService[T: BaseModel](CallMixin, ABC):
+    by_name: dict[str, type[AlertService[Any]]] = {}
 
-    schema = NotImplementedError
+    title: str
+    html: bool = False
 
-    html = False
+    def __init_subclass__(cls) -> None:
+        super().__init_subclass__()
 
-    def __init__(self, middleware, attributes):
+        if cls.__name__ not in ("ThreadedAlertService", "ProThreadedAlertService"):
+            if not cls.__name__.endswith("AlertService"):
+                raise NameError(f"Invalid alert service name {cls.__name__}")
+
+            name = cls.__name__.removesuffix("AlertService")
+
+            if name in AlertService.by_name:
+                raise RuntimeError(f"Alert service {name} is already registered")
+
+            AlertService.by_name[name] = cls
+
+    def __init__(self, middleware: Middleware, attributes: T):
         self.middleware = middleware
         self.attributes = attributes
 
         self.logger = logging.getLogger(self.__class__.__name__)
 
-        # If we remove some attributes, it should not be an error if they are still left in the database
-        schema = self.schema.copy()
-        schema.additional_attrs = True
-        # Set defaults for new attributes
-        self.attributes = schema.clean(self.attributes)
-
     @classmethod
-    def name(cls):
+    def name(cls) -> str:
         return cls.__name__.replace("AlertService", "")
 
-    @classmethod
-    def validate(cls, attributes):
-        cls.schema.validate(attributes)
+    @abstractmethod
+    async def send(
+        self,
+        alerts: list[Alert[Any]],
+        gone_alerts: list[Alert[Any]],
+        new_alerts: list[Alert[Any]],
+    ) -> None:
+        ...
 
-    async def send(self, alerts, gone_alerts, new_alerts):
-        raise NotImplementedError
-
-    async def _format_alerts(self, alerts, gone_alerts, new_alerts):
-        product_name = await self.middleware.call("system.product_name")
+    async def _format_alerts(
+        self,
+        alerts: list[Alert[Any]],
+        gone_alerts: list[Alert[Any]],
+        new_alerts: list[Alert[Any]],
+    ) -> str:
         hostname = await self.middleware.call("system.hostname")
-        if await self.middleware.call("system.is_enterprise"):
-            node_map = await self.middleware.call("alert.node_map")
+        if await self.middleware.call("system.is_ha_capable"):
+            node_map = await self.call2(self.s.alert.node_map)
         else:
             node_map = None
 
-        html = format_alerts(product_name, hostname, node_map, alerts, gone_alerts, new_alerts)
+        html = format_alerts(ProductName.PRODUCT_NAME, hostname, node_map, alerts, gone_alerts, new_alerts)
 
         if self.html:
             return html
@@ -272,25 +495,51 @@ class AlertService:
         return html2text.html2text(html).rstrip()
 
 
-class ThreadedAlertService(AlertService):
-    async def send(self, alerts, gone_alerts, new_alerts):
+class ThreadedAlertService[T: BaseModel](AlertService[T]):
+    async def send(
+        self,
+        alerts: list[Alert[Any]],
+        gone_alerts: list[Alert[Any]],
+        new_alerts: list[Alert[Any]],
+    ) -> None:
         return await self.middleware.run_in_thread(self.send_sync, alerts, gone_alerts, new_alerts)
 
-    def send_sync(self, alerts, gone_alerts, new_alerts):
-        raise NotImplementedError
+    @abstractmethod
+    def send_sync(
+        self,
+        alerts: list[Alert[Any]],
+        gone_alerts: list[Alert[Any]],
+        new_alerts: list[Alert[Any]],
+    ) -> None:
+        ...
 
-    def _format_alerts(self, alerts, gone_alerts, new_alerts):
-        product_name = self.middleware.call_sync("system.product_name")
+    def _format_alerts_sync(
+        self,
+        alerts: list[Alert[Any]],
+        gone_alerts: list[Alert[Any]],
+        new_alerts: list[Alert[Any]],
+    ) -> str:
         hostname = self.middleware.call_sync("system.hostname")
-        if self.middleware.call_sync("system.is_enterprise"):
-            node_map = self.middleware.call_sync("alert.node_map")
+        if self.middleware.call_sync("system.is_ha_capable"):
+            node_map = self.call_sync2(self.s.alert.node_map)
         else:
             node_map = None
-        return format_alerts(product_name, hostname, node_map, alerts, gone_alerts, new_alerts)
+
+        html = format_alerts(ProductName.PRODUCT_NAME, hostname, node_map, alerts, gone_alerts, new_alerts)
+
+        if self.html:
+            return html
+
+        return html2text.html2text(html).rstrip()
 
 
-class ProThreadedAlertService(ThreadedAlertService):
-    def send_sync(self, alerts, gone_alerts, new_alerts):
+class ProThreadedAlertService[T: BaseModel](ThreadedAlertService[T]):
+    def send_sync(
+        self,
+        alerts: list[Alert[Any]],
+        gone_alerts: list[Alert[Any]],
+        new_alerts: list[Alert[Any]],
+    ) -> None:
         exc = None
 
         for alert in gone_alerts:
@@ -310,17 +559,29 @@ class ProThreadedAlertService(ThreadedAlertService):
         if exc is not None:
             raise exc
 
-    def create_alert(self, alert):
-        raise NotImplementedError
+    @abstractmethod
+    def create_alert(self, alert: Alert[Any]) -> None:
+        ...
 
-    def delete_alert(self, alert):
-        raise NotImplementedError
+    @abstractmethod
+    def delete_alert(self, alert: Alert[Any]) -> None:
+        ...
 
 
-def format_alerts(product_name, hostname, node_map, alerts, gone_alerts, new_alerts):
+def format_alerts(
+    product_name: str,
+    hostname: str,
+    node_map: dict[str, str] | None,
+    alerts: list[Alert[Any]],
+    gone_alerts: list[Alert[Any]],
+    new_alerts: list[Alert[Any]],
+) -> str:
     text = f"{product_name} @ {hostname}<br><br>"
 
-    if len(alerts) == 1 and len(gone_alerts) == 0 and len(new_alerts) == 1 and new_alerts[0].klass.name == "Test":
+    if (
+        len(alerts) == 1 and len(gone_alerts) == 0 and len(new_alerts) == 1 and
+        new_alerts[0].instance.config.name == "Test"
+    ):
         return text + "This is a test alert"
 
     if new_alerts:
@@ -352,12 +613,12 @@ def format_alerts(product_name, hostname, node_map, alerts, gone_alerts, new_ale
     return text
 
 
-def format_alert(alert, node_map):
+def format_alert(alert: Alert[Any], node_map: dict[str, str] | None) -> str:
     return (f"{node_map[alert.node]} - " if node_map else "") + alert.formatted
 
 
-def ellipsis(s, l):
-    if len(s) <= l:
+def ellipsis(s: str, length: int) -> str:
+    if len(s) <= length:
         return s
 
-    return s[:(l - 1)] + "…"
+    return s[:(length - 1)] + "…"

@@ -1,0 +1,318 @@
+import typing
+
+import pytest
+from truenas_pylicensed.features import FEATURE_TIERS, LicenseFeature, SupportTier
+
+from middlewared.api.v28_0_0.truenas import EntitlementEntry
+from middlewared.pytest.unit.entitlements import facts_for_column, make_facts, make_license
+from middlewared.utils.entitlements import (
+    COLUMNS,
+    FEATURE_DISPLAY_NAMES,
+    POLICY,
+    TARGET_VECTORS,
+    DerivedEntitlement,
+    HardwareClass,
+    LegacyRule,
+    Reason,
+    TierRule,
+    Vector,
+    check_entitlement,
+)
+from middlewared.utils.entitlements.engine import _MESSAGES
+from middlewared.utils.license import LicenseInfo
+
+
+# The product feature matrix, written out. Every row is a decision about who gets what,
+# so a cell that changes has to change here too rather than riding along with a refactor.
+# It is also what makes the single representative-per-shape table below safe: the features
+# that share a shape are pinned here instead of being swept there.
+def test_target_vectors_match_the_product_matrix():
+    assert TARGET_VECTORS == {
+        LicenseFeature.APPS: Vector(ce=1, hw=1, hw_k=1, ce_k=1),
+        LicenseFeature.AUTOTUNE: Vector(ce=0, hw=0, hw_k=1, ce_k=0),
+        LicenseFeature.CATALOG_ENTERPRISE_TRAIN: Vector(ce=0, hw=0, hw_k=1, ce_k=0),
+        LicenseFeature.CONTAINERS: Vector(ce=1, hw=1, hw_k=1, ce_k=1),
+        LicenseFeature.DEDUP: Vector(ce=1, hw=0, hw_k=1, ce_k=1),
+        LicenseFeature.DIRECTORY_SERVICES_AUTH: Vector(ce=0, hw=0, hw_k=1, ce_k=1),
+        LicenseFeature.FIBRECHANNEL: Vector(ce=0, hw=0, hw_k=1, ce_k=1),
+        LicenseFeature.HA: Vector(ce=0, hw=0, hw_k=1, ce_k=0),
+        LicenseFeature.KMIP: Vector(ce=0, hw=0, hw_k=1, ce_k=1),
+        LicenseFeature.MISSION_CRITICAL: Vector(ce=0, hw=0, hw_k=1, ce_k=1),
+        LicenseFeature.NETWORK_FEC: Vector(ce=0, hw=0, hw_k=1, ce_k=1),
+        LicenseFeature.NFS_SNAPSHOT: Vector(ce=0, hw=0, hw_k=1, ce_k=1),
+        LicenseFeature.NVMEOF_SPDK: Vector(ce=0, hw=0, hw_k=1, ce_k=1),
+        LicenseFeature.RDMA: Vector(ce=0, hw=0, hw_k=1, ce_k=1),
+        LicenseFeature.S3_AUDIT: Vector(ce=0, hw=0, hw_k=1, ce_k=1),
+        LicenseFeature.S3_VERSIONING: Vector(ce=0, hw=0, hw_k=1, ce_k=1),
+        LicenseFeature.SED: Vector(ce=0, hw=0, hw_k=1, ce_k=0),
+        LicenseFeature.SMB_BLOCK_CLONING: Vector(ce=0, hw=0, hw_k=1, ce_k=1),
+        LicenseFeature.STIG: Vector(ce=0, hw=0, hw_k=1, ce_k=1),
+        LicenseFeature.SUPPORT: Vector(ce=0, hw=0, hw_k=1, ce_k=1),
+        LicenseFeature.TRUESEARCH: Vector(ce=0, hw=0, hw_k=1, ce_k=1),
+        LicenseFeature.VMS: Vector(ce=1, hw=1, hw_k=1, ce_k=1),
+        LicenseFeature.WEBSHARE: Vector(ce=0, hw=0, hw_k=1, ce_k=1),
+        LicenseFeature.ZFSTIER: Vector(ce=0, hw=0, hw_k=1, ce_k=1),
+    }
+
+
+# Live POLICY shape: which keys have a rule, and of which kind.
+def test_live_policy_shape():
+    assert set(POLICY) == {
+        LicenseFeature.CATALOG_ENTERPRISE_TRAIN,
+        LicenseFeature.DEDUP,
+        LicenseFeature.DIRECTORY_SERVICES_AUTH,
+        LicenseFeature.FIBRECHANNEL,
+        LicenseFeature.HA,
+        LicenseFeature.KMIP,
+        LicenseFeature.MISSION_CRITICAL,
+        LicenseFeature.ZFSTIER,
+        LicenseFeature.APPS,
+        LicenseFeature.CONTAINERS,
+        LicenseFeature.VMS,
+        LicenseFeature.WEBSHARE,
+        LicenseFeature.SED,
+        LicenseFeature.SMB_BLOCK_CLONING,
+        LicenseFeature.STIG,
+        LicenseFeature.SUPPORT,
+        LicenseFeature.TRUESEARCH,
+        LicenseFeature.NFS_SNAPSHOT,
+        LicenseFeature.NVMEOF_SPDK,
+        LicenseFeature.NETWORK_FEC,
+        LicenseFeature.RDMA,
+        LicenseFeature.S3_AUDIT,
+        LicenseFeature.S3_VERSIONING,
+        DerivedEntitlement.PROACTIVE_SUPPORT,
+    }
+    assert isinstance(POLICY[LicenseFeature.HA], Vector)
+    assert isinstance(POLICY[DerivedEntitlement.PROACTIVE_SUPPORT], TierRule)
+    # Every license feature the policy rules on is bound to a matrix Vector.
+    for key in set(POLICY) - set(DerivedEntitlement):
+        assert isinstance(POLICY[key], Vector), key
+    # LegacyRule is still dispatched by the engine, but no live entry uses it.
+    assert not [rule for rule in POLICY.values() if isinstance(rule, LegacyRule)]
+
+
+def test_ha_has_exactly_one_policy_entry():
+    """Any other ``StrEnum`` member spelled ``"HA"`` would collapse into this entry rather than sit
+    beside it, keeping the first key's identity and the last value written."""
+    assert [type(key) for key in POLICY if key == "HA"] == [LicenseFeature]
+    assert isinstance(POLICY["HA"], Vector)
+
+
+MATRIXLESS_FEATURES = frozenset({LicenseFeature.TNC_SUB})
+
+
+# Completeness: adding a flag must not silently skip a site.
+def test_target_vectors_cover_every_license_feature():
+    assert set(LicenseFeature) - MATRIXLESS_FEATURES == set(TARGET_VECTORS)
+
+
+def test_policy_keys_are_known_vocabulary():
+    assert set(POLICY) <= set(LicenseFeature) | set(DerivedEntitlement)
+    # And the other direction: an unruled DerivedEntitlement member comes back NOT_GATED --
+    # entitled -- from the public endpoint, rather than being denied.
+    assert set(DerivedEntitlement) <= set(POLICY)
+
+
+def test_policy_keys_have_display_names():
+    assert set(POLICY) <= set(FEATURE_DISPLAY_NAMES)
+
+
+def test_every_reason_has_a_message_template():
+    # `_format_message` does `_MESSAGES.get(reason, "")`, so a member added without an entry
+    # silently yields an empty message rather than failing anywhere.
+    assert set(Reason) == set(_MESSAGES)
+
+
+def test_api_reason_literal_matches_engine_reason():
+    # The import contract keeps modules under middlewared.api.v* away from the engine, so the
+    # public reason vocabulary has to be spelled out again there. This is what keeps the copy
+    # honest.
+    literal = EntitlementEntry.model_fields["reason"].annotation
+    assert set(typing.get_args(literal)) == {r.value for r in Reason}
+
+
+def test_declared_tiers_cover_tier_rules():
+    for rule in POLICY.values():
+        if isinstance(rule, TierRule):
+            assert rule.feature in FEATURE_TIERS
+            assert rule.allowed_tiers <= set(FEATURE_TIERS[rule.feature])
+
+
+@pytest.mark.parametrize(
+    "vector",
+    [
+        Vector(ce=1, hw=0, hw_k=1, ce_k=1),
+        Vector(ce=0, hw=1, hw_k=1, ce_k=1),
+    ],
+)
+def test_tier_rule_rejects_a_cell_outside_the_key_columns(vector):
+    with pytest.raises(ValueError, match="read off a feature key"):
+        TierRule(feature=LicenseFeature.SUPPORT, allowed_tiers=frozenset({SupportTier.GOLD}), vector=vector)
+
+
+def test_columns_match_vector_fields():
+    assert Vector._fields == tuple(c.lower().replace("+", "_") for c in COLUMNS)
+
+
+def _license_for(feature: str, state: str) -> LicenseInfo | None:
+    if state == "none":
+        return None
+    if state == "key":
+        return make_license(feature_names=(feature,))
+    return make_license(feature_names=())  # "nokey": licensed, without this feature's key
+
+
+# Vector resolution, once per distinct live vector shape.
+# The features sharing a shape are pinned by the matrix test above, so sweeping them would repeat it.
+VECTOR_TABLE = [
+    # APPS/CONTAINERS/VMS (1,1,1,1): granted unlicensed on either side, and a license
+    # without the key revokes it.
+    (LicenseFeature.APPS, HardwareClass.TRUENAS_HW, "none", True, "ENTITLED", "HW"),
+    (LicenseFeature.APPS, HardwareClass.TRUENAS_HW, "nokey", False, "KEY_MISSING", None),
+    (LicenseFeature.APPS, HardwareClass.TRUENAS_HW, "key", True, "ENTITLED", "HW+K"),
+    (LicenseFeature.APPS, HardwareClass.GENERIC, "none", True, "ENTITLED", "CE"),
+    (LicenseFeature.APPS, HardwareClass.GENERIC, "nokey", False, "KEY_MISSING", None),
+    (LicenseFeature.APPS, HardwareClass.GENERIC, "key", True, "ENTITLED", "CE+K"),
+    # CATALOG_ENTERPRISE_TRAIN, and SED which shares its shape: a shape whose CE key cell is 0, so
+    # a key on the community side still denies.
+    (LicenseFeature.CATALOG_ENTERPRISE_TRAIN, HardwareClass.TRUENAS_HW, "none", False, "NO_LICENSE", "HW"),
+    (LicenseFeature.CATALOG_ENTERPRISE_TRAIN, HardwareClass.TRUENAS_HW, "nokey", False, "KEY_MISSING", None),
+    (LicenseFeature.CATALOG_ENTERPRISE_TRAIN, HardwareClass.TRUENAS_HW, "key", True, "ENTITLED", "HW+K"),
+    (LicenseFeature.CATALOG_ENTERPRISE_TRAIN, HardwareClass.GENERIC, "none", False, "WRONG_HARDWARE", "CE"),
+    (LicenseFeature.CATALOG_ENTERPRISE_TRAIN, HardwareClass.GENERIC, "nokey", False, "WRONG_HARDWARE", None),
+    (LicenseFeature.CATALOG_ENTERPRISE_TRAIN, HardwareClass.GENERIC, "key", False, "WRONG_HARDWARE", "CE+K"),
+    # DEDUP (1,0,1,1): free on the community side, keyed on appliance hardware.
+    (LicenseFeature.DEDUP, HardwareClass.TRUENAS_HW, "none", False, "NO_LICENSE", "HW"),
+    (LicenseFeature.DEDUP, HardwareClass.TRUENAS_HW, "nokey", False, "KEY_MISSING", None),
+    (LicenseFeature.DEDUP, HardwareClass.TRUENAS_HW, "key", True, "ENTITLED", "HW+K"),
+    (LicenseFeature.DEDUP, HardwareClass.GENERIC, "none", True, "ENTITLED", "CE"),
+    (LicenseFeature.DEDUP, HardwareClass.GENERIC, "nokey", False, "KEY_MISSING", None),
+    (LicenseFeature.DEDUP, HardwareClass.GENERIC, "key", True, "ENTITLED", "CE+K"),
+    # ZFSTIER, and the other features sharing (0,0,1,1): key-only on either side.
+    (LicenseFeature.ZFSTIER, HardwareClass.TRUENAS_HW, "none", False, "NO_LICENSE", "HW"),
+    (LicenseFeature.ZFSTIER, HardwareClass.TRUENAS_HW, "nokey", False, "KEY_MISSING", None),
+    (LicenseFeature.ZFSTIER, HardwareClass.TRUENAS_HW, "key", True, "ENTITLED", "HW+K"),
+    (LicenseFeature.ZFSTIER, HardwareClass.GENERIC, "none", False, "NO_LICENSE", "CE"),
+    (LicenseFeature.ZFSTIER, HardwareClass.GENERIC, "nokey", False, "KEY_MISSING", None),
+    (LicenseFeature.ZFSTIER, HardwareClass.GENERIC, "key", True, "ENTITLED", "CE+K"),
+    # A Mini is iX-built hardware that reads the CE half of every row, so unlicensed DEDUP is
+    # granted here and denied on the appliance row above.
+    (LicenseFeature.DEDUP, HardwareClass.MINI, "none", True, "ENTITLED", "CE"),
+]
+
+
+@pytest.mark.parametrize("feature,hardware_class,state,entitled,reason,column", VECTOR_TABLE)
+def test_vector_behavior(feature, hardware_class, state, entitled, reason, column):
+    facts = make_facts(hardware_class=hardware_class, license=_license_for(feature, state))
+    entitlement = check_entitlement(feature, facts)
+    assert entitlement.entitled is entitled
+    assert entitlement.reason == reason
+    assert entitlement.column == column
+
+
+# Where a denial's wording comes from. A feature may register bespoke wording that has to
+# win over the generic template on every reason it registers, and a feature with no display
+# name has to fall back to its raw key rather than emitting an empty phrase.
+_CE_KEY_DROPPED = Vector(ce=0, hw=0, hw_k=1, ce_k=0)
+
+MESSAGE_TABLE = [
+    # An override replaces the generic template on a live denial.
+    (LicenseFeature.NVMEOF_SPDK, "HW+L", None, "SPDK is limited to enterprise licensed systems only."),
+    # ... and holds on WRONG_HARDWARE too, which no live vector with an override can reach.
+    (
+        LicenseFeature.NVMEOF_SPDK,
+        "CE+K",
+        _CE_KEY_DROPPED,
+        "SPDK is limited to enterprise licensed systems only.",
+    ),
+    # No override: the generic template is filled from the display name, not the key.
+    (LicenseFeature.DEDUP, "HW+L", None, "This system's license does not include the ZFS deduplication feature."),
+    # No display name either, so the raw key is what the template gets.
+    (
+        "SYNTHETIC_UNNAMED",
+        "HW",
+        Vector(ce=0, hw=0, hw_k=1, ce_k=1),
+        "This system is not licensed to use the SYNTHETIC_UNNAMED feature.",
+    ),
+]
+
+
+@pytest.mark.parametrize("feature,column,vector,message", MESSAGE_TABLE)
+def test_message_source(feature, column, vector, message):
+    policy = None if vector is None else {feature: vector}
+    entitlement = check_entitlement(feature, facts_for_column(feature, column), policy=policy)
+    assert entitlement.entitled is False
+    assert entitlement.message == message
+
+
+# Unknown feature.
+def test_unknown_feature_raises():
+    with pytest.raises(ValueError):
+        check_entitlement("NOPE", make_facts(hardware_class=HardwareClass.GENERIC))
+
+
+def _proactive_support_license(state: str, support_type: str | None) -> LicenseInfo | None:
+    if state == "none":
+        return None
+    if state == "key":
+        return make_license(feature_names=("SUPPORT",), support_type=support_type)
+    return make_license(feature_names=())  # "nokey": licensed, without the SUPPORT key
+
+
+PROACTIVE_SUPPORT_NO_LICENSE = "This system is not licensed to use the proactive support feature."
+PROACTIVE_SUPPORT_KEY_MISSING = "This system's license does not include the proactive support feature."
+PROACTIVE_SUPPORT_TIER = "This system's support tier does not include the proactive support feature."
+
+# PROACTIVE_SUPPORT: the live TierRule, which is the only rule kind that reads a
+# qualifier off a feature key other than its own policy key. The messages are asserted
+# because that split is invisible to mypy -- both are `str` -- and conflating them would
+# emit "the support feature" here, which is a different entitlement.
+TIER_TABLE = [
+    (HardwareClass.TRUENAS_HW, "none", None, False, "NO_LICENSE", "HW", PROACTIVE_SUPPORT_NO_LICENSE),
+    (HardwareClass.TRUENAS_HW, "nokey", None, False, "KEY_MISSING", None, PROACTIVE_SUPPORT_KEY_MISSING),
+    (HardwareClass.TRUENAS_HW, "key", "GOLD", True, "ENTITLED", "HW+K", ""),
+    (HardwareClass.TRUENAS_HW, "key", "SILVER", True, "ENTITLED", "HW+K", ""),
+    (HardwareClass.TRUENAS_HW, "key", "SILVERINTERNATIONAL", True, "ENTITLED", "HW+K", ""),
+    # The tier is upper-cased before it is matched.
+    (HardwareClass.TRUENAS_HW, "key", "gold", True, "ENTITLED", "HW+K", ""),
+    (HardwareClass.TRUENAS_HW, "key", "BRONZE", False, "TIER_INSUFFICIENT", "HW+K", PROACTIVE_SUPPORT_TIER),
+    # The SUPPORT key is present but carries no tier at all.
+    (HardwareClass.TRUENAS_HW, "key", None, False, "TIER_INSUFFICIENT", "HW+K", PROACTIVE_SUPPORT_TIER),
+    (HardwareClass.GENERIC, "none", None, False, "NO_LICENSE", "CE", PROACTIVE_SUPPORT_NO_LICENSE),
+    (HardwareClass.GENERIC, "nokey", None, False, "KEY_MISSING", None, PROACTIVE_SUPPORT_KEY_MISSING),
+    (HardwareClass.GENERIC, "key", "GOLD", True, "ENTITLED", "CE+K", ""),
+]
+
+
+@pytest.mark.parametrize("hardware_class,state,support_type,entitled,reason,column,message", TIER_TABLE)
+def test_tier_rule_behavior(hardware_class, state, support_type, entitled, reason, column, message):
+    facts = make_facts(hardware_class=hardware_class, license=_proactive_support_license(state, support_type))
+    entitlement = check_entitlement(DerivedEntitlement.PROACTIVE_SUPPORT, facts)
+    assert entitlement.entitled is entitled
+    assert entitlement.reason == reason
+    # The tier is a qualifier on the key columns, so the SUPPORT key -- not the policy key,
+    # which no license carries -- is what resolves the column.
+    assert entitlement.column == column
+    assert entitlement.message == message
+
+
+# HA. A virtual machine stamped as an HA node classifies as appliance hardware, so the CE half of
+# the row covers only machines that cannot be one half of a pair: Minis, whiteboxes, and anything
+# whose hardware probe degraded.
+HA_TABLE = [
+    (HardwareClass.TRUENAS_HW, (LicenseFeature.HA,), True, "ENTITLED", "HW+K"),
+    (HardwareClass.TRUENAS_HW, (), False, "KEY_MISSING", None),
+    (HardwareClass.TRUENAS_HW, None, False, "NO_LICENSE", "HW"),
+    (HardwareClass.GENERIC, (LicenseFeature.HA,), False, "WRONG_HARDWARE", "CE+K"),
+    (HardwareClass.MINI, (LicenseFeature.HA,), False, "WRONG_HARDWARE", "CE+K"),
+]
+
+
+@pytest.mark.parametrize("hardware_class,feature_names,entitled,reason,column", HA_TABLE)
+def test_ha_behavior(hardware_class, feature_names, entitled, reason, column):
+    license = None if feature_names is None else make_license(feature_names=feature_names)
+    entitlement = check_entitlement(LicenseFeature.HA, make_facts(hardware_class=hardware_class, license=license))
+    assert entitlement.entitled is entitled
+    assert entitlement.reason == reason
+    assert entitlement.column == column

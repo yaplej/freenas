@@ -1,0 +1,483 @@
+from __future__ import annotations
+
+import errno
+import platform
+import re
+import shlex
+from typing import TYPE_CHECKING, Any, TypeVar
+import uuid
+
+from truenas_pylibvirt import DomainDoesNotExistError
+from truenas_pylibvirt.domain.base.configuration import parse_numeric_set
+from truenas_pylibvirt.utils import kvm_supported
+
+from middlewared.api.current import (
+    VMCreate,
+    VMDeleteOptions,
+    VMDeviceDeleteOptions,
+    VMDiskDevice,
+    VMEntry,
+    VMUpdate,
+)
+from middlewared.plugins.zfs.zvol_utils import zvol_path_to_name
+from middlewared.pylibvirt import gather_pylibvirt_domains_states, get_pylibvirt_domain_state
+from middlewared.service import CallError, CRUDServicePart, ValidationErrors
+import middlewared.sqlalchemy as sa
+from middlewared.utils.libvirt.utils import ACTIVE_STATES, retrieve_status, same_uuid
+
+from .capabilities import guest_architecture_and_machine_choices
+from .constants import VMGuestArch
+from .info import (
+    MAXIMUM_SUPPORTED_VCPUS,
+    bootloader_aavmf_choices,
+    bootloader_ovmf_choices,
+    cpu_model_choices,
+    license_active,
+    vm_flags,
+)
+from .lifecycle import pylibvirt_vm
+from .utils import delete_vm_state, rename_vm_state, vm_state_missing_sources
+
+if TYPE_CHECKING:
+    from middlewared.utils.types import AuditCallback
+
+
+RE_NAME = re.compile(r'^[a-zA-Z_0-9]+$')
+
+
+def _is_secboot_firmware(filename: str) -> bool:
+    # OVMF/AAVMF secboot CODE files use a few conventions: *.secboot.fd is the
+    # canonical name; *.ms.fd is a symlink to it on Debian's AAVMF (and OVMF);
+    # *.snakeoil.fd is a secboot variant signed with self-signed test keys.
+    # Anchored with surrounding dots so AAVMF_CODE.no-secboot.fd doesn't match
+    # via the bare "secboot" substring.
+    name = filename.lower()
+    return any(token in name for token in ('.secboot.', '.ms.fd', '.snakeoil.'))
+
+
+VMDataT = TypeVar('VMDataT', bound=VMEntry)
+
+
+class VMModel(sa.Model):
+    __tablename__ = 'vm_vm'
+
+    id = sa.Column(sa.Integer(), primary_key=True)
+    name = sa.Column(sa.String(150))
+    description = sa.Column(sa.String(250))
+    vcpus = sa.Column(sa.Integer(), default=1)
+    memory = sa.Column(sa.Integer())
+    min_memory = sa.Column(sa.Integer(), nullable=True)
+    autostart = sa.Column(sa.Boolean(), default=False)
+    time = sa.Column(sa.String(5), default='LOCAL')
+    bootloader = sa.Column(sa.String(50), default='UEFI')
+    cores = sa.Column(sa.Integer(), default=1)
+    threads = sa.Column(sa.Integer(), default=1)
+    hyperv_enlightenments = sa.Column(sa.Boolean(), default=False)
+    shutdown_timeout = sa.Column(sa.Integer(), default=90)
+    cpu_mode = sa.Column(sa.Text())
+    cpu_model = sa.Column(sa.Text(), nullable=True)
+    cpuset = sa.Column(sa.Text(), default=None, nullable=True)
+    nodeset = sa.Column(sa.Text(), default=None, nullable=True)
+    pin_vcpus = sa.Column(sa.Boolean(), default=False)
+    hide_from_msr = sa.Column(sa.Boolean(), default=False)
+    suspend_on_snapshot = sa.Column(sa.Boolean(), default=True)
+    ensure_display_device = sa.Column(sa.Boolean(), default=True)
+    arch_type = sa.Column(sa.String(255), default=None, nullable=True)
+    video_model = sa.Column(sa.String(50))
+    machine_type = sa.Column(sa.String(255), default=None, nullable=True)
+    uuid = sa.Column(sa.String(255))
+    command_line_args = sa.Column(sa.Text(), default='', nullable=False)
+    bootloader_ovmf = sa.Column(sa.String(1024), default='OVMF_CODE.fd')
+    trusted_platform_module = sa.Column(sa.Boolean(), default=False)
+    enable_cpu_topology_extension = sa.Column(sa.Boolean(), default=False)
+    enable_secure_boot = sa.Column(sa.Boolean(), default=False, nullable=False)
+
+
+class VMServicePart(CRUDServicePart[VMEntry]):
+    _datastore = 'vm.vm'
+    _datastore_sql_filters = frozenset((
+        'id', 'name', 'description', 'vcpus', 'memory', 'min_memory', 'autostart', 'time', 'bootloader', 'cores',
+        'threads', 'hyperv_enlightenments', 'shutdown_timeout', 'cpu_mode', 'cpu_model', 'cpuset', 'nodeset',
+        'pin_vcpus', 'hide_from_msr', 'suspend_on_snapshot', 'ensure_display_device', 'arch_type', 'video_model',
+        'machine_type', 'uuid', 'command_line_args', 'bootloader_ovmf', 'trusted_platform_module',
+        'enable_cpu_topology_extension', 'enable_secure_boot',
+    ))
+    _entry = VMEntry
+
+    def extend_context_sync(self, rows: list[dict[str, Any]], extra: dict[str, Any]) -> dict[str, Any]:
+        return {
+            'devices': self.devices_by_vm(rows),
+            'states': gather_pylibvirt_domains_states(
+                self.middleware,
+                rows,
+                self.middleware.libvirt_domains_manager.vms_connection,
+                lambda vm: pylibvirt_vm(self, self.state_entry(vm)),
+            ) if retrieve_status(extra) else None,
+        }
+
+    def devices_by_vm(self, rows: list[dict[str, Any]]) -> dict[int, list[Any]]:
+        devices_by_vm: dict[int, list[Any]] = {}
+        if not rows:
+            return devices_by_vm
+
+        for device in self.call_sync2(
+            self.s.vm.device.query,
+            [['vm', 'in', [row['id'] for row in rows]]],
+        ):
+            devices_by_vm.setdefault(device.vm, []).append(device)
+
+        return devices_by_vm
+
+    def state_entry(self, row: dict[str, Any]) -> VMEntry:
+        # State gathering only reads the VM's identity to find its libvirt domain, so the
+        # runtime-only fields are filled with placeholders just to satisfy the model.
+        return VMEntry(**{
+            **row,
+            'devices': [],
+            'display_available': False,
+            'status': {'state': 'STOPPED', 'pid': None, 'domain_state': None},
+        })
+
+    async def extend(self, data: dict[str, Any], context: dict[str, Any]) -> dict[str, Any]:
+        vm_devices = context['devices'].get(data['id'], [])
+        data.update({
+            'devices': vm_devices,
+            'display_available': any(device.attributes.dtype == 'DISPLAY' for device in vm_devices),
+            'status': None if context['states'] is None else get_pylibvirt_domain_state(context['states'], data),
+        })
+        return data
+
+    async def do_create(self, data: VMCreate) -> VMEntry:
+        if data.video_model is None:
+            data.video_model = 'VIRTIO' if data.arch_type == VMGuestArch.AARCH64 else 'VGA'
+
+        verrors = ValidationErrors()
+        data = await self.validate(verrors, 'vm_create', data)
+
+        if data.enable_secure_boot:
+            # Secure-boot defaults are arch-specific:
+            # - x86 secboot: pc-q35 machine + OVMF_CODE_4M.secboot.fd
+            #   (https://docs.openstack.org/nova/latest/admin/secure-boot.html)
+            # - aarch64 secboot: virt machine + AAVMF_CODE.ms.fd
+            updates: dict[str, Any] = {}
+            if not data.arch_type and not data.machine_type:
+                # If neither arch nor machine is specified, assume x86_64 to
+                # preserve existing behavior. vm.update fails on null arch_type
+                # so we set it explicitly.
+                updates['arch_type'] = VMGuestArch.X86_64
+            arch = updates.get('arch_type') or data.arch_type or VMGuestArch.X86_64
+            is_aarch64 = arch == VMGuestArch.AARCH64
+
+            if not data.machine_type:
+                updates['machine_type'] = 'virt-9.2' if is_aarch64 else 'pc-q35-6.2'
+            elif is_aarch64:
+                if not data.machine_type.startswith('virt'):
+                    verrors.add(
+                        'vm_create.machine_type',
+                        'aarch64 secure boot requires a virt machine type'
+                    )
+            else:
+                if 'pc-q35' not in data.machine_type:
+                    verrors.add(
+                        'vm_create.machine_type',
+                        'Secure boot is only available in q35 machine type'
+                    )
+
+            if data.bootloader_ovmf is None:
+                updates['bootloader_ovmf'] = 'AAVMF_CODE.ms.fd' if is_aarch64 else 'OVMF_CODE_4M.secboot.fd'
+
+            if updates:
+                data = data.model_copy(update=updates)
+
+            if data.bootloader_ovmf is None:
+                verrors.add(
+                    'vm_create.bootloader_ovmf',
+                    'Bootloader firmware must be specified when secure boot is enabled'
+                )
+            elif not _is_secboot_firmware(data.bootloader_ovmf):
+                example = 'AAVMF_CODE.ms.fd' if is_aarch64 else 'OVMF_CODE_4M.secboot.fd'
+                verrors.add(
+                    'vm_create.bootloader_ovmf',
+                    f'Select a bootloader_ovmf that supports secure boot i.e {example}'
+                )
+
+        if data.bootloader_ovmf is None:
+            if data.arch_type == VMGuestArch.AARCH64:
+                data = data.model_copy(update={'bootloader_ovmf': 'AAVMF_CODE.fd'})
+            else:
+                data = data.model_copy(update={'bootloader_ovmf': 'OVMF_CODE_4M.fd'})
+
+        choices_fn = bootloader_aavmf_choices if data.arch_type == VMGuestArch.AARCH64 else bootloader_ovmf_choices
+        if data.bootloader_ovmf not in await self.to_thread(choices_fn):
+            verrors.add('vm_create.bootloader_ovmf', 'Invalid bootloader ovmf choice specified')
+
+        verrors.check()
+
+        entry = await self._create(data.model_dump())
+        await self.middleware.call('etc.generate', 'libvirt_guests')
+        return entry
+
+    async def do_update(self, id_: int, data: VMUpdate, *, audit_callback: AuditCallback) -> VMEntry:
+        old = await self.get_instance(id_)
+        new = old.updated(data)
+        audit_callback(new.name)
+
+        if new.name != old.name:
+            if old.status.state in ACTIVE_STATES:
+                raise CallError('VM name can only be changed when VM is inactive')
+
+        verrors = ValidationErrors()
+        await self.validate(verrors, 'vm_update', new, old=old)
+        verrors.check()
+
+        renamed = False
+        if new.name != old.name:
+            try:
+                await self.to_thread(rename_vm_state, old.id, old.name, new.id, new.name)
+            except FileExistsError as e:
+                raise CallError(
+                    f'Cannot rename VM {old.name!r} -> {new.name!r}: on-disk state already '
+                    'exists at the destination (likely stale NVRAM/TPM left over from a '
+                    'previously deleted VM). Name change aborted; VM configuration is unchanged.'
+                ) from e
+            except OSError as e:
+                raise CallError(
+                    f'Failed to rename VM state for {old.name!r} -> {new.name!r}: '
+                    f'{e.strerror or e} (errno={e.errno}). Name change aborted; '
+                    f'VM configuration is unchanged.'
+                ) from e
+            renamed = True
+
+            missing = await self.to_thread(
+                vm_state_missing_sources, new.id, new.name,
+                old.bootloader, old.trusted_platform_module,
+            )
+            if missing:
+                self.logger.warning(
+                    '%s: rename to %r proceeded with no prior on-disk state for %s; '
+                    'libvirt/swtpm will initialise fresh state on next start.',
+                    old.name, new.name, ', '.join(missing),
+                )
+
+        try:
+            entry = await self._update(id_, new.model_dump(
+                exclude={'id', 'devices', 'display_available', 'status_or_null'}
+            ))
+        except Exception:
+            if renamed:
+                try:
+                    await self.to_thread(rename_vm_state, new.id, new.name, old.id, old.name)
+                except Exception:
+                    self.logger.error(
+                        '%s: state-file rollback failed after DB update failure',
+                        old.name, exc_info=True,
+                    )
+            raise
+
+        if old.shutdown_timeout != new.shutdown_timeout:
+            await self.middleware.call('etc.generate', 'libvirt_guests')
+
+        return entry
+
+    def do_delete(self, id_: int, data: VMDeleteOptions, *, audit_callback: AuditCallback) -> None:
+        vm = self.get_instance__sync(id_)
+        audit_callback(vm.name)
+
+        if vm.status.state in ACTIVE_STATES and not data.force:
+            raise CallError(
+                f'{vm.name!r} is {vm.status.state.lower()}; stop the VM first or pass force to delete it.',
+                errno.EBUSY,
+            )
+
+        # Stop and undefine the domain before destroying any backing zvols so qemu
+        # releases the block devices first; destroying a zvol under a live domain
+        # risks guest corruption and fails with EBUSY.
+        pylibvirt_vm_obj = pylibvirt_vm(self, vm)
+        try:
+            self.middleware.libvirt_domains_manager.vms.delete(pylibvirt_vm_obj)
+        except DomainDoesNotExistError:
+            pass
+
+        if data.zvols:
+            disk_devices = self.call_sync2(
+                self.s.vm.device.query,
+                [('vm', '=', id_), ('attributes.dtype', '=', 'DISK')]
+            )
+            for device in disk_devices:
+                if not isinstance(device.attributes, VMDiskDevice):
+                    continue
+                if not device.attributes.path or not device.attributes.path.startswith('/dev/zvol/'):
+                    continue
+
+                disk_name = zvol_path_to_name(device.attributes.path)
+                try:
+                    self.call_sync2(self.s.zfs.resource.destroy_impl, disk_name, recursive=True)
+                except Exception:
+                    if not data.force:
+                        raise
+
+                    self.logger.error(
+                        'Failed to delete %r volume when removing %r VM', disk_name, vm.name, exc_info=True
+                    )
+
+        for device in vm.devices:
+            self.call_sync2(self.s.vm.device.delete, device.id, VMDeviceDeleteOptions(force=False))
+
+        self.run_coroutine(self._delete(id_))
+        try:
+            delete_vm_state(vm.id, vm.name)
+        except Exception:
+            self.logger.error(
+                '%s: failed to remove on-disk VM state (nvram/tpm)', vm.name, exc_info=True,
+            )
+        self.middleware.call_sync('etc.generate', 'libvirt_guests')
+
+    async def validate(
+        self, verrors: ValidationErrors, schema_name: str, data: VMDataT, old: VMEntry | None = None,
+    ) -> VMDataT:
+        if data.uuid is None:
+            data = data.model_copy(update={'uuid': str(uuid.uuid4())})
+
+        if old is None or data.uuid != old.uuid:
+            rows = await self.middleware.call('datastore.query', 'vm.vm', [])
+            if any(
+                (old is None or row['id'] != old.id) and row['uuid'] and same_uuid(data.uuid, row['uuid'])
+                for row in rows
+            ):
+                verrors.add(f'{schema_name}.uuid', 'A VM with this UUID already exists.', errno.EEXIST)
+
+        if not await license_active(self):
+            verrors.add(f'{schema_name}.name', 'System is not licensed to use VMs')
+
+        if data.min_memory and data.min_memory > data.memory:
+            verrors.add(
+                f'{schema_name}.min_memory',
+                'Minimum memory should not be greater than defined/maximum memory'
+            )
+
+        try:
+            shlex.split(data.command_line_args)
+        except ValueError as e:
+            verrors.add(f'{schema_name}.command_line_args', f'Parse error: {e.args[0]}')
+
+        vcpus = data.vcpus * data.cores * data.threads
+        if vcpus:
+            flags = vm_flags()
+            if vcpus > MAXIMUM_SUPPORTED_VCPUS:
+                verrors.add(
+                    f'{schema_name}.vcpus',
+                    f'Maximum {MAXIMUM_SUPPORTED_VCPUS} vcpus are supported.'
+                    f'Please ensure the product of "{schema_name}.vcpus", "{schema_name}.cores" and '
+                    f'"{schema_name}.threads" is less than {MAXIMUM_SUPPORTED_VCPUS}.'
+                )
+            elif flags.intel_vmx:
+                if vcpus > 1 and flags.unrestricted_guest is False:
+                    verrors.add(f'{schema_name}.vcpus', 'Only one Virtual CPU is allowed in this system.')
+            elif flags.amd_rvi:
+                if vcpus > 1 and flags.amd_asids is False:
+                    verrors.add(f'{schema_name}.vcpus', 'Only one virtual CPU is allowed in this system.')
+            elif not kvm_supported():
+                verrors.add(schema_name, 'This system does not support virtualization.')
+
+        if data.arch_type or data.machine_type:
+            choices = await self.to_thread(guest_architecture_and_machine_choices, self)
+            if data.arch_type and data.arch_type not in choices:
+                verrors.add(
+                    f'{schema_name}.arch_type',
+                    'Specified architecture type is not supported on this system'
+                )
+            if data.machine_type:
+                if not data.arch_type:
+                    verrors.add(
+                        f'{schema_name}.arch_type',
+                        f'Must be specified when "{schema_name}.machine_type" is set'
+                    )
+                elif data.arch_type in choices and data.machine_type not in choices[data.arch_type]:
+                    verrors.add(
+                        f'{schema_name}.machine_type',
+                        f'Specified machine type is not supported for {choices[data.arch_type]!r} architecture type'
+                    )
+
+        # Reject x86-only configuration on aarch64 guests
+        if data.arch_type == VMGuestArch.AARCH64:
+            if data.bootloader == 'UEFI_CSM':
+                verrors.add(
+                    f'{schema_name}.bootloader',
+                    'UEFI_CSM (legacy BIOS) is x86-only and not supported for aarch64 guests'
+                )
+            if data.hyperv_enlightenments:
+                verrors.add(
+                    f'{schema_name}.hyperv_enlightenments',
+                    'Hyper-V enlightenments are x86-only and not supported for aarch64 guests'
+                )
+            if data.hide_from_msr:
+                verrors.add(
+                    f'{schema_name}.hide_from_msr',
+                    'hide_from_msr is x86-specific and not supported for aarch64 guests'
+                )
+            if data.video_model != 'VIRTIO':
+                verrors.add(
+                    f'{schema_name}.video_model',
+                    'Only the VIRTIO video model is supported for aarch64 guests'
+                )
+
+        # KVM accelerates same-ISA guests only; HOST-PASSTHROUGH / HOST-MODEL
+        # don't work cross-arch (TCG can't passthrough a different-ISA CPU).
+        if data.cpu_mode in ('HOST-PASSTHROUGH', 'HOST-MODEL'):
+            host_arch = platform.machine()
+            guest_arch = data.arch_type or host_arch
+            same_family = (
+                guest_arch == host_arch
+                or (host_arch == VMGuestArch.X86_64 and guest_arch in (VMGuestArch.I686, 'i386'))
+            )
+            if not same_family:
+                verrors.add(
+                    f'{schema_name}.cpu_mode',
+                    f'{data.cpu_mode} requires the guest architecture ({guest_arch!r}) to match '
+                    f'the host ({host_arch!r}). Use CUSTOM with an explicit cpu_model for '
+                    'cross-architecture emulation.'
+                )
+
+        if data.cpu_mode != 'CUSTOM' and data.cpu_model:
+            verrors.add(
+                f'{schema_name}.cpu_model',
+                'This attribute should not be specified when "cpu_mode" is not "CUSTOM".'
+            )
+        elif data.cpu_model and data.cpu_model not in await self.to_thread(
+            cpu_model_choices, data.arch_type or VMGuestArch.X86_64
+        ):
+            verrors.add(f'{schema_name}.cpu_model', 'Please select a valid CPU model.')
+
+        if not old or data.name != old.name:
+            filters: list[tuple[str, str, Any]] = [('name', '=', data.name)]
+            if old:
+                filters.append(('id', '!=', old.id))
+            if await self.middleware.call('datastore.query', 'vm.vm', filters):
+                verrors.add(f'{schema_name}.name', 'This name already exists.', errno.EEXIST)
+            elif not RE_NAME.search(data.name):
+                verrors.add(f'{schema_name}.name', 'Only alphanumeric characters are allowed.')
+
+        if data.pin_vcpus:
+            if not data.cpuset:
+                verrors.add(
+                    f'{schema_name}.cpuset',
+                    f'Must be specified when "{schema_name}.pin_vcpus" is set.'
+                )
+            else:
+                try:
+                    cpus = parse_numeric_set(data.cpuset)
+                except ValueError as e:
+                    verrors.add(f'{schema_name}.cpuset', f'Invalid cpuset format: {e}')
+                else:
+                    if len(cpus) != vcpus:
+                        verrors.add(
+                            f'{schema_name}.pin_vcpus',
+                            f'Number of cpus in "{schema_name}.cpuset" must be equal to total number '
+                            'vcpus if pinning is enabled.'
+                        )
+
+        # TODO: Let's please implement PCI express hierarchy as the limit on devices in KVM is quite high
+        # with reports of users having thousands of disks
+        # Let's validate that the VM has the correct no of slots available to accommodate currently configured devices
+
+        return data

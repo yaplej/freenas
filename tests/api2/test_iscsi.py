@@ -1,42 +1,28 @@
-import contextlib
-
-import sys
-import os
-sys.path.append(os.getcwd())
-
 import pytest
-from pytest_dependency import depends
+
 from middlewared.service_exception import ValidationErrors
-from middlewared.test.integration.utils import call
+from middlewared.test.integration.assets.iscsi import iscsi_extent
 from middlewared.test.integration.assets.pool import dataset
-from auto_config import dev_test
-# comment pytestmark for development testing with --dev-test
-pytestmark = pytest.mark.skipif(dev_test, reason='Skipping for test development testing')
-
-
-@contextlib.contextmanager
-def iscsi_extent(data):
-    extent = call("iscsi.extent.create", data)
-
-    try:
-        yield extent
-    finally:
-        call("iscsi.extent.delete", extent["id"])
+from middlewared.test.integration.utils import call, poll
 
 
 def test__iscsi_extent__disk_choices(request):
-    depends(request, ["pool_04"], scope="session")
-    with dataset("test zvol", {
-        "type": "VOLUME",
-        "volsize": 1024000,
-    }) as ds:
+    with dataset("test zvol", {"type": "VOLUME", "volsize": 1048576}) as ds:
         # Make snapshots available for devices
-        call("zfs.dataset.update", ds, {"properties": {"snapdev": {"parsed": "visible"}}})
-        call("zfs.snapshot.create", {"dataset": ds, "name": "snap-1"})
-        assert call("iscsi.extent.disk_choices") == {
-            f'zvol/{ds.replace(" ", "+")}': f'{ds} (1000 KiB)',
-            f'zvol/{ds.replace(" ", "+")}@snap-1': f'{ds}@snap-1 [ro]',
-        }
+        call(
+            "pool.dataset.update_impl", {"name": ds, "zprops": {"snapdev": "visible"}}
+        )
+        call("pool.snapshot.create", {"dataset": ds, "name": "snap-1"})
+        # udev creates the snapshot device symlink after the snapshot exists
+        poll(
+            lambda: call("iscsi.extent.disk_choices"),
+            condition=lambda choices: choices == {
+                f'zvol/{ds.replace(" ", "+")}': f'{ds} (1 MiB)',
+                f'zvol/{ds.replace(" ", "+")}@snap-1': f'{ds}@snap-1 [ro]',
+            },
+            timeout=30,
+            message="Snapshot device did not appear in iSCSI disk choices",
+        )
 
         # Create new extent
         with iscsi_extent({
@@ -54,10 +40,9 @@ def test__iscsi_extent__disk_choices(request):
 
 
 def test__iscsi_extent__create_with_invalid_disk_with_whitespace(request):
-    depends(request, ["pool_04"], scope="session")
     with dataset("test zvol", {
         "type": "VOLUME",
-        "volsize": 1024000,
+        "volsize": 1048576,
     }) as ds:
         with pytest.raises(ValidationErrors) as e:
             with iscsi_extent({
@@ -73,10 +58,9 @@ def test__iscsi_extent__create_with_invalid_disk_with_whitespace(request):
 
 
 def test__iscsi_extent__locked(request):
-    depends(request, ["pool_04"], scope="session")
     with dataset("test zvol", {
         "type": "VOLUME",
-        "volsize": 1024000,
+        "volsize": 1048576,
         "inherit_encryption": False,
         "encryption": True,
         "encryption_options": {"passphrase": "testtest"},

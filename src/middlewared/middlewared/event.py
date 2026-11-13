@@ -1,123 +1,170 @@
 import asyncio
-import contextlib
 import json
 import threading
+import typing
 
-from middlewared.schema import Any, clean_and_validate_arg, ValidationErrors
-from middlewared.settings import conf
+from middlewared.api.base.handler.accept import validate_model
+from middlewared.role import RoleManager
+from middlewared.service import ValidationErrors
+
+if typing.TYPE_CHECKING:
+    from middlewared.api.base import BaseModel
+    from middlewared.common.event_source.manager import Subscriber
+    from middlewared.main import Middleware
+    from middlewared.utils.types import EventType
 
 
-class Events(object):
+class Events:
+    def __init__(self, role_manager: RoleManager):
+        self.role_manager = role_manager
+        self._events: dict[str, dict[str, typing.Any]] = {}
+        self.__events_private: set[str] = set()
 
-    def __init__(self):
-        self._events = {}
-        self.__events_private = set()
-
-    def register(self, name, description, private=False, returns=None):
+    def register(
+        self,
+        name: str,
+        description: str,
+        private: bool,
+        models: dict['EventType', type['BaseModel']] | None,
+        no_auth_required: bool,
+        no_authz_required: bool,
+        roles: typing.Iterable[str],
+    ):
         if name in self._events:
             raise ValueError(f'Event {name!r} already registered.')
+        self.role_manager.register_event(name, roles)
         self._events[name] = {
             'description': description,
-            'accepts': [],
-            'returns': [returns] if returns else [Any(name, null=True)],
+            'models': models,
+            'no_auth_required': no_auth_required,
+            'no_authz_required': no_authz_required,
+            'roles': self.role_manager.roles_for_event(name),
         }
         if private:
             self.__events_private.add(name)
 
-    def get_event(self, name):
-        return self._events.get(name)
+    def get_event(self, name: str) -> typing.Optional[dict[str, typing.Any]]:
+        event = self._events.get(name)
+        if event is None:
+            return None
+
+        return {
+            'private': name in self.__events_private,
+            'wildcard_subscription': True,
+            **event,
+        }
 
     def __contains__(self, name):
         return name in self._events
 
     def __iter__(self):
-        for k, v in self._events.items():
-            yield k, {
-                'private': k in self.__events_private,
-                'wildcard_subscription': True,
-                **v,
-            }
+        for k in self._events:
+            yield k, self.get_event(k)
 
 
-class EventSourceMetabase(type):
-
-    def __new__(cls, name, bases, attrs):
-        klass = super().__new__(cls, name, bases, attrs)
-        if name == 'EventSource' and bases == ():
-            return klass
-
-        for i in (('ACCEPTS', name.lower()), ('RETURNS', f'{name.lower()}_returns')):
-            doc_type = getattr(klass, i[0])
-            if doc_type == NotImplementedError:
-                doc_type = Any(null=True)
-            if not doc_type.name:
-                doc_type.name = i[1]
-            setattr(klass, i[0], [doc_type])
-
-        return klass
+class SendEventProcedure(typing.Protocol):
+    def __call__(self, event_type: str, **kwargs) -> None: ...
 
 
-class EventSource(metaclass=EventSourceMetabase):
+UnsubscribeProcedure: typing.TypeAlias = typing.Callable[[Exception | None], typing.Awaitable[None]]
 
-    ACCEPTS = NotImplementedError
-    RETURNS = NotImplementedError
 
-    def __init__(self, middleware, name, arg, send_event, unsubscribe_all):
+class EventSource:
+    args: type['BaseModel'] | None = None
+    event: type['BaseModel'] | None = None
+    roles: list[str] = []
+
+    def __init__(
+        self,
+        middleware: 'Middleware',
+        name: str,
+        arg: str | None,
+        send_event: SendEventProcedure,
+        unsubscribe_all: UnsubscribeProcedure,
+    ):
         self.middleware = middleware
         self.name = name
         self.arg = arg
         self.send_event_internal = send_event
         self.unsubscribe_all = unsubscribe_all
+        self._canceled = False
         self._cancel = asyncio.Event()
         self._cancel_sync = threading.Event()
 
-    def send_event(self, event_type, **kwargs):
-        if conf.debug_mode and event_type in ('ADDED', 'CHANGED'):
-            verrors = ValidationErrors()
-            clean_and_validate_arg(verrors, self.RETURNS[0], kwargs.get('fields'))
-            if verrors:
-                self.middleware.loop.call_soon_threadsafe(lambda: asyncio.ensure_future(self.unsubscribe_all(verrors)))
-                return
-
+    def send_event(self, event_type: str, **kwargs: typing.Any) -> None:
         self.send_event_internal(event_type, **kwargs)
 
-    async def validate_arg(self):
-        verrors = ValidationErrors()
-        try:
-            with contextlib.suppress(json.JSONDecodeError):
-                self.arg = json.loads(self.arg)
-        except TypeError:
-            self.arg = self.ACCEPTS[0].default
+    async def validate_arg(self) -> None:
+        if self.arg is None:
+            data = {}
+        else:
+            try:
+                data = json.loads(self.arg)
+            except ValueError as e:
+                verrors = ValidationErrors()
+                verrors.add("", str(e))
+                raise verrors
 
-        self.arg = clean_and_validate_arg(verrors, self.ACCEPTS[0], self.arg)
-        verrors.check()
+        self.arg = validate_model(self.args, data)
 
-    async def process(self):
+    async def process(self) -> None:
         error = None
+
         try:
             await self.run()
         except Exception as e:
             error = e
             self.middleware.logger.error('EventSource %r run() failed', self.name, exc_info=True)
+
         try:
             await self.on_finish()
         except Exception:
             self.middleware.logger.error('EventSource %r on_finish() failed', self.name, exc_info=True)
 
-        await self.unsubscribe_all(error)
+        # The event source is explicitly cancelled if and only if all subscribers are gone.
+        # There is no need to run `unsubscribe_all` in that case.
+        # Moreover, running `unsubscribe_all` would unsubscribe new subscribers that were added
+        # to the new event source instance while the cancelled event source instance was shutting down.
+        if not self._canceled:
+            await self.unsubscribe_all(error)
 
-    async def run(self):
+    async def run(self) -> None:
         await self.middleware.run_in_thread(self.run_sync)
 
-    def run_sync(self):
+    def run_sync(self) -> None:
         raise NotImplementedError('run_sync() method not implemented')
 
-    async def cancel(self):
+    async def send_initial_state(self, subscriber: 'Subscriber') -> None:
+        pass
+
+    async def cancel(self) -> None:
+        self._canceled = True
         self._cancel.set()
         await self.middleware.run_in_thread(self._cancel_sync.set)
 
-    async def on_finish(self):
+    async def on_finish(self) -> None:
         await self.middleware.run_in_thread(self.on_finish_sync)
 
-    def on_finish_sync(self):
+    def on_finish_sync(self) -> None:
         pass
+
+
+class TypedEventSource[A: 'BaseModel'](EventSource):
+    """EventSource subclass that provides validated args as a typed pydantic model."""
+    args: type[A]
+    typed_arg: A
+
+    async def validate_arg(self) -> None:
+        if self.arg is None:
+            data = {}
+        else:
+            try:
+                data = json.loads(self.arg)
+            except ValueError as e:
+                verrors = ValidationErrors()
+                verrors.add("", str(e))
+                raise verrors
+
+        result = validate_model(self.args, data, dump_models=False)
+        self.typed_arg = result  # type: ignore[assignment]
+        self.arg = result.model_dump()

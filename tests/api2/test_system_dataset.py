@@ -1,79 +1,96 @@
+import errno
+import os
 import pytest
-from pytest_dependency import depends
 
+from middlewared.service_exception import CallError
 from middlewared.test.integration.assets.pool import another_pool
-from middlewared.test.integration.utils import call, mock, pool, ssh
-
-from auto_config import dev_test
-pytestmark = pytest.mark.skipif(dev_test, reason='Skipping for test development testing')
+from middlewared.test.integration.utils import call, pool
 
 
-def read_log():
-    return ssh("cat /var/log/middlewared.log")
+PASSPHRASE = 'passphrase'
 
 
-def write_to_log(string):
-    assert string not in read_log()
-
-    with mock("test.test1", f"""
-        from middlewared.service import lock
-
-        async def mock(self, *args):
-            self.logger.debug({string!r})
-    """):
-        call("test.test1")
-
-    assert string in read_log()
+@pytest.fixture(scope="module")
+def passphrase_encrypted_pool_session():
+    with another_pool({"encryption": True, "encryption_options": {"passphrase": PASSPHRASE}}) as p:
+        yield p["name"]
 
 
-def test_system_dataset_migrate(request):
-    depends(request, ["pool_04"], scope="session")
-
+@pytest.fixture(scope="function")
+def passphrase_encrypted_pool(passphrase_encrypted_pool_session):
     config = call("systemdataset.config")
     assert config["pool"] == pool
-    assert config["syslog"]
 
-    # Make sure that log files are synced to the new location
-    write_to_log("test_system_dataset_migrate step 1")
+    for dataset in call("pool.dataset.query", [["name", "^", f"{passphrase_encrypted_pool_session}/"]]):
+        try:
+            call("pool.dataset.delete", dataset, {"recursive": True})
+        except CallError as e:
+            if e.errno != errno.ENOENT:
+                raise
 
-    call("systemdataset.update", {"pool": "boot-pool"}, job=True)
-    assert "test_system_dataset_migrate step 1" in read_log()
+    # If root dataset is locked, let's unlock it here
+    # It can be locked if some test locks it but does not unlock it later on and we should have
+    # a clean slate whenever we are trying to test using this pool/root dataset
+    if call("pool.dataset.get_instance", passphrase_encrypted_pool_session)["locked"]:
+        call("pool.dataset.unlock", passphrase_encrypted_pool_session, {
+            "datasets": [{"name": passphrase_encrypted_pool_session, "passphrase": PASSPHRASE}],
+        }, job=True)
 
-    write_to_log("test_system_dataset_migrate step 2")
-
-    call("systemdataset.update", {"pool": pool}, job=True)
-    assert "test_system_dataset_migrate step 1" in read_log()
-    assert "test_system_dataset_migrate step 2" in read_log()
+    yield passphrase_encrypted_pool_session
 
 
 @pytest.mark.parametrize("lock", [False, True])
-def test_migrate_to_a_pool_with_passphrase_encrypted_root_dataset(request, lock):
-    depends(request, ["pool_04"], scope="session")
+def test_migrate_to_a_pool_with_passphrase_encrypted_root_dataset(passphrase_encrypted_pool, lock):
+    if lock:
+        call("pool.dataset.lock", passphrase_encrypted_pool, job=True)
 
-    config = call("systemdataset.config")
-    assert config["pool"] == pool
+    assert passphrase_encrypted_pool in call("systemdataset.pool_choices")
 
-    with another_pool({"encryption": True, "encryption_options": {"passphrase": "passphrase"}}):
-        if lock:
-            call("pool.dataset.lock", "test", job=True)
+    call("systemdataset.update", {"pool": passphrase_encrypted_pool}, job=True)
 
-        assert "test" in call("systemdataset.pool_choices")
+    query_args = {
+        "paths": [f"{passphrase_encrypted_pool}/.system"],
+        "properties": ["encryption"]
+    }
+    ds = call("zfs.resource.list", query_args)[0]
+    assert ds["properties"]["encryption"]["value"] == "off"
 
-        call("systemdataset.update", {"pool": "test"}, job=True)
-
-        ds = call("zfs.dataset.get_instance", "test/.system")
-        assert ds["properties"]["encryption"]["value"] == "off"
-
-        call("systemdataset.update", {"pool": pool}, job=True)
+    call("systemdataset.update", {"pool": pool}, job=True)
 
 
-def test_lock_passphrase_encrypted_pool_with_system_dataset(request):
-    depends(request, ["pool_04"], scope="session")
+def test_lock_passphrase_encrypted_pool_with_system_dataset(passphrase_encrypted_pool):
+    call("systemdataset.update", {"pool": passphrase_encrypted_pool}, job=True)
 
-    with another_pool({"encryption": True, "encryption_options": {"passphrase": "passphrase"}}):
-        call("systemdataset.update", {"pool": "test"}, job=True)
+    call("pool.dataset.lock", passphrase_encrypted_pool, job=True)
 
-        call("pool.dataset.lock", "test", job=True)
+    query_args = {
+        "paths": [f"{passphrase_encrypted_pool}/.system"],
+        "properties": ["mounted"]
+    }
+    ds = call("zfs.resource.list", query_args)[0]
+    assert ds["properties"]["mounted"]["raw"] == "yes"
 
-        ds = call("zfs.dataset.get_instance", "test/.system")
-        assert ds["properties"]["mounted"]["value"] == "yes"
+    call("systemdataset.update", {"pool": pool}, job=True)
+
+
+def test_system_dataset_mountpoints():
+    system_config = call("systemdataset.config")
+    for system_dataset_spec in call(
+        "systemdataset.get_system_dataset_spec", system_config["pool"], system_config["uuid"]
+    ):
+        mount_point = system_dataset_spec.get("mountpoint") or os.path.join(
+            system_config["path"], os.path.basename(system_dataset_spec["name"])
+        )
+
+        ds_stats = call("filesystem.stat", mount_point)
+        assert ds_stats["uid"] == system_dataset_spec["chown_config"]["uid"]
+        assert ds_stats["gid"] == system_dataset_spec["chown_config"]["gid"]
+        assert ds_stats["mode"] & 0o777 == system_dataset_spec["chown_config"]["mode"]
+
+
+def test_netdata_post_mount_action():
+    # We rely on this to make sure system dataset post mount actions are working as intended
+    ds_stats = call("filesystem.stat", "/var/db/system/netdata/ix_state")
+    assert ds_stats["uid"] == 999, ds_stats
+    assert ds_stats["gid"] == 997, ds_stats
+    assert ds_stats["mode"] & 0o777 == 0o755, ds_stats

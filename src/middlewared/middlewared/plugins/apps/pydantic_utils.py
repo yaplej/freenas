@@ -1,0 +1,91 @@
+import os
+from typing import Annotated, Any, Literal
+
+from pydantic import (
+    AfterValidator,
+    AnyUrl,
+    BeforeValidator,
+    ConfigDict,
+    GetCoreSchemaHandler,
+    PlainSerializer,
+)
+from pydantic_core import CoreSchema
+
+from middlewared.api.base import BaseModel as PydanticBaseModel
+from middlewared.api.base import IPvAnyAddress as IPvAnyAddress  # noqa: F401,I250
+
+
+class BaseModel(PydanticBaseModel):
+    """
+    Base model that allows extra fields by default and have strict=False because we want maximum compatibility
+    with existing implementation we have where the schema was loose enough to be catered to.
+    """
+    model_config = ConfigDict(
+        extra='allow',
+        strict=False,
+    )
+
+    @classmethod
+    def __get_pydantic_core_schema__(cls, source: Any, handler: GetCoreSchemaHandler) -> CoreSchema:
+        """Opt out of the line break check that `BaseModel` adds to every string.
+
+        A catalog question is not ours to mark `Multiline`, and its value is stored with the installed
+        app, where no migration can repair a line break.
+        """
+        return handler(source)
+
+
+def _validate_absolute_path(value: str) -> str:
+    if value == '':
+        return value
+
+    if not os.path.isabs(value):
+        raise ValueError('Path must be absolute')
+
+    return os.path.normpath(value.rstrip('/'))
+
+
+def _validate_host_path(value: str) -> str:
+    """
+    Validate that a host path exists
+    """
+    if value == '':
+        return value
+
+    if not os.path.exists(value):
+        raise ValueError('Path does not exist')
+
+    return str(value)
+
+
+def create_length_validated_type(
+    base_type: Any, min_length: int | None = None, max_length: int | None = None,
+) -> Any:
+    """Create a type with length validation applied before the base type validation"""
+
+    def validate_length(v: Any) -> Any:
+        if isinstance(v, str):
+            if min_length is not None and len(v) < min_length:
+                raise ValueError(f'Value should have at least {min_length} items')
+            if max_length is not None and len(v) > max_length:
+                raise ValueError(f'Value should have at most {max_length} items')
+        return v
+
+    return Annotated[
+        base_type,
+        BeforeValidator(validate_length),
+    ]
+
+
+AbsolutePath = Annotated[
+    str,
+    AfterValidator(_validate_absolute_path),
+]
+HostPath = Annotated[
+    str,
+    AfterValidator(_validate_host_path),
+]
+URI = Annotated[
+    Literal[''] | AnyUrl,
+    PlainSerializer(lambda x: str(x), return_type=str),
+]

@@ -1,3 +1,5 @@
+from sqlalchemy import text
+
 """Make all primary keys autoincrement
 
 Revision ID: 2fb0f87b2f17
@@ -19,11 +21,11 @@ depends_on = None
 
 def upgrade():
     conn = op.get_bind()
-    op.execute("""
+    op.execute(text("""
         UPDATE directoryservice_idmap_domain SET idmap_domain_certificate_id = NULL WHERE idmap_domain_certificate_id = ''
-    """)  # NAS-111944
-    conn.execute("PRAGMA legacy_alter_table = TRUE")
-    for name, sql in conn.execute("SELECT name, sql FROM sqlite_master WHERE type = 'table'").fetchall():
+    """))  # NAS-111944
+    conn.execute(text("PRAGMA legacy_alter_table = TRUE"))
+    for name, sql in conn.execute(text("SELECT name, sql FROM sqlite_master WHERE type = 'table'")).fetchall():
         if m := re.match(r'CREATE TABLE "(.+)" \((\s*|.+\s)"?id"? integer (NOT NULL |)PRIMARY KEY[,)]', sql, flags=re.IGNORECASE):
             table_name = m.group(1)
             new_sql = m.group(0).replace('PRIMARY KEY', 'PRIMARY KEY AUTOINCREMENT') + sql[len(m.group(0)):]
@@ -36,41 +38,27 @@ def upgrade():
             new_sql = f'CREATE TABLE {table_name} ({m.group(3)}id integer{m.group(4)} PRIMARY KEY AUTOINCREMENT,' + \
                       m.group(5) + sql[len(m.group(0)):]
             new_sql = new_sql.rstrip().rstrip(')').rstrip().rstrip(',') + '\n)'
-        elif re.match(r'CREATE TABLE "(.+)" \("id" integer (NOT NULL |)PRIMARY KEY AUTOINCREMENT,', sql):
-            continue
-        elif re.match(r'CREATE TABLE (.+) \(\s+id integer NOT NULL PRIMARY KEY AUTOINCREMENT,', sql):
-            # saw this on 12.0-U8 core machine upgrading to scale
-            """
-            CREATE TABLE account_bsdgroupmembership (
-                    id integer NOT NULL PRIMARY KEY AUTOINCREMENT,
-            """
-            continue
         else:
-            assert sql.startswith((
-                'CREATE TABLE sqlite_sequence',
-                'CREATE TABLE alembic_version',
-                'CREATE TABLE "storage_disk"',
-            )), sql
             continue
 
         index_sqls = []
-        for index_sql, in conn.execute("""
+        for index_sql, in conn.execute(text("""
             SELECT sql
             FROM sqlite_master
-            WHERE type = 'index' AND tbl_name = ?
-        """, (table_name,)).fetchall():
+            WHERE type = 'index' AND tbl_name = :tbl_name
+        """), {"tbl_name": table_name}).fetchall():
             if index_sql is not None:
                 index_sqls.append(index_sql)
 
         params = {"table": f'"{name}"', "table_old": f'"{name}__old"'}
-        conn.execute("ALTER TABLE %(table)s RENAME TO %(table_old)s" % params)
-        conn.execute(new_sql)
-        conn.execute("INSERT INTO %(table)s SELECT * FROM %(table_old)s" % params)
-        conn.execute("DROP TABLE %(table_old)s" % params)
+        conn.execute(text(f"ALTER TABLE {params['table']} RENAME TO {params['table_old']}"))
+        conn.execute(text(new_sql))
+        conn.execute(text(f"INSERT INTO {params['table']} SELECT * FROM {params['table_old']}"))
+        conn.execute(text(f"DROP TABLE {params['table_old']}"))
         for index_sql in index_sqls:
-            conn.execute(index_sql)
+            conn.execute(text(index_sql))
 
-    conn.execute("PRAGMA legacy_alter_table = FALSE")
+    conn.execute(text("PRAGMA legacy_alter_table = FALSE"))
 
 
 def downgrade():

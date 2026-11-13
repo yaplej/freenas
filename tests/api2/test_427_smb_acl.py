@@ -1,32 +1,34 @@
 #!/usr/bin/env python3
 
-import urllib.parse
-import contextlib
+import errno
 import pytest
 import sys
 import os
+import secrets
+import string
 import subprocess
 apifolder = os.getcwd()
 sys.path.append(apifolder)
-from functions import POST, GET, DELETE, SSH_TEST, wait_on_job
 from auto_config import (
-    ip,
-    dev_test,
     pool_name,
-    password,
-    user,
 )
-from protocols import SMB
+from middlewared.service_exception import ValidationError, ValidationErrors
+from middlewared.test.integration.assets.account import user
+from middlewared.test.integration.assets.smb import smb_share
+from middlewared.test.integration.assets.pool import dataset
+from middlewared.test.integration.utils import call
+from middlewared.test.integration.utils.client import truenas_server
+from middlewared.test.integration.utils.smb import security, smb_connection
+from middlewared.test.integration.utils.unittest import RegexString
 from pytest_dependency import depends
 from time import sleep
 from utils import create_dataset
 
-reason = 'Skipping for test development testing'
-# comment pytestmark for development testing with --dev-test
-pytestmark = pytest.mark.skipif(dev_test, reason=reason)
 
 SMB_USER = "smbacluser"
-SMB_PWD = "smb1234"
+SMB_PWD = ''.join(secrets.choice(string.ascii_letters + string.digits) for i in range(10))
+TEST_DATA = {}
+OWNER_RIGHTS_SID = 'S-1-3-4'
 
 
 permset = {
@@ -55,36 +57,14 @@ flagset = {
 }
 
 
-@contextlib.contextmanager
-def smb_share(path, options=None):
-    results = POST("/sharing/smb/", {
-        "path": path,
-        **(options or {}),
-    })
-    assert results.status_code == 200, results.text
-    id = results.json()["id"]
-
-    try:
-        yield id
-    finally:
-        result = DELETE(f"/sharing/smb/id/{id}/")
-        assert result.status_code == 200, result.text
-
-    assert results.status_code == 200, results.text
-    global next_uid
-    next_uid = results.json()
-
-
 def get_windows_sd(share, format="LOCAL"):
-    results = POST("/smb/get_remote_acl", {
+    return call("smb.get_remote_acl", {
         "server": "127.0.0.1",
         "share": share,
         "username": SMB_USER,
         "password": SMB_PWD,
         "options": {"output_format": format}
-    })
-    assert results.status_code == 200, results.text
-    return results.json()['acl_data']
+    })['acl_data']
 
 
 def iter_permset(path, share, local_acl):
@@ -92,10 +72,7 @@ def iter_permset(path, share, local_acl):
     assert smbacl['acl'][0]['perms'] == permset
     for perm in permset.keys():
         permset[perm] = True
-        result = POST("/filesystem/setacl/", {'path': path, "dacl": local_acl})
-        assert result.status_code == 200, result.text
-        job_status = wait_on_job(result.json(), 180)
-        assert job_status["state"] == "SUCCESS", str(job_status["results"])
+        call('filesystem.setacl', {'path': path, "dacl": local_acl, 'options': {'validate_effective_acl': False}}, job=True)
         smbacl = get_windows_sd(share)
         for ace in smbacl["acl"]:
             if ace["id"] != 666:
@@ -110,10 +87,7 @@ def iter_flagset(path, share, local_acl):
     for flag in flagset.keys():
         # we automatically canonicalize entries and so INHERITED shifts to end of list
         flagset[flag] = True
-        result = POST("/filesystem/setacl/", {'path': path, "dacl": local_acl})
-        assert result.status_code == 200, result.text
-        job_status = wait_on_job(result.json(), 180)
-        assert job_status["state"] == "SUCCESS", str(job_status["results"])
+        call('filesystem.setacl', {'path': path, "dacl": local_acl, 'options': {'validate_effective_acl': False}}, job=True)
         smbacl = get_windows_sd(share)
         for ace in smbacl["acl"]:
             if ace["id"] != 666:
@@ -122,37 +96,31 @@ def iter_flagset(path, share, local_acl):
             assert ace["flags"] == flagset, f'{flag}: {str(ace)}'
 
 
+@pytest.fixture(scope='module')
+def initialize_for_smb_tests(request):
+    ba = call(
+        'group.query',
+        [['name', '=', 'builtin_administrators']],
+        {'get': True}
+    )
+    with user({
+        'username': SMB_USER,
+        'full_name': SMB_USER,
+        'group_create': True,
+        'smb': True,
+        'groups': [ba['id']],
+        'password': SMB_PWD
+    }) as u:
+        try:
+            call('service.control', 'START', 'cifs', job=True)
+            yield {'user': u}
+        finally:
+            call('service.control', 'STOP', 'cifs', job=True)
+
+
 @pytest.mark.dependency(name="SMB_SERVICE_STARTED")
-def test_001_start_smb_service(request):
-    payload = {"service": "cifs"}
-    results = POST("/service/start/", payload)
-    assert results.status_code == 200, results.text
-
-    results = GET("/service?service=cifs")
-    assert results.json()[0]["state"] == "RUNNING", results.text
-
-
-@pytest.mark.dependency(name="SMB_USER_CREATED")
-def test_002_creating_shareuser_to_test_acls(request):
-    depends(request, ["SMB_SERVICE_STARTED"])
-    results = GET('/user/get_next_uid/')
-    assert results.status_code == 200, results.text
-    global new_id
-    new_id = results.json()
-    groupinfo = GET('/group?group=builtin_administrators').json()[0]
-
-    global smbuser_id
-    payload = {
-        "username": SMB_USER,
-        "full_name": "SMB User",
-        "group_create": True,
-        "groups": [groupinfo["id"]],
-        "password": SMB_PWD,
-        "uid": new_id,
-    }
-    results = POST("/user/", payload)
-    assert results.status_code == 200, results.text
-    smbuser_id = results.json()
+def test_001_initialize_for_tests(initialize_for_smb_tests):
+    TEST_DATA.update(initialize_for_smb_tests)
 
 
 def test_003_test_perms(request):
@@ -163,28 +131,20 @@ def test_003_test_perms(request):
     correct NT ACL bit gets toggled when viewed through SMB
     protocol.
     """
-    depends(request, ["SMB_SERVICE_STARTED", "pool_04"], scope="session")
+    depends(request, ["SMB_SERVICE_STARTED"], scope="session")
 
-    ds = 'nfs4acl_perms_smb'
-    path = f'/mnt/{pool_name}/{ds}'
-    with create_dataset(f'{pool_name}/{ds}', {'share_type': 'SMB'}):
-        with smb_share(path, {"name": "PERMS"}):
-            result = POST('/filesystem/getacl/', {'path': path, 'simplified': False})
-            assert result.status_code == 200, result.text
-            the_acl = result.json()['acl']
-            new_entry = {
+    with dataset('nfs4acl_perms_smb', {'share_type': 'SMB'}) as ds:
+        path = os.path.join('/mnt', ds)
+        with smb_share(path, "PERMS"):
+            the_acl = call('filesystem.getacl', path, False)['acl']
+            the_acl.insert(0, {
                 'perms': permset,
                 'flags': flagset,
                 'id': 666,
                 'type': 'ALLOW',
                 'tag': 'USER'
-            }
-
-            the_acl.insert(0, new_entry)
-            result = POST("/filesystem/setacl/", {'path': path, "dacl": the_acl})
-            assert result.status_code == 200, result.text
-            job_status = wait_on_job(result.json(), 180)
-            assert job_status["state"] == "SUCCESS", str(job_status["results"])
+            })
+            call('filesystem.setacl', {'path': path, "dacl": the_acl, 'options': {'validate_effective_acl': False}}, job=True)
             iter_permset(path, "PERMS", the_acl)
 
 
@@ -196,28 +156,20 @@ def test_004_test_flags(request):
     correct NT ACL bit gets toggled when viewed through SMB
     protocol.
     """
-    depends(request, ["SMB_SERVICE_STARTED", "pool_04"], scope="session")
+    depends(request, ["SMB_SERVICE_STARTED"], scope="session")
 
-    ds = 'nfs4acl_flags_smb'
-    path = f'/mnt/{pool_name}/{ds}'
-    with create_dataset(f'{pool_name}/{ds}', {'share_type': 'SMB'}):
-        with smb_share(path, {"name": "FLAGS"}):
-            result = POST('/filesystem/getacl/', {'path': path, 'simplified': False})
-            assert result.status_code == 200, result.text
-            the_acl = result.json()['acl']
-            new_entry = {
+    with dataset('nfs4acl_flags_smb', {'share_type': 'SMB'}) as ds:
+        path = os.path.join('/mnt', ds)
+        with smb_share(path, "FLAGS"):
+            the_acl = call('filesystem.getacl', path, False)['acl']
+            the_acl.insert(0, {
                 'perms': permset,
                 'flags': flagset,
                 'id': 666,
                 'type': 'ALLOW',
                 'tag': 'USER'
-            }
-
-            the_acl.insert(0, new_entry)
-            result = POST("/filesystem/setacl/", {'path': path, "dacl": the_acl})
-            assert result.status_code == 200, result.text
-            job_status = wait_on_job(result.json(), 180)
-            assert job_status["state"] == "SUCCESS", str(job_status["results"])
+            })
+            call('filesystem.setacl', {'path': path, "dacl": the_acl, 'options': {'validate_effective_acl': False}}, job=True)
             iter_flagset(path, "FLAGS", the_acl)
 
 
@@ -228,12 +180,13 @@ def test_005_test_map_modify(request):
     grants an access mask equaivalent to MODIFY or FULL depending on whether it's
     the file owner or group / other.
     """
-    depends(request, ["SMB_SERVICE_STARTED", "pool_04"], scope="session")
+    depends(request, ["SMB_SERVICE_STARTED"], scope="session")
 
     ds = 'nfs4acl_map_modify'
     path = f'/mnt/{pool_name}/{ds}'
-    with create_dataset(f'{pool_name}/{ds}', {'acltype': 'NFSV4', 'aclmode': 'PASSTHROUGH'}, None, 777):
-        with smb_share(path, {"name": "MAP_MODIFY"}):
+    with create_dataset(f'{pool_name}/{ds}', {'acltype': 'NFSV4', 'aclmode': 'PASSTHROUGH'}, None, '777'):
+        with smb_share(path, "MAP_MODIFY"):
+            sleep(5)
             sd = get_windows_sd("MAP_MODIFY", "SMB")
             dacl = sd['dacl']
             assert dacl[0]['access_mask']['standard'] == 'FULL', str(dacl[0])
@@ -244,10 +197,11 @@ def test_005_test_map_modify(request):
 
 
 def test_006_test_preserve_dynamic_id_mapping(request):
-    depends(request, ["SMB_SERVICE_STARTED", "pool_04"], scope="session")
-    def _find_owner_rights(acl):
+    depends(request, ["SMB_SERVICE_STARTED"], scope="session")
+
+    def _find_owner_rights(acl, owner_rights_id):
         for entry in acl:
-            if 'owner rights' in entry['who']:
+            if entry['id'] == owner_rights_id:
                 return True
 
         return False
@@ -255,13 +209,13 @@ def test_006_test_preserve_dynamic_id_mapping(request):
     ds = 'nfs4acl_dynmamic_user'
     path = f'/mnt/{pool_name}/{ds}'
     with create_dataset(f'{pool_name}/{ds}', {'share_type': 'SMB'}):
-        with smb_share(path, {"name": "DYNAMIC"}):
+        with smb_share(path, "DYNAMIC"):
             # add an ACL entry that forces generation
             # of a dynamic idmap entry
             sleep(5)
             cmd = [
                 'smbcacls',
-                f'//{ip}/DYNAMIC',
+                f'//{truenas_server.ip}/DYNAMIC',
                 '\\',
                 '-a', r'ACL:S-1-3-4:ALLOWED/0x0/FULL',
                 '-d', '0',
@@ -270,51 +224,76 @@ def test_006_test_preserve_dynamic_id_mapping(request):
             res = subprocess.run(cmd, capture_output=True)
             assert res.returncode == 0, res.stderr.decode() or res.stdout.decode()
 
+            # Since winbindd is by default not in nsswitch when we're standalone
+            # the GID won't resolve to name
+            res = call('idmap.convert_sids', [OWNER_RIGHTS_SID])
+            assert OWNER_RIGHTS_SID in res['mapped']
+            assert res['mapped'][OWNER_RIGHTS_SID]['id_type'] == 'GROUP'
+            assert res['mapped'][OWNER_RIGHTS_SID]['name'].endswith('Owner Rights')
+            owner_rights_id = res['mapped'][OWNER_RIGHTS_SID]['id']
+
             # verify "owner rights" entry is present
-            result = POST('/filesystem/getacl/', {'path': path, 'simplified': False, 'resolve_ids': True})
-            assert result.status_code == 200, result.text
-            the_acl = result.json()['acl']
-            has_owner_rights = _find_owner_rights(the_acl)
+            # verify "owner rights" entry is still present
+            the_acl = call('filesystem.getacl', path, False, True)['acl']
+            has_owner_rights = _find_owner_rights(the_acl, owner_rights_id)
             assert has_owner_rights is True, str(the_acl)
 
             # force re-sync of group mapping database (and winbindd_idmap.tdb)
-            res = SSH_TEST('midclt call smb.synchronize_group_mappings -job', user, password, ip)
-            assert res['result'] is True, res['stderr'] or res['output']
+            call('smb.synchronize_group_mappings', job=True)
 
             # verify "owner rights" entry is still present
-            assert res['result'] is True, res['error']
-            result = POST('/filesystem/getacl/', {'path': path, 'simplified': False, 'resolve_ids': True})
-            assert result.status_code == 200, result.text
-            the_acl = result.json()['acl']
-            has_owner_rights = _find_owner_rights(the_acl)
+            the_acl = call('filesystem.getacl', path, False, True)['acl']
+            has_owner_rights = _find_owner_rights(the_acl, owner_rights_id)
             assert has_owner_rights is True, str(the_acl)
 
 
 def test_007_test_disable_autoinherit(request):
-    depends(request, ["SMB_SERVICE_STARTED", "pool_04"], scope="session")
+    depends(request, ["SMB_SERVICE_STARTED"], scope="session")
     ds = 'nfs4acl_disable_inherit'
     path = f'/mnt/{pool_name}/{ds}'
     with create_dataset(f'{pool_name}/{ds}', {'share_type': 'SMB'}):
-        with smb_share(path, {'name': 'NFS4_INHERIT'}):
-            c = SMB()
-            c.connect(host=ip, share='NFS4_INHERIT', username=SMB_USER, password=SMB_PWD, smb1=False)
-            c.mkdir('foo')
-            sd = c.get_sd('foo')
-            assert 'SEC_DESC_DACL_PROTECTED' not in sd['control']['parsed'], str(sd)
-            c.inherit_acl('foo', 'COPY')
-            sd = c.get_sd('foo')
-            assert 'SEC_DESC_DACL_PROTECTED' in sd['control']['parsed'], str(sd)
-            c.disconnect()
+        with smb_share(path, 'NFS4_INHERIT'):
+            with smb_connection(
+                share='NFS4_INHERIT',
+                username=SMB_USER,
+                password=SMB_PWD
+            ) as c:
+                c.mkdir('foo')
+                fh = c.create_file('foo', 'r')
+                sd = c.get_sd(fh, security.SECINFO_DACL)
+                c.close(fh)
+                assert sd.type & security.SEC_DESC_DACL_PROTECTED == 0, sd.as_sddl()
+                c.inherit_acl('foo', 'COPY')
+                fh = c.create_file('foo', 'r')
+                sd = c.get_sd(fh, security.SECINFO_DACL)
+                assert sd.type & security.SEC_DESC_DACL_PROTECTED, sd.as_sddl()
 
 
-def test_099_delete_smb_user(request):
-    depends(request, ["SMB_USER_CREATED"])
-    results = DELETE(f"/user/id/{smbuser_id}/", {"delete_group": True})
-    assert results.status_code == 200, results.text
+def test_008_test_prevent_smb_dataset_update(request):
+    """
+    Prevent changing acltype and xattr on dataset hosting SMB shares
+    """
+    ds_name = 'prevent_changes'
+    path = f'/mnt/{pool_name}/{ds_name}'
+    with create_dataset(f'{pool_name}/{ds_name}') as ds:
+        with smb_share(path, 'SMB_SHARE_1'):
+            # Create a second share for testing purposes
+            with smb_share(path, 'SMB_SHARE_2'):
 
+                # Confirm we ignore requests that don't involve changes
+                for setting in [{"acltype": "POSIX"}]:
+                    call('pool.dataset.update', ds, setting)
 
-def test_100_stop_smb_service(request):
-    depends(request, ["SMB_SERVICE_STARTED"])
-    payload = {"service": "cifs"}
-    results = POST("/service/stop/", payload)
-    assert results.status_code == 200, results.text
+                # Confirm we block requests that involve changes
+                for setting in [{"acltype": "OFF"}]:
+                    attrib = list(setting.keys())[0]
+                    with pytest.raises(ValidationErrors) as ve:
+                        call('pool.dataset.update', ds, setting)
+                    assert ve.value.errors == [
+                        ValidationError(
+                            f"pool_dataset_update.{attrib}",
+                            RegexString("This dataset is hosting SMB shares. .*"),
+                            errno.EINVAL,
+                        )
+                    ]
+                    assert "SMB_SHARE_2" in str(ve.value.errors[0]), ve.value.errors[0]

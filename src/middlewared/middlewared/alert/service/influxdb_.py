@@ -1,28 +1,22 @@
+from __future__ import annotations
+
+from typing import Any
+
 from influxdb import InfluxDBClient
 
-from middlewared.alert.base import ThreadedAlertService
-from middlewared.schema import Dict, Str
+from middlewared.alert.base import Alert, ThreadedAlertService
+from middlewared.api.current import InfluxDBServiceModel
 
 
-class InfluxDBAlertService(ThreadedAlertService):
+class InfluxDBAlertService(ThreadedAlertService[InfluxDBServiceModel]):
     title = "InfluxDB"
 
-    schema = Dict(
-        "influxdb_attributes",
-        Str("host", required=True, empty=False),
-        Str("username", required=True, empty=False),
-        Str("password", required=True, empty=False),
-        Str("database", required=True, empty=False),
-        Str("series_name", required=True, empty=False),
-        strict=True,
-    )
-
-    def send_sync(self, alerts, gone_alerts, new_alerts):
-        client = InfluxDBClient(self.attributes["host"], 8086, self.attributes["username"], self.attributes["password"],
-                                self.attributes["database"])
+    def send_sync(self, alerts: list[Alert[Any]], gone_alerts: list[Alert[Any]], new_alerts: list[Alert[Any]]) -> None:
+        client = InfluxDBClient(self.attributes.host, 8086, self.attributes.username,
+                                self.attributes.password.get_secret_value(), self.attributes.database)
         client.write_points([
             {
-                "measurement": self.attributes["series_name"],
+                "measurement": self.attributes.series_name,
                 "tags": {},
                 "time": alert.datetime.isoformat(),
                 "fields": {

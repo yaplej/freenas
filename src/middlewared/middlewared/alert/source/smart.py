@@ -1,29 +1,268 @@
-from middlewared.alert.base import AlertClass, OneShotAlertClass, AlertCategory, AlertLevel, Alert
+# Copyright (c) - iXsystems Inc. dba TrueNAS
+#
+# Licensed under the terms of the TrueNAS Enterprise License Agreement
+# See the file LICENSE.IX for complete terms and conditions
+
+from dataclasses import dataclass
+from datetime import timedelta
+from typing import Any
+
+from middlewared.alert.base import (
+    Alert,
+    AlertCategory,
+    AlertClass,
+    AlertClassConfig,
+    AlertLevel,
+    ThreadedAlertSource,
+)
+from middlewared.alert.schedule import IntervalSchedule
 
 
-class SMARTAlertClass(AlertClass, OneShotAlertClass):
-    category = AlertCategory.HARDWARE
-    level = AlertLevel.CRITICAL
-    title = "S.M.A.R.T. Error"
-    text = "%(message)s."
+@dataclass(slots=True, kw_only=True)
+class SmartInfo:
+    uncorrected_errors: int = 0
+    smart_testfail: bool = False
+    spare_block_reserve: int | None = None
+    erase_count: int | None = None
+    unknown_device: bool = False
 
-    proactive_support = True
 
-    deleted_automatically = False
+@dataclass(kw_only=True)
+class SMARTUncorrectedErrorsAlert(AlertClass):
+    config = AlertClassConfig(
+        category=AlertCategory.HARDWARE,
+        level=AlertLevel.WARNING,
+        title="Uncorrected Errors Detected",
+        text="%(ue)d uncorrectable errors reported for %(name)s (%(serial)s).",
+    )
 
-    async def create(self, args):
-        if not args["device"].startswith("/dev/"):
-            args["device"] = f"/dev/{args['device']}"
+    ue: int
+    name: str
+    serial: str
 
-        return Alert(SMARTAlertClass, args)
 
-    async def delete(self, alerts, query):
-        device = query
+@dataclass(kw_only=True)
+class SMARTFailedSelfTestAlert(AlertClass):
+    config = AlertClassConfig(
+        category=AlertCategory.HARDWARE,
+        level=AlertLevel.WARNING,
+        title="Failed Selftest",
+        text="%(name)s (%(serial)s) failed a SMART selftest.",
+    )
 
-        if not device.startswith("/dev/"):
-            device = f"/dev/{device}"
+    name: str
+    serial: str
 
-        return list(filter(
-            lambda alert: alert.args["device"] != device,
-            alerts
-        ))
+
+@dataclass(kw_only=True)
+class SMARTSpareBlockCountAlert(AlertClass):
+    config = AlertClassConfig(
+        category=AlertCategory.HARDWARE,
+        level=AlertLevel.CRITICAL,
+        title="Low Spare Block Reserve",
+        text="%(name)s (%(serial)s) is reporting a low spare block reserve (%(sb)d) .",
+    )
+
+    name: str
+    serial: str
+    sb: int
+
+
+@dataclass(kw_only=True)
+class SMARTEraseCycleCountAlert(AlertClass):
+    config = AlertClassConfig(
+        category=AlertCategory.HARDWARE,
+        level=AlertLevel.WARNING,
+        title="High Erase Cycle Count",
+        text="%(name)s (%(serial)s) has a high erase cycle count (%(ec)d) (raw (%(ec_raw)d).",
+    )
+
+    name: str
+    serial: str
+    ec: int
+    ec_raw: int
+
+
+class SMARTAlertSource(ThreadedAlertSource):
+    run_on_backup_node = False
+    schedule = IntervalSchedule(timedelta(minutes=90))
+
+    def parse_ata_smart_info(self, data: dict[str, Any]) -> SmartInfo:
+        ue, test_failed, sbr, ec = 0, False, 0, 0
+        for attr in data.get("ata_smart_attributes", {}).get("table", []):
+            if attr["id"] == 187:
+                ue = attr["raw"]["value"]
+            elif attr["id"] == 170:
+                sbr = attr["value"]
+            elif attr["id"] == 173:
+                ec = attr["raw"]["value"]
+
+        # NAS-141215: smartctl nests the self-test log under "extended" (GP Log 0x07)
+        # or "standard" (legacy SMART log), never as a direct child of
+        # ata_smart_self_test_log. Under `smartctl -x` (what we run) these are mutually
+        # exclusive: "extended" is emitted when the drive supports GP logging, otherwise
+        # smartctl's retry_selftest_log fallback emits "standard" instead. Prefer
+        # "extended" and fall back to "standard" to mirror smartctl itself
+        # (smartmontools 7.4 ataprint.cpp:4280-4332).
+        stl = data.get("ata_smart_self_test_log", {})
+        log = stl.get("extended", {})
+        if not log:
+            log = stl.get("standard", {})
+
+        if ata_tests := log.get("table", []):
+            # NAS-140419: smartctl writes table[] newest-first (see ataPrintSmartSelfTestlog
+            # in smartmontools/ataprint.cpp), so [0] is the most recent test.
+            # NAS-141951: smartctl omits "passed" entirely when the test result is
+            # unknown -- status nibble 0x1 (aborted by host), 0x2 (interrupted by
+            # host reset) or 0x3 (fatal/unknown error); see "aborted -> unknown" in
+            # ataPrintSmartSelfTestEntry (smartmontools 7.4 ataprint.cpp:2654-2657).
+            # Only an explicit false means the drive recorded a failed self-test.
+            test_failed = ata_tests[0]["status"].get("passed") is False
+
+        return SmartInfo(
+            uncorrected_errors=ue,
+            smart_testfail=test_failed,
+            spare_block_reserve=sbr,
+            erase_count=ec,
+        )
+
+    def parse_scsi_smart_info(self, data: dict[str, Any]) -> SmartInfo:
+        uncorrected: int = 0
+        test_failed: bool = False
+        pkey, errkey = "scsi_error_counter_log", "total_uncorrected_errors"
+        uncorrected += data.get(pkey, {}).get("read", {errkey: 0})[errkey]
+        uncorrected += data.get(pkey, {}).get("write", {errkey: 0})[errkey]
+        uncorrected += data.get(pkey, {}).get("verify", {errkey: 0})[errkey]
+        test_prefix = "scsi_self_test_"
+        failed_tests, last_failed_idx = list(), -1
+        for idx in range(0, 21):  # 20 tests maximum are returned
+            try:
+                if data[f"{test_prefix}{idx}"]["result"]["value"] in (3, 4, 5, 6, 7):
+                    # T10/1416-D (SPC-3) Rev. 23, section 7.2.10
+                    failed_tests.append(idx)
+                    last_failed_idx = idx
+            except KeyError:
+                continue
+
+        # if a smart test failed and it was the latest
+        # one that failed, raise an alert
+        test_failed = bool(failed_tests and max(failed_tests) == last_failed_idx)
+
+        return SmartInfo(
+            uncorrected_errors=uncorrected,
+            smart_testfail=test_failed,
+        )
+
+    def parse_nvme_smart_info(self, data: dict[str, Any]) -> SmartInfo:
+        # Per NVMe spec, self-test log entries are ordered newest-first, so
+        # index 0 is the most recent test. smartctl writes each kept entry at
+        # its hardware index, so the JSON table may be sparse (null gaps) when
+        # firmware leaves stale bytes in unused ring-buffer slots; skip nulls
+        # and take the first real entry rather than relying on position -1.
+        table = data.get("nvme_self_test_log", {}).get("table", [])
+        latest = next((e for e in table if e), None)
+        if latest is None:
+            return SmartInfo()
+        return SmartInfo(
+            smart_testfail=latest["self_test_result"]["value"] in (5, 6, 7),
+        )
+
+    def parse_smart_info(self, data: dict[str, Any]) -> SmartInfo:
+        proto = data.get("device", {}).get("protocol")
+        if not proto:
+            return SmartInfo(unknown_device=True)
+
+        match proto:
+            case "ATA":
+                return self.parse_ata_smart_info(data)
+            case "SCSI":
+                return self.parse_scsi_smart_info(data)
+            case "NVMe":
+                return self.parse_nvme_smart_info(data)
+            case _:
+                return SmartInfo(unknown_device=True)
+
+    def micron_phison_check(self, sijson: dict[str, Any], si: SmartInfo) -> list[Alert[Any]]:
+        alerts: list[Alert[Any]] = list()
+
+        model = sijson.get("model_name", "")
+        is_micron = model.startswith("Micron_5210")
+        is_phison = model.startswith("QSP")
+        if not any((is_micron, is_phison)):
+            return alerts
+
+        if si.spare_block_reserve is not None and si.spare_block_reserve <= 90:
+            # Rule: Trigger critical alert when the Spare Block Reserve
+            # (a.k.a. “Bad Block Count” on Phison / “Reserved Block Count” on Micron)
+            # falls below 90% of its initial value.
+            alerts.append(
+                Alert(SMARTSpareBlockCountAlert(
+                    name=sijson["device"]["name"],
+                    serial=sijson["serial_number"],
+                    sb=si.spare_block_reserve,
+                ))
+            )
+
+        if si.erase_count is not None:
+            ec = 0
+            if is_micron:
+                # Micron calls it "Average Block-Erase Count"
+                # and we can parse the value as-is.
+                ec = si.erase_count
+            else:
+                # Phison calls it "Erase Count" and we must
+                # pack the value to 6 bytes and pull out
+                # bytes 2 and 3 according to OEM.
+                ec_bytes = si.erase_count.to_bytes(6, byteorder="little")
+                ec = ec_bytes[2] | (ec_bytes[3] << 8)
+
+            if ec > 3000:
+                # Rule: Trigger warning alert when the
+                # Block Erase Count has a Raw Value > 3000.
+                alerts.append(
+                    Alert(SMARTEraseCycleCountAlert(
+                        name=sijson["device"]["name"],
+                        serial=sijson["serial_number"],
+                        ec=ec,
+                        ec_raw=si.erase_count,
+                    ))
+                )
+
+        return alerts
+
+    def check_sync(self) -> list[Alert[Any]]:
+        alerts: list[Alert[Any]] = list()
+        is_ha_capable = self.middleware.call_sync("system.is_ha_capable")
+        for disk in self.middleware.call_sync("disk.get_disks"):
+            if "pmem" in disk.name:
+                continue
+
+            try:
+                sijson = disk.smartctl_info(return_json=True, raise_alert=False)
+                parsed = self.parse_smart_info(sijson)
+                if parsed.unknown_device:
+                    # empty SD card readers, USB bridges, etc
+                    continue
+
+                if parsed.uncorrected_errors:
+                    alerts.append(
+                        Alert(SMARTUncorrectedErrorsAlert(
+                            ue=parsed.uncorrected_errors,
+                            name=disk.name,
+                            serial=disk.serial,
+                        ))
+                    )
+                if parsed.smart_testfail:
+                    alerts.append(
+                        Alert(SMARTFailedSelfTestAlert(
+                            name=disk.name,
+                            serial=disk.serial,
+                        ))
+                    )
+
+                if is_ha_capable and sijson.get("model_name"):
+                    alerts.extend(self.micron_phison_check(sijson, parsed))
+            except Exception:
+                self.middleware.logger.exception("Unexpected failure parsing SMART info")
+                continue
+        return alerts

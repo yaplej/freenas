@@ -1,0 +1,306 @@
+from base64 import b64decode, b64encode
+import enum
+import json
+import os
+import struct
+import subprocess
+
+from middlewared.plugins.smb_.constants import SMBPath
+from middlewared.service import Service
+from middlewared.service_exception import CallError, MatchNotFound
+from middlewared.utils.directoryservices.ipa_constants import IPA_SMB_CRED_VERSION
+from middlewared.utils.filter_list import filter_list
+from middlewared.utils.sid import raw_sid_to_str
+from middlewared.utils.tdb import (
+    TDBDataType,
+    TDBOptions,
+    TDBPathType,
+    get_tdb_handle,
+)
+
+SECRETS_FILE = os.path.join(SMBPath.PRIVATEDIR.path, 'secrets.tdb')
+SECRETS_TDB_OPTIONS = TDBOptions(TDBPathType.CUSTOM, TDBDataType.BYTES)
+SECRETS_TDB_CONFIG = (SECRETS_FILE, SECRETS_TDB_OPTIONS)
+
+# TrueNAS-private secrets.tdb key (namespaced away from samba's SECRETS/* keys) recording
+# the version of the IPA SMB machine-account credential last written for a domain.
+IPA_SMB_CRED_VERSION_KEY = 'TRUENAS/IPA_SMB_CRED_VERSION'
+
+
+# c.f. source3/include/secrets.h
+class Secrets(enum.Enum):
+    MACHINE_ACCT_PASS = 'SECRETS/$MACHINE.ACC'
+    MACHINE_PASSWORD = 'SECRETS/MACHINE_PASSWORD'
+    MACHINE_PASSWORD_PREV = 'SECRETS/MACHINE_PASSWORD.PREV'
+    MACHINE_LAST_CHANGE_TIME = 'SECRETS/MACHINE_LAST_CHANGE_TIME'
+    MACHINE_SEC_CHANNEL_TYPE = 'SECRETS/MACHINE_SEC_CHANNEL_TYPE'
+    MACHINE_TRUST_ACCOUNT_NAME = 'SECRETS/SECRETS_MACHINE_TRUST_ACCOUNT_NAME'
+    MACHINE_DOMAIN_INFO = 'SECRETS/MACHINE_DOMAIN_INFO'
+    DOMTRUST_ACCT_PASS = 'SECRETS/$DOMTRUST.ACC'
+    SALTING_PRINCIPAL = 'SECRETS/SALTING_PRINCIPAL'
+    DOMAIN_SID = 'SECRETS/SID'
+    SAM_SID = 'SAM/SID'
+    PROTECT_IDS = 'SECRETS/PROTECT/IDS'
+    DOMAIN_GUID = 'SECRETS/DOMGUID'
+    SERVER_GUID = 'SECRETS/GUID'
+    LDAP_BIND_PW = 'SECRETS/LDAP_BIND_PW'
+    LDAP_IDMAP_SECRET = 'SECRETS/GENERIC/IDMAP_LDAP'
+    LOCAL_SCHANNEL_KEY = 'SECRETS/LOCAL_SCHANNEL_KEY'
+    AUTH_USER = 'SECRETS/AUTH_USER'
+    AUTH_DOMAIN = 'SECRETS/AUTH_DOMAIN'
+    AUTH_PASSWORD = 'SECRETS/AUTH_PASSWORD'
+
+
+def fetch_secrets_entry(key: str) -> str:
+    with get_tdb_handle(*SECRETS_TDB_CONFIG) as hdl:
+        return hdl.get(key)
+
+
+def store_secrets_entry(key: str, val: str) -> str:
+    with get_tdb_handle(*SECRETS_TDB_CONFIG) as hdl:
+        return hdl.store(key, val)
+
+
+def query_secrets_entries(filters: list, options: dict) -> list:
+    with get_tdb_handle(*SECRETS_TDB_CONFIG) as hdl:
+        return filter_list(hdl.entries(), filters, options)
+
+
+def delete_machine_account_secrets(workgroup: str, realm: str | None) -> None:
+    """ Surgical delete of the AD/IPA bind keys for ``workgroup`` (and ``realm`` if
+    provided). Mirrors samba's ``secrets_delete_machine_password_ex``: removes the
+    machine-account password / sec channel / domain SID / domain GUID / DES salt
+    entries while leaving local-only keys intact (``SAM/SID``,
+    ``SECRETS/SID/{netbios}``, ``SECRETS/GUID``, ``SECRETS/LOCAL_SCHANNEL_KEY``,
+    ``SECRETS/LDAP_BIND_PW``). Idempotent -- missing keys are ignored. """
+    wg = workgroup.upper()
+    keys = [
+        f'{Secrets.MACHINE_ACCT_PASS.value}/{wg}',
+        f'{Secrets.MACHINE_PASSWORD.value}/{wg}',
+        f'{Secrets.MACHINE_PASSWORD_PREV.value}/{wg}',
+        f'{Secrets.MACHINE_LAST_CHANGE_TIME.value}/{wg}',
+        f'{Secrets.MACHINE_SEC_CHANNEL_TYPE.value}/{wg}',
+        f'{Secrets.MACHINE_TRUST_ACCOUNT_NAME.value}/{wg}',
+        f'{Secrets.MACHINE_DOMAIN_INFO.value}/{wg}',
+        f'{Secrets.DOMTRUST_ACCT_PASS.value}/{wg}',
+        f'{Secrets.DOMAIN_SID.value}/{wg}',
+        f'{Secrets.DOMAIN_GUID.value}/{wg}',
+    ]
+    if realm:
+        keys.append(f'{Secrets.SALTING_PRINCIPAL.value}/DES/{realm.upper()}')
+
+    with get_tdb_handle(*SECRETS_TDB_CONFIG) as hdl:
+        for key in keys:
+            try:
+                hdl.delete(key)
+            except (MatchNotFound, RuntimeError):
+                # Idempotent: keys we never set or that samba already cleaned up are fine
+                pass
+
+
+class DomainSecrets(Service):
+
+    class Config:
+        namespace = 'directoryservices.secrets'
+        cli_private = True
+        private = True
+
+    def has_domain(self, domain):
+        """
+        Check whether running version of secrets.tdb has our machine account password
+        """
+        try:
+            fetch_secrets_entry(f"{Secrets.MACHINE_PASSWORD.value}/{domain.upper()}")
+        except MatchNotFound:
+            return False
+
+        return True
+
+    def domain_sid(self, domain):
+        """
+        Retrieve the SID for the specified domain from secrets.tdb
+        and return it as a SID string (e.g. 'S-1-5-21-x-y-z').
+        """
+        encoded_sid = fetch_secrets_entry(
+            f"{Secrets.DOMAIN_SID.value}/{domain.upper()}"
+        )
+        return raw_sid_to_str(b64decode(encoded_sid))
+
+    def last_password_change(self, domain):
+        """
+        Retrieve the last password change timestamp for the specified domain.
+        Raises MatchNotFound if entry is not present in secrets.tdb
+        """
+        encoded_change_ts = fetch_secrets_entry(
+            f"{Secrets.MACHINE_LAST_CHANGE_TIME.value}/{domain.upper()}"
+        )
+        try:
+            bytes_passwd_chng = b64decode(encoded_change_ts)
+        except Exception:
+            self.logger.warning("Failed to retrieve last password change time for domain "
+                                "[%s] from domain secrets. Directory service functionality "
+                                "may be impacted.", domain, exc_info=True)
+            return None
+
+        return struct.unpack("<L", bytes_passwd_chng)[0]
+
+    def set_ipa_secret(self, domain: str, secret: bytes):
+        # The stored secret in secrets.tdb and our kerberos keytab for SMB must be kept
+        # in-sync. `secret` is the raw machine-account password bytes (the same value used
+        # to derive the SMB keytab); it is piped verbatim to `net changesecretpw` and must
+        # not be base64- or otherwise encoded, or SMB machine authentication will fail.
+        store_secrets_entry(
+            f'{Secrets.MACHINE_PASSWORD.value}/{domain.upper()}', b64encode(b"2\x00").decode()
+        )
+
+        # Password changed field must be initialized (but otherwise is not required)
+        store_secrets_entry(
+            f"{Secrets.MACHINE_LAST_CHANGE_TIME.value}/{domain.upper()}", b64encode(b"2\x00").decode()
+        )
+
+        setsecret = subprocess.run(
+            ['net', 'changesecretpw', '-f', '-d', '5'],
+            capture_output=True, check=False, input=secret
+        )
+        if setsecret.returncode != 0:
+            raise CallError(f'Failed to set machine account secret: {setsecret.stderr.decode()}')
+
+        # Record the credential-format version so that systems joined by a build that wrote
+        # this secret incorrectly can be detected and healed after an upgrade.
+        store_secrets_entry(
+            f'{IPA_SMB_CRED_VERSION_KEY}/{domain.upper()}',
+            b64encode(str(IPA_SMB_CRED_VERSION).encode()).decode()
+        )
+
+    def ipa_cred_version(self, domain):
+        """
+        Return the IPA SMB machine-account credential-format version recorded in
+        secrets.tdb for `domain`, or 0 when no marker is present (which indicates the
+        credential was written by a build predating version tracking and should be
+        regenerated).
+        """
+        try:
+            encoded = fetch_secrets_entry(f'{IPA_SMB_CRED_VERSION_KEY}/{domain.upper()}')
+        except MatchNotFound:
+            return 0
+
+        try:
+            return int(b64decode(encoded).decode())
+        except (ValueError, TypeError):
+            return 0
+
+    def set_ldap_idmap_secret(self, domain, user_dn, secret):
+        """
+        Some idmap backends (ldap and rfc2307) store credentials in secrets.tdb.
+        This method is used by idmap plugin to write the password.
+        """
+        store_secrets_entry(
+            f'{Secrets.LDAP_IDMAP_SECRET.value}_{domain.upper()}/{user_dn}',
+            b64encode(secret.encode() + b'\x00').decode()
+        )
+
+    def get_ldap_idmap_secret(self, domain, user_dn):
+        """
+        Retrieve idmap secret for the specifed domain and user dn.
+        """
+        return fetch_secrets_entry(f'{Secrets.LDAP_IDMAP_SECRET.value}_{domain.upper()}/{user_dn}')
+
+    def get_machine_secret(self, domain):
+        return fetch_secrets_entry(f'{Secrets.MACHINE_PASSWORD.value}/{domain.upper()}')
+
+    def get_salting_principal(self, realm):
+        return fetch_secrets_entry(f'{Secrets.SALTING_PRINCIPAL.value}/DES/{realm.upper()}')
+
+    def dump(self):
+        """
+        Dump contents of secrets.tdb. Values are base64-encoded
+        """
+        entries = query_secrets_entries([], {})
+        return {entry['key']: entry['value'] for entry in entries}
+
+    async def get_db_secrets(self):
+        """
+        Retrieve secrets that are stored currently in freenas-v1.db.
+        """
+        db = await self.middleware.call('datastore.config', 'services.cifs', {
+            'prefix': 'cifs_srv_', 'select': ['id', 'secrets']
+        })
+        if not db['secrets']:
+            return {'id': db['id']}
+
+        try:
+            secrets = json.loads(db['secrets'])
+        except json.decoder.JSONDecodeError:
+            self.logger.warning("Stored secrets are not valid JSON "
+                                "a new backup of secrets should be generated.")
+            return {'id': db['id']}
+        return {'id': db['id']} | secrets
+
+    async def backup(self, allow_missing_machine_secret=False):
+        """
+        store backup of secrets.tdb contents (keyed on current netbios name) in
+        freenas-v1.db file. Only the current netbiosname's entry is retained --
+        backups under prior netbiosnames (from hostname changes on this server)
+        are dropped to prevent the DB row from accumulating full secret dumps
+        of historical hostnames indefinitely. In HA the netbiosname is shared
+        (it's the virtual SMB hostname, not per-controller) so pruning never
+        loses the standby's backup.
+
+        ``allow_missing_machine_secret`` permits overwriting the stored backup with a
+        secrets.tdb dump that contains no machine account password. This is only
+        expected when deliberately clearing the backup (for example after leaving a
+        domain). By default such an overwrite is refused so a machine-secret-less dump
+        cannot destroy an otherwise-good backup.
+        """
+        failover_status = await self.middleware.call('failover.status')
+        if failover_status not in ('SINGLE', 'MASTER'):
+            self.logger.debug("Current failover status [%s]. Skipping secrets backup.",
+                              failover_status)
+            return
+
+        netbios_name = (await self.middleware.call('smb.config'))['netbiosname']
+        db_secrets = await self.get_db_secrets()
+        id_ = db_secrets.pop('id')
+
+        if not (secrets := (await self.middleware.call('directoryservices.secrets.dump'))):
+            self.logger.warning("Unable to parse secrets")
+            return
+
+        if not allow_missing_machine_secret and not any(
+            key.startswith(f'{Secrets.MACHINE_PASSWORD.value}/') for key in secrets
+        ):
+            self.logger.warning(
+                "Refusing to overwrite the stored directory services secrets backup: the "
+                "current secrets.tdb contains no machine account password. This can occur "
+                "transiently during startup before the machine account secret has been "
+                "restored from the database backup."
+            )
+            return
+
+        fresh = {f"{netbios_name.upper()}$": secrets}
+        await self.middleware.call(
+            'datastore.update',
+            'services.cifs', id_,
+            {'secrets': json.dumps(fresh)},
+            {'prefix': 'cifs_srv_'}
+        )
+
+    async def restore(self, netbios_name=None):
+        """ Restore the contents of secrets.tdb from a stored backup of the node.
+        This is allowed on standby controller as it preps winbindd for failover. """
+        if netbios_name is None:
+            netbios_name = (await self.middleware.call('smb.config'))['netbiosname']
+
+        db_secrets = await self.get_db_secrets()
+        server_secrets = db_secrets.get(f"{netbios_name.upper()}$")
+        if server_secrets is None:
+            self.logger.warning("Unable to find stored secrets for [%s]. "
+                                "Directory service functionality may be impacted.",
+                                netbios_name)
+            return False
+
+        self.logger.debug('Restoring secrets.tdb for %s', netbios_name)
+        for key, value in server_secrets.items():
+            await self.middleware.run_in_thread(store_secrets_entry, key, value)
+
+        return True

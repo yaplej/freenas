@@ -1,124 +1,161 @@
+from __future__ import annotations
+
 import errno
+import hashlib
 import json
 import logging
 import os
 import subprocess
 import time
+from typing import Any, Callable
 
-from middlewared.service import CallError, private, Service
-from middlewared.utils import osc
+from middlewared.api.current import BootEnvironmentDestroy, QueryOptions, ZFSResourceQuery
+from middlewared.service import CallError, ServiceContext
 from middlewared.utils.size import format_size
 
 logger = logging.getLogger(__name__)
 
 run_kw = dict(check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, encoding="utf-8", errors="ignore")
+STARTING_INSTALLER = "Starting installer"
 
 
-class UpdateService(Service):
-    @private
-    def install_scale(self, mounted, progress_callback, options=None):
-        options = options or {}
+def get_hash(file_path: str, digest: str = "sha1") -> str:
+    with open(file_path, 'rb') as f:
+        return hashlib.file_digest(f, digest).hexdigest()
 
-        with open(os.path.join(mounted, "manifest.json")) as f:
-            manifest = json.load(f)
 
-        boot_pool_name = self.middleware.call_sync("boot.pool_name")
-        self.middleware.call_sync("update.ensure_free_space", boot_pool_name, manifest["size"])
+def install_scale(
+    context: ServiceContext,
+    mounted: str,
+    progress_callback: Callable[[float, str], None],
+    options: dict[str, Any],
+) -> None:
+    raise_warnings = options.pop("raise_warnings", True)
 
-        for file, checksum in manifest["checksums"].items():
-            progress_callback(0, f"Verifying {file}")
-            if osc.IS_FREEBSD:
-                our_checksum = subprocess.run(["sha1", os.path.join(mounted, file)], **run_kw).stdout.split()[-1]
-            else:
-                our_checksum = subprocess.run(["sha1sum", os.path.join(mounted, file)], **run_kw).stdout.split()[0]
+    with open(os.path.join(mounted, "manifest.json")) as f:
+        manifest = json.load(f)
+
+    boot_pool_name = context.call_sync2(context.s.boot.pool_name)
+    ensure_free_space(context, boot_pool_name, manifest["size"])
+
+    for file, checksum in manifest["checksums"].items():
+        progress_callback(0, f"Verifying {file}")
+        file_path = os.path.join(mounted, file)
+        our_checksum = get_hash(file_path)
+        if our_checksum != checksum:
+            # eventually we will use sha256
+            our_checksum = get_hash(file_path, digest="sha256")
             if our_checksum != checksum:
                 raise CallError(f"Checksum mismatch for {file!r}: {our_checksum} != {checksum}")
 
-        command = {
-            "disks": self.middleware.call_sync("boot.get_disks"),
-            "json": True,
-            "old_root": "/",
-            "pool_name": boot_pool_name,
-            "src": mounted,
-            **options,
-        }
+    progress_callback(0, "Running pre-checks")
+    warning = _execute_truenas_install(context, mounted, {
+        "json": True,
+        "old_root": "/",
+        "precheck": True,
+    }, progress_callback)
+    if warning and raise_warnings:
+        raise CallError(warning, errno.EAGAIN)
 
-        if osc.IS_FREEBSD:
-            command["devices"] = self.middleware.call_sync("zfs.pool.get_devices", boot_pool_name)
+    progress_callback(0, STARTING_INSTALLER)
+    command = {
+        "disks": context.call_sync2(context.s.boot.get_disks),
+        "json": True,
+        "old_root": "/",
+        "pool_name": boot_pool_name,
+        "src": mounted,
+        **options,
+    }
+    _execute_truenas_install(context, mounted, command, progress_callback)
 
-        p = subprocess.Popen(
-            ["python3", "-m", "truenas_install"], cwd=mounted, stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, encoding="utf-8", errors="ignore",
-        )
-        p.stdin.write(json.dumps(command))
-        p.stdin.close()
-        stderr = ""
-        error = None
-        for line in iter(p.stdout.readline, ""):
-            try:
-                data = json.loads(line)
-            except ValueError:
-                stderr += line
+
+def _execute_truenas_install(
+    context: ServiceContext,
+    cwd: str,
+    command: dict[str, Any],
+    progress_callback: Callable[[float, str], None],
+) -> str:
+    p = subprocess.Popen(
+        ["python3", "-m", "truenas_install"], cwd=cwd, stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, encoding="utf-8", errors="ignore",
+    )
+    assert p.stdin
+    assert p.stdout
+    p.stdin.write(json.dumps(command))
+    p.stdin.close()
+    stderr = ""
+    error: str | None = None
+    for line in iter(p.stdout.readline, ""):
+        try:
+            data = json.loads(line)
+        except ValueError:
+            stderr += line
+        else:
+            if "progress" in data and "message" in data:
+                progress_callback(data["progress"], data["message"])
+            elif "error" in data:
+                error = data["error"]
             else:
-                if "progress" in data and "message" in data:
-                    progress_callback(data["progress"], data["message"])
-                elif "error" in data:
-                    error = data["error"]
-                else:
-                    raise ValueError(f"Invalid truenas_install JSON: {data!r}")
-        p.wait()
-        if p.returncode != 0:
-            if error is not None:
-                raise CallError(error)
-            else:
-                raise CallError(stderr)
+                raise ValueError(f"Invalid truenas_install JSON: {data!r}")
+    p.wait()
 
-    @private
-    def ensure_free_space(self, pool_name, size):
-        space_left = self._space_left(pool_name)
+    if error is not None:
+        result = error
+    else:
+        result = stderr
 
-        if space_left > size:
-            return
+    if p.returncode != 0:
+        raise CallError(result or f"Abnormal installer process termination with code {p.returncode}")
+    else:
+        return result
 
-        for bootenv in reversed(self.middleware.call_sync(
-            "bootenv.query",
-            [
-                ["keep", "=", False],
-                ["mountpoint", "=", "-"],
-                ["activated", "=", False],
-            ],
-            {"order_by": ["created"]},
-        )):
-            space_left_before_prune = space_left
 
-            logger.info("Pruning %r", bootenv["id"])
-            self.middleware.call_sync("bootenv.delete", bootenv["id"])
+def ensure_free_space(context: ServiceContext, pool_name: str, size: int) -> None:
+    space_left = _space_left(context, pool_name)
+    if space_left > size:
+        return
 
-            be_size = bootenv["rawspace"]
-            if be_size is None:
-                be_size = 0
+    filters = [
+        # ignore BE that is explicitly marked to be kept
+        ["keep", "=", False],
+        # ignore current BE
+        ["active", "=", False],
+        # ignore active BE on next reboot
+        ["activated", "=", False],
+    ]
+    # ascending order (i.e. oldest comes first)
+    opts = QueryOptions(order_by=["created"])
+    for be in context.call_sync2(context.s.boot.environment.query, filters, opts):
+        space_left_before_prune = space_left
+        logger.info("Pruning %r", be.id)
+        context.call_sync2(context.s.boot.environment.destroy, BootEnvironmentDestroy(id=be.id))
 
-            for i in range(10):
-                space_left = self._space_left(pool_name)
+        be_size = be.used_bytes
+        for i in range(10):
+            space_left = _space_left(context, pool_name)
+            if space_left > size:
+                return
 
-                if space_left > size:
-                    return
+            freed_space = space_left - space_left_before_prune
+            if freed_space >= be_size * 0.5:
+                return
 
-                freed_space = space_left - space_left_before_prune
-                if freed_space >= be_size * 0.5:
-                    return
+            logger.debug(
+                "Only freed %d bytes of %d, waiting for deferred operation to complete...",
+                freed_space,
+                be_size
+            )
+            time.sleep(1)
 
-                logger.debug("Only freed %d bytes of %d, waiting for deferred operation to complete...", freed_space,
-                             be_size)
-                time.sleep(1)
+    raise CallError(
+        f"Insufficient disk space available on {pool_name} ({format_size(space_left)}). "
+        f"Need {format_size(size)}",
+        errno.ENOSPC,
+    )
 
-        raise CallError(
-            f"Insufficient disk space available on {pool_name} ({format_size(space_left)}). "
-            f"Need {format_size(size)}",
-            errno.ENOSPC,
-        )
 
-    def _space_left(self, pool_name):
-        filters = [["name", "=", pool_name]]
-        options = {"get": True, "extra": {"flat": False, "retrieve_children": False, "properties": ["available"]}}
-        return self.middleware.call_sync('zfs.dataset.query', filters, options)['properties']['available']['parsed']
+def _space_left(context: ServiceContext, pool_name: str) -> int:
+    space_left: int = context.call_sync2(
+        context.s.zfs.resource.list_impl, ZFSResourceQuery(paths=[pool_name], properties=['available'])
+    )[0]['properties']['available']['value']
+    return space_left

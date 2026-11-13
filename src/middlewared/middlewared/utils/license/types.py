@@ -1,0 +1,97 @@
+"""Normalized license objects, identical whichever source produced them."""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from datetime import date
+import enum
+import typing
+
+if typing.TYPE_CHECKING:
+    from collections.abc import Mapping, Sequence
+
+    from truenas_pylicensed import LicenseType
+
+__all__ = ("FeatureInfo", "LicenseInfo", "LicenseOrigin")
+
+
+class LicenseOrigin(enum.Enum):
+    """Who produced a license record.
+
+    Entitlement resolution deliberately does not read this: a system-generated record is meant
+    to resolve exactly as an issued one does. It exists for consumers that mean "iX issued
+    this" -- what to report outward, and which lifecycle transitions to fire.
+
+    TODO: Remove once legacy licenses are removed.
+    """
+
+    ISSUED = "ISSUED"
+    SYSTEM_GENERATED = "SYSTEM_GENERATED"
+
+
+@dataclass(frozen=True, kw_only=True, slots=True)
+class FeatureInfo:
+    name: str
+    """Feature key (e.g. "DEDUP", "SED").
+
+    A plain str rather than a LicenseFeature: the daemon does not constrain
+    feature keys on the wire, so an unrecognized key has to round-trip
+    untouched.
+    """
+    start_date: date | None
+    """Feature start date or None."""
+    expires_at: date | None
+    """Feature expiration date or None for perpetual."""
+    type: str | None = None
+    """Per-feature tier qualifier (e.g. SUPPORT type=GOLD), read by the proactive-support tier gate."""
+
+
+@dataclass(frozen=True, kw_only=True, slots=True)
+class LicenseInfo:
+    # Unhashable because the container fields are MappingProxyType; None keeps the generated __eq__.
+    __hash__ = None  # type: ignore[assignment]
+
+    id: str
+    """Unique UUID string for the license."""
+    type: LicenseType
+    """The license type."""
+    model: str | None
+    """Hardware model (e.g. "H30") for enterprise types, None otherwise."""
+    support_expires_at: date | None
+    """End of the support contract, or None when the license carries no support.
+
+    This is the only expiry a license carries. A license itself does not expire;
+    expiry is a property of individual features, and SUPPORT is the only one
+    whose expiry anything acts on.
+    """
+    features: Mapping[str, FeatureInfo]
+    """Licensed features, keyed by the feature name each one carries."""
+    serials: Sequence[str]
+    """System serial number(s) for hardware-bound licenses."""
+    enclosures: Mapping[str, int]
+    """Licensed enclosure models mapped to count."""
+    contract_type: str | None
+    """Support contract type."""
+    origin: LicenseOrigin
+    """Whether an issuer signed this record or the system wrote it for itself."""
+    issued_at: str | None = None
+    """Issue date exactly as the license records it: the minted RFC3339 timestamp, or a legacy
+    license's contract start date. None for a system-generated record."""
+
+    def has_feature(self, name: str) -> bool:
+        return name in self.features  # membership only; the feature's own expiry is not consulted
+
+    def feature(self, name: str) -> FeatureInfo | None:
+        return self.features.get(name)
+
+    def feature_type(self, name: str) -> str | None:
+        info = self.features.get(name)
+        return info.type if info is not None else None
+
+    def has_serial(self, serial: str) -> bool:
+        return serial in self.serials
+
+    def support_lapsed(self, today: date | None = None) -> bool:
+        """A contract is in force through its end date, so the comparison is strict."""
+        expires_at = self.support_expires_at
+        return expires_at is not None and expires_at < (today or date.today())

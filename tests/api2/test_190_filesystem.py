@@ -1,303 +1,403 @@
-#!/usr/bin/env python3
-
-# Author: Eric Turgeon
-# License: BSD
+import errno
+import stat
+import os
+from copy import deepcopy
 
 import pytest
-import sys
-import os
-from pytest_dependency import depends
-apifolder = os.getcwd()
-sys.path.append(apifolder)
 
-from copy import deepcopy
-from functions import POST, PUT, SSH_TEST, wait_on_job
-from auto_config import dev_test, pool_name, ip, user, password
+from auto_config import pool_name
+from middlewared.service_exception import CallError
 from middlewared.test.integration.assets.filesystem import directory
-from utils import create_dataset
-
-# comment pytestmark for development testing with --dev-test
-pytestmark = pytest.mark.skipif(dev_test, reason='Skipping for test development testing')
-group = 'root'
-path = '/etc'
-path_list = ['default', 'kernel', 'zfs', 'ssh']
-random_path = ['/boot/grub', '/root', '/bin', '/usr/bin']
+from middlewared.test.integration.assets.pool import dataset as create_dataset
+from middlewared.test.integration.utils import call, ssh
+from truenas_api_client import ClientException
 
 
-def test_01_get_filesystem_listdir():
-    results = POST('/filesystem/listdir/', {'path': path})
-    assert results.status_code == 200, results.text
-    assert isinstance(results.json(), list) is True, results.text
-    assert len(results.json()) > 0, results.text
-    global listdir
-    listdir = results
+@pytest.mark.parametrize("spath", ("/boot/grub", "/root", "/bin", "/usr/bin"))
+def test_filesystem_stat_results_for_path_(spath):
+    results = call("filesystem.stat", spath)
+    for key in (
+        "allocation_size",
+        "size",
+        "mode",
+        "dev",
+        "inode",
+        "uid",
+        "gid",
+        "nlink",
+        "mount_id",
+        "dev",
+        "inode",
+    ):
+        assert isinstance(results[key], int)
+        if key in ("uid", "gid"):
+            assert results[key] == 0
+        elif key == "nlink":
+            assert -1 < results[key] < 10
 
+    for key in ("atime", "mtime", "ctime"):
+        assert isinstance(results[key], float)
 
-@pytest.mark.parametrize('name', path_list)
-def test_02_looking_at_listdir_path_(name):
-    for dline in listdir.json():
-        if dline['path'] == f'{path}/{name}':
-            assert dline['type'] in ('DIRECTORY', 'FILE'), listdir.text
-            assert dline['uid'] == 0, listdir.text
-            assert dline['gid'] == 0, listdir.text
-            assert dline['name'] == name, listdir.text
-            break
+    for key in ("user", "group"):
+        assert results[key] == "root"
+
+    assert results["acl"] is False
+    if spath == "/bin":
+        assert results["type"] == "SYMLINK"
+        assert results["realpath"] == "/usr/bin"
     else:
-        raise AssertionError(f'/{path}/{name} not found')
+        assert results["type"] == "DIRECTORY"
+        assert results["realpath"] == spath
 
 
-@pytest.mark.parametrize('path', random_path)
-def test_03_get_filesystem_stat_(path):
-    results = POST('/filesystem/stat/', path)
-    assert results.status_code == 200, results.text
-    assert isinstance(results.json(), dict) is True, results.text
-    assert isinstance(results.json()['size'], int) is True, results.text
-    assert isinstance(results.json()['mode'], int) is True, results.text
-    assert results.json()['uid'] == 0, results.text
-    assert results.json()['gid'] == 0, results.text
-    assert isinstance(results.json()['atime'], float) is True, results.text
-    assert isinstance(results.json()['mtime'], float) is True, results.text
-    assert isinstance(results.json()['ctime'], float) is True, results.text
-    assert isinstance(results.json()['dev'], int) is True, results.text
-    assert isinstance(results.json()['inode'], int) is True, results.text
-    assert results.json()['nlink'] in tuple(range(10)), results.text
-    assert results.json()['user'] == 'root', results.text
-    assert results.json()['group'] == group, results.text
-    assert results.json()['acl'] is False, results.text
+def test_filesystem_statfs_fstype():
+    parent_path = f"/mnt/{pool_name}"
+    data = call("filesystem.statfs", parent_path)
+    assert data["fstype"] == "zfs", data["fstype"]
+    nested_path = f"{parent_path}/tmpfs"
+    ssh(f"mkdir -p {nested_path}; mount -t tmpfs -o size=10M tmpfstest {nested_path}")
+    data = call("filesystem.statfs", nested_path)
+    assert data["fstype"] == "tmpfs", data["fstype"]
+    ssh(f"umount {nested_path}; rmdir {nested_path}")
 
 
-def test_04_test_filesystem_statfs_fstype(request):
-    depends(request, ["pool_04"], scope="session")
-    # test zfs fstype first
-    parent_path = f'/mnt/{pool_name}'
-    results = POST('/filesystem/statfs/', parent_path)
-    assert results.status_code == 200, results.text
-    data = results.json()
-    assert data, results.text
-    assert data['fstype'] == 'zfs', data['fstype']
-
-    # mount nested tmpfs entry and make sure statfs
-    # returns `tmpfs` as the fstype
-    # mkdir
-    nested_path = f'{parent_path}/tmpfs'
-    cmd1 = f'mkdir -p {nested_path}'
-    results = SSH_TEST(cmd1, user, password, ip)
-    assert results['result'] is True, results['output']
-
-    # mount tmpfs
-    cmd2 = f'mount -t tmpfs -o size=10M tmpfstest {nested_path}'
-    results = SSH_TEST(cmd2, user, password, ip)
-    assert results['result'] is True, results['output']
-
-    # test fstype
-    results = POST('/filesystem/statfs/', nested_path)
-    assert results.status_code == 200, results.text
-    data = results.json()
-    assert data, results.text
-    assert data['fstype'] == 'tmpfs', data['fstype']
-
-    # cleanup
-    cmd3 = f'umount {nested_path}'
-    results = SSH_TEST(cmd3, user, password, ip)
-    assert results['result'] is True, results['output']
-    cmd4 = f'rmdir {nested_path}'
-    results = SSH_TEST(cmd4, user, password, ip)
-    assert results['result'] is True, results['output']
-
-
-def test_05_set_immutable_flag_on_path(request):
-    depends(request, ["pool_04"], scope="session")
-    t_path = os.path.join('/mnt', pool_name, 'random_directory_immutable')
-    t_child_path = os.path.join(t_path, 'child')
-
+def test_immutable_flag():
+    t_path = os.path.join("/mnt", pool_name, "random_directory_immutable")
+    t_child_path = os.path.join(t_path, "child")
     with directory(t_path) as d:
         for flag_set in (True, False):
-            POST('/filesystem/set_immutable/', {'set_flag': flag_set, 'path': d})
+            call('filesystem.set_zfs_attributes', {
+                'path': d,
+                'zfs_file_attributes': {'immutable': flag_set}
+            }, job=True)
             # We test 2 things
             # 1) Writing content to the parent path fails/succeeds based on "set"
             # 2) "is_immutable_set" returns sane response
-            results = POST('/filesystem/mkdir', f'{t_child_path}_{flag_set}')
-            assert results.status_code == (500 if flag_set else 200), results.text
+            if flag_set:
+                with pytest.raises(PermissionError):
+                    call('filesystem.mkdir', {'path': f"{t_child_path}_{flag_set}"})
+            else:
+                call('filesystem.mkdir', {'path': f"{t_child_path}_{flag_set}"})
 
-            results = POST('/filesystem/is_immutable/', t_path)
-            assert results.status_code == 200, results.text
-            result = results.json()
-            assert isinstance(result, bool) is True, results.text
-            assert result == flag_set, 'Immutable flag is still not set' if flag_set else 'Immutable flag is still set'
-
-
-def test_06_test_filesystem_listdir_exclude_non_mounts():
-    # create a random directory at top-level of '/mnt'
-    mnt = '/mnt/'
-    randir = 'random_dir'
-    path = mnt + randir
-
-    with directory(path) as _:
-        # now call filesystem.listdir specifying '/mnt' as path
-        # and ensure `randir` is not in the output
-        results = POST('/filesystem/listdir/', {'path': mnt})
-        assert results.status_code == 200, results.text
-        assert not any(i['name'] == randir for i in results.json()), f'{randir} should not be listed'
+            is_immutable = 'IMMUTABLE' in call('filesystem.stat', t_path)['attributes']
+            err = "Immutable flag is still not set"
+            if not flag_set:
+                err = "Immutable flag is still set"
+            assert is_immutable == flag_set, err
 
 
-def test_07_test_filesystem_stat_filetype(request):
+def test_filesystem_listdir_exclude_non_mounts():
+    with directory("/mnt/random_dir"):
+        listing = call("filesystem.listdir", "/mnt")
+        names = {i["name"] for i in listing}
+        # exclude dirs at root of /mnt since this directory is used
+        # exclusively to mount zpools
+        assert "random_dir" not in names
+        # /mnt is on rootfs and the pool roots are separate ZFS mounts;
+        # listdir must still surface them or every pool-listing UI breaks.
+        assert pool_name in names, names
+
+
+def test_filesystem_listdir_includes_child_datasets():
+    """Child datasets are separate ZFS mounts; listdir must still see them.
+
+    Regression guard for NAS-140883.
+    """
+    with create_dataset("listdir_parent") as parent:
+        parent_path = f"/mnt/{parent}"
+        with create_dataset("listdir_parent/child") as child:
+            entry = call(
+                "filesystem.listdir", parent_path,
+                [["name", "=", "child"]], {"get": True},
+            )
+            assert entry["type"] == "DIRECTORY"
+            assert entry["is_mountpoint"] is True
+            assert entry["path"] == f"/mnt/{child}"
+
+
+def test_filesystem_stat_filetype():
     """
     This test checks that file types are properly
     identified through the filesystem plugin in middleware.
     There is an additional check to make sure that paths
     in the ZFS CTL directory (.zfs) are properly flagged.
     """
-    depends(request, ["pool_04"], scope="session")
-    ds_name = 'stat_test'
-    snap_name = f'{ds_name}_snap1'
-    path = f'/mnt/{pool_name}/{ds_name}'
-    targets = ['file', 'directory', 'symlink', 'other']
-    cmds = [
-        f'mkdir {path}/directory',
-        f'touch {path}/file',
-        f'ln -s {path}/file {path}/symlink',
-        f'mkfifo {path}/other'
-    ]
-
-    with create_dataset(f'{pool_name}/{ds_name}'):
-        results = SSH_TEST(' && '.join(cmds), user, password, ip)
-        assert results['result'] is True, str(results)
-
+    ds_name = "stat_test"
+    targets = ("file", "directory", "symlink", "other")
+    with create_dataset(ds_name) as ds:
+        base = f"/mnt/{ds}"
+        ssh(
+            " && ".join(
+                (
+                    f"mkdir {base}/directory",
+                    f"touch {base}/file",
+                    f"ln -s {base}/file {base}/symlink",
+                    f"mkfifo {base}/other",
+                )
+            )
+        )
         for x in targets:
-            target = f'{path}/{x}'
-            results = POST('/filesystem/stat/', target)
-            assert results.status_code == 200, f'{target}: {results.text}'
-            statout = results.json()
+            statout = call("filesystem.stat", f"{base}/{x}")
+            assert statout["type"] == x.upper()
+            assert not statout["is_ctldir"]
 
-            assert statout['type'] == x.upper(), str(statout)
-            assert not statout['is_ctldir']
-
-        result = POST("/zfs/snapshot/", {
-            'dataset': f'{pool_name}/{ds_name}',
-            'name': snap_name,
-            'recursive': False,
-        })
-        assert result.status_code == 200, result.text
-
+        snap_name = f"{ds_name}_snap1"
+        call(
+            "pool.snapshot.create",
+            {
+                "dataset": ds,
+                "name": snap_name,
+                "recursive": False,
+            },
+        )
         for x in targets:
-            target = f'{path}/.zfs/snapshot/{snap_name}/{x}'
-            results = POST('/filesystem/stat/', target)
-            assert results.status_code == 200, f'{target}: {results.text}'
-            statout = results.json()
+            target = f"{base}/.zfs/snapshot/{snap_name}/{x}"
+            statout = call("filesystem.stat", target)
+            assert statout["type"] == x.upper()
+            assert statout["is_ctldir"]
 
-            assert statout['type'] == x.upper(), str(statout)
-            assert statout['is_ctldir']
+        assert call("filesystem.stat", f"{base}/.zfs/snapshot/{snap_name}")["is_ctldir"]
+        assert all(
+            dirent["is_ctldir"]
+            for dirent in call(
+                "filesystem.listdir",
+                f"{base}/.zfs/snapshot",
+                [],
+                {"select": ["name", "is_ctldir"]},
+            )
+        )
+        assert call("filesystem.stat", f"{base}/.zfs/snapshot")["is_ctldir"]
+        assert all(
+            dirent["is_ctldir"]
+            for dirent in call(
+                "filesystem.listdir",
+                f"{base}/.zfs",
+                [],
+                {"select": ["name", "is_ctldir"]},
+            )
+        )
+        assert call("filesystem.stat", f"{base}/.zfs")["is_ctldir"]
 
-        results = POST('/filesystem/stat/', f'{path}/.zfs/snapshot/{snap_name}')
-        assert results.status_code == 200, results.text
-        assert results.json()['is_ctldir']
 
-        results = POST('/filesystem/stat/', f'{path}/.zfs/snapshot')
-        assert results.status_code == 200, results.text
-        assert results.json()['is_ctldir']
-
-        results = POST('/filesystem/stat/', f'{path}/.zfs')
-        assert results.status_code == 200, results.text
-        assert results.json()['is_ctldir']
-
-
-def test_08_test_fiilesystem_statfs_flags(request):
+def test_fiilesystem_statfs_flags():
     """
     This test verifies that changing ZFS properties via
     middleware causes mountinfo changes visible via statfs.
     """
-    depends(request, ["pool_04"], scope="session")
-    ds_name = 'statfs_test'
-    target = f'{pool_name}/{ds_name}'
-    target_url = target.replace('/', '%2F')
-    path = f'/mnt/{target}'
-
-    # tuple: ZFS property name, property value, mountinfo value
-    properties = [
+    properties = (
+        # tuple: ZFS property name, property value, mountinfo value
         ("readonly", "ON", "RO"),
         ("readonly", "OFF", "RW"),
         ("atime", "OFF", "NOATIME"),
         ("exec", "OFF", "NOEXEC"),
         ("acltype", "NFSV4", "NFS4ACL"),
         ("acltype", "POSIX", "POSIXACL"),
-    ]
-
-    with create_dataset(target):
+    )
+    with create_dataset("statfs_test") as ds:
+        base = f"/mnt/{ds}"
         for p in properties:
             # set option we're checking and make sure it's really set
-            payload = {
-                p[0]: p[1]
-            }
-            if p[0] == 'acltype':
-                payload.update({
-                    'aclmode': 'RESTRICTED' if p[1] == 'NFSV4' else 'DISCARD'
-                })
-            results = PUT(f'/pool/dataset/id/{target_url}', payload)
-            assert results.status_code == 200, results.text
-            prop_out = results.json()[p[0]]
-            assert prop_out['value'] == p[1]
+            payload = {p[0]: p[1]}
+            if p[0] == "acltype":
+                payload.update(
+                    {"aclmode": "RESTRICTED" if p[1] == "NFSV4" else "DISCARD"}
+                )
+            assert call("pool.dataset.update", ds, payload)[p[0]]["value"] == p[1]
 
             # check statfs results
-            results = POST('/filesystem/statfs/', path)
-            assert results.status_code == 200, results.text
-
-            mount_flags = results.json()['flags']
-            assert p[2] in mount_flags, f'{path}: ({p[2]}) not in {mount_flags}'
+            mount_flags = call("filesystem.statfs", base)["flags"]
+            assert p[2] in mount_flags, f"{base}: ({p[2]}) not in {mount_flags}"
 
 
-def test_09_test_dosmodes():
-    modes = ['readonly', 'hidden', 'system', 'archive', 'offline', 'sparse']
-    ds_name = 'dosmode_test'
-    target = f'{pool_name}/{ds_name}'
-    path = f'/mnt/{target}'
-    testpaths = [
-        f'{path}/testfile',
-        f'{path}/testdir',
-    ]
+@pytest.fixture(scope="module")
+def attrs_recursive_tree():
+    """Tree with mixed files, directories, and a symlink for recursive attr tests."""
+    with create_dataset("zfs_attrs_recursive") as ds:
+        base = f"/mnt/{ds}"
+        ssh(
+            f"mkdir -p {base}/sub && "
+            f"touch {base}/a.txt {base}/b.txt {base}/sub/c.txt && "
+            f"ln -s a.txt {base}/lnk"
+        )
+        yield base
 
-    with create_dataset(target):
-        cmd = [
-            f'touch {testpaths[0]}',
-            f'mkdir {testpaths[1]}'
-        ]
-        results = SSH_TEST(' && '.join(cmd), user, password, ip)
-        assert results['result'] is True, str(results)
 
+def _hidden(path):
+    return call("filesystem.get_zfs_attributes", path)["hidden"]
+
+
+def test_recursive_files_only_skips_dirs_and_symlinks(attrs_recursive_tree):
+    base = attrs_recursive_tree
+    try:
+        call(
+            "filesystem.set_zfs_attributes",
+            {
+                "path": base,
+                "zfs_file_attributes": {"hidden": True},
+                "options": {"recursive": ["FILES"]},
+            },
+            job=True,
+        )
+        assert _hidden(f"{base}/a.txt") is True
+        assert _hidden(f"{base}/b.txt") is True
+        assert _hidden(f"{base}/sub/c.txt") is True
+        assert _hidden(base) is False
+        assert _hidden(f"{base}/sub") is False
+    finally:
+        call(
+            "filesystem.set_zfs_attributes",
+            {
+                "path": base,
+                "zfs_file_attributes": {"hidden": False},
+                "options": {"recursive": ["FILES", "DIRECTORIES"]},
+            },
+            job=True,
+        )
+
+
+def test_recursive_directories_only_skips_files(attrs_recursive_tree):
+    base = attrs_recursive_tree
+    try:
+        call(
+            "filesystem.set_zfs_attributes",
+            {
+                "path": base,
+                "zfs_file_attributes": {"hidden": True},
+                "options": {"recursive": ["DIRECTORIES"]},
+            },
+            job=True,
+        )
+        assert _hidden(base) is True
+        assert _hidden(f"{base}/sub") is True
+        assert _hidden(f"{base}/a.txt") is False
+        assert _hidden(f"{base}/sub/c.txt") is False
+    finally:
+        call(
+            "filesystem.set_zfs_attributes",
+            {
+                "path": base,
+                "zfs_file_attributes": {"hidden": False},
+                "options": {"recursive": ["FILES", "DIRECTORIES"]},
+            },
+            job=True,
+        )
+
+
+def test_recursive_both_applies_to_all_non_symlinks(attrs_recursive_tree):
+    base = attrs_recursive_tree
+    try:
+        call(
+            "filesystem.set_zfs_attributes",
+            {
+                "path": base,
+                "zfs_file_attributes": {"hidden": True},
+                "options": {"recursive": ["FILES", "DIRECTORIES"]},
+            },
+            job=True,
+        )
+        for p in (base, f"{base}/sub", f"{base}/a.txt", f"{base}/b.txt", f"{base}/sub/c.txt"):
+            assert _hidden(p) is True, p
+    finally:
+        call(
+            "filesystem.set_zfs_attributes",
+            {
+                "path": base,
+                "zfs_file_attributes": {"hidden": False},
+                "options": {"recursive": ["FILES", "DIRECTORIES"]},
+            },
+            job=True,
+        )
+
+
+def test_recursive_files_only_on_file_path_modifies_root(attrs_recursive_tree):
+    target = f"{attrs_recursive_tree}/a.txt"
+    try:
+        call(
+            "filesystem.set_zfs_attributes",
+            {
+                "path": target,
+                "zfs_file_attributes": {"hidden": True},
+                "options": {"recursive": ["FILES"]},
+            },
+            job=True,
+        )
+        assert _hidden(target) is True
+    finally:
+        call(
+            "filesystem.set_zfs_attributes",
+            {
+                "path": target,
+                "zfs_file_attributes": {"hidden": False},
+            },
+            job=True,
+        )
+
+
+def test_recursive_directories_only_on_file_path_is_noop(attrs_recursive_tree):
+    target = f"{attrs_recursive_tree}/a.txt"
+    before = _hidden(target)
+    res = call(
+        "filesystem.set_zfs_attributes",
+        {
+            "path": target,
+            "zfs_file_attributes": {"hidden": not before},
+            "options": {"recursive": ["DIRECTORIES"]},
+        },
+        job=True,
+    )
+    assert res["hidden"] == before
+    assert _hidden(target) == before
+
+
+def test_recursive_empty_list_is_validation_error(attrs_recursive_tree):
+    with pytest.raises(Exception):
+        call(
+            "filesystem.set_zfs_attributes",
+            {
+                "path": attrs_recursive_tree,
+                "zfs_file_attributes": {"hidden": True},
+                "options": {"recursive": []},
+            },
+            job=True,
+        )
+
+
+def test_dosmodes():
+    modes = ("readonly", "hidden", "system", "archive", "offline", "sparse")
+    with create_dataset("dosmode_test") as ds:
+        base = f"/mnt/{ds}"
+        testpaths = (f"{base}/testfile", f"{base}/testdir")
+        ssh(f"touch {testpaths[0]}; mkdir {testpaths[1]}")
         for p in testpaths:
-            results = POST('/filesystem/get_dosmode', p)
-            assert results.status_code == 200, results
-
-            expected_flags = results.json()
-
+            expected_flags = call("filesystem.get_zfs_attributes", p)
             for m in modes:
                 to_set = {m: not expected_flags[m]}
-                results = POST('/filesystem/set_dosmode', {'path': p, 'dosmode': to_set})
-                assert results.status_code == 200, results.text
-
+                res = call(
+                    "filesystem.set_zfs_attributes",
+                    {"path": p, "zfs_file_attributes": to_set},
+                    job=True,
+                )
                 expected_flags.update(to_set)
-                results = POST('/filesystem/get_dosmode', p)
-                assert results.status_code == 200, results
-                assert results.json() == expected_flags
+                assert expected_flags == res
+                res = call("filesystem.get_zfs_attributes", p)
+                assert expected_flags == res
 
 
-def test_10_acl_path_execute_validation():
-    ds_name = 'acl_execute_test'
-    target = f'{pool_name}/{ds_name}'
-    path = f'/mnt/{target}'
-
+def test_acl_path_execute_validation():
+    perm = {"BASIC": "FULL_CONTROL"}
+    flag = {"BASIC": "INHERIT"}
     NFSV4_DACL = [
-        {'tag': 'owner@', 'id': -1, 'type': 'ALLOW', 'perms': {'BASIC': 'FULL_CONTROL'}, 'flags': {'BASIC': 'INHERIT'}},
-        {'tag': 'group@', 'id': -1, 'type': 'ALLOW', 'perms': {'BASIC': 'FULL_CONTROL'}, 'flags': {'BASIC': 'INHERIT'}},
-        {'tag': 'USER', 'id': 65534, 'type': 'ALLOW', 'perms': {'BASIC': 'FULL_CONTROL'}, 'flags': {'BASIC': 'INHERIT'}},
-        {'tag': 'GROUP', 'id': 65534, 'type': 'ALLOW', 'perms': {'BASIC': 'FULL_CONTROL'}, 'flags': {'BASIC': 'INHERIT'}},
+        {"tag": "owner@", "id": -1, "type": "ALLOW", "perms": perm, "flags": flag},
+        {"tag": "group@", "id": -1, "type": "ALLOW", "perms": perm, "flags": flag},
+        {"tag": "USER", "id": 65534, "type": "ALLOW", "perms": perm, "flags": flag},
+        {"tag": "GROUP", "id": 65534, "type": "ALLOW", "perms": perm, "flags": flag},
     ]
-
-    # Do NFSv4 checks
-    with create_dataset(target, {'acltype': 'NFSV4', 'aclmode': 'PASSTHROUGH'}, None, 770):
-        sub_ds_name = f'{ds_name}/sub'
-        sub_target = f'{pool_name}/{sub_ds_name}'
-        sub_path = f'/mnt/{sub_target}'
-
+    with create_dataset(
+        "acl_execute_test",
+        data={"acltype": "NFSV4", "aclmode": "PASSTHROUGH"},
+        mode="770",
+    ) as ds:
+        path = f"/mnt/{ds}"
         """
         For NFSv4 ACLs four different tags generate user tokens differently:
         1) owner@ tag will test `uid` from payload
@@ -305,63 +405,128 @@ def test_10_acl_path_execute_validation():
         3) GROUP will test the `id` in payload with id_type
         4) USER will test the `id` in mayload with USER id_type
         """
-
         # Start with testing denials
-        with create_dataset(sub_target, {'acltype': 'NFSV4', 'aclmode': 'PASSTHROUGH'}):
+        with create_dataset(
+            "acl_execute_test/sub", data={"acltype": "NFSV4", "aclmode": "PASSTHROUGH"}
+        ) as sub_ds:
+            sub_path = f"/mnt/{sub_ds}"
             acl = deepcopy(NFSV4_DACL)
-            names = ['daemon', 'apps', 'nobody', 'nogroup']
+            names = ("daemon", "apps", "nobody", "nogroup")
             for idx, entry in enumerate(NFSV4_DACL):
-                perm_job = POST('/filesystem/setacl/',
-                                {'path': sub_path, "dacl": acl, 'uid': 1, 'gid': 568})
-                assert perm_job.status_code == 200, perm_job.text
-
-                job_status = wait_on_job(perm_job.json(), 180)
-
-                # all of these tests should fail
-                assert job_status['state'] == 'FAILED', str(job_status['results'])
-                assert names[idx] in job_status['results']['error'], job_status['results']['error']
+                with pytest.raises(ClientException, match=f"{names[idx]}"):
+                    # all of these tests should fail and the user account
+                    # should be in the error message raised
+                    call(
+                        "filesystem.setacl",
+                        {"path": sub_path, "dacl": acl, "uid": 1, "gid": 568},
+                        job=True,
+                    )
                 acl.pop(0)
 
             # when this test starts, we have 770 perms on parent
             for entry in NFSV4_DACL:
                 # first set permissions on parent dataset
-                if entry['tag'] == 'owner@':
-                    perm_job = POST('/filesystem/chown/', {
-                        'path': path,
-                        'uid': 1,
-                        'gid': 0
-                    })
-                elif entry['tag'] == 'group@':
-                    perm_job = POST('/filesystem/chown/', {
-                        'path': path,
-                        'uid': 0,
-                        'gid': 568
-                    })
-                elif entry['tag'] == 'USER':
-                    perm_job = POST('/filesystem/setacl/', {
-                        'path': path,
-                        'uid': 0,
-                        'gid': 0,
-                        'dacl': [entry]
-                    })
-                elif entry['tag'] == 'GROUP':
-                    perm_job = POST('/filesystem/setacl/', {
-                        'path': path,
-                        'uid': 0,
-                        'gid': 0,
-                        'dacl': [entry]
-                    })
-
-                assert perm_job.status_code == 200, perm_job.text
-                job_status = wait_on_job(perm_job.json(), 180)
-                assert job_status['state'] == 'SUCCESS', str(job_status['results'])
+                if entry["tag"] == "owner@":
+                    call(
+                        "filesystem.chown", {"path": path, "uid": 1, "gid": 0}, job=True
+                    )
+                elif entry["tag"] == "group@":
+                    call(
+                        "filesystem.chown",
+                        {"path": path, "uid": 0, "gid": 568},
+                        job=True,
+                    )
+                elif entry["tag"] == "USER":
+                    call(
+                        "filesystem.setacl",
+                        {"path": path, "uid": 0, "gid": 0, "dacl": [entry]},
+                        job=True,
+                    )
+                elif entry["tag"] == "GROUP":
+                    call(
+                        "filesystem.setacl",
+                        {"path": path, "uid": 0, "gid": 0, "dacl": [entry]},
+                        job=True,
+                    )
 
                 # Now set the acl on child dataset. This should succeed
-                perm_job = POST('/filesystem/setacl/', {
-                    'path': sub_path,
-                    'uid': 1,
-                    'gid': 568,
-                    'dacl': [entry]
-                })
-                job_status = wait_on_job(perm_job.json(), 180)
-                assert job_status['state'] == 'SUCCESS', str(job_status['results'])
+                call(
+                    "filesystem.setacl",
+                    {"path": sub_path, "uid": 1, "gid": 568, "dacl": [entry]},
+                    job=True,
+                )
+
+
+@pytest.fixture(scope="module")
+def file_and_directory():
+    with create_dataset("test_file_and_directory") as ds:
+        ssh(f"mkdir /mnt/{ds}/test-directory; touch /mnt/{ds}/test-file")
+        yield ds
+
+
+@pytest.mark.parametrize(
+    "query,result",
+    [
+        ([], {"test-directory", "test-file"}),
+        ([["type", "=", "DIRECTORY"]], {"test-directory"}),
+        ([["type", "!=", "DIRECTORY"]], {"test-file"}),
+        ([["type", "=", "FILE"]], {"test-file"}),
+        ([["type", "!=", "FILE"]], {"test-directory"}),
+    ],
+)
+def test_type_filter(file_and_directory, query, result):
+    listdir = call("filesystem.listdir", f"/mnt/{file_and_directory}", query)
+    assert {item["name"] for item in listdir} == result, listdir
+
+
+def test_mkdir_mode():
+    with create_dataset("test_mkdir_mode") as ds:
+        testdir = os.path.join("/mnt", ds, "testdir")
+        call("filesystem.mkdir", {"path": testdir, "options": {"mode": "777"}})
+        st = call("filesystem.stat", testdir)
+        assert stat.S_IMODE(st["mode"]) == 0o777
+
+
+def test_mkdir_chmod_failure():
+    with create_dataset("test_mkdir_chmod", {"share_type": "SMB"}) as ds:
+        testdir = os.path.join("/mnt", ds, "testdir")
+        with pytest.raises(PermissionError):
+            call("filesystem.mkdir", {"path": testdir, "options": {"mode": "777"}})
+        with pytest.raises(CallError) as ce:
+            call("filesystem.stat", testdir)
+        assert ce.value.errno == errno.ENOENT
+        mkdir_st = call(
+            "filesystem.mkdir",
+            {"path": testdir, "options": {"mode": "777", "raise_chmod_error": False}},
+        )
+        st = call("filesystem.stat", testdir)
+        # Verify that mode output returned from mkdir matches what was actually set
+        assert st["mode"] == mkdir_st["mode"]
+        # mkdir succeeded, but chmod failed so we get mode based on inherited ACL (SMB preset)
+        assert stat.S_IMODE(st["mode"]) == 0o770
+
+
+def test_listdir_zfs_attrs_and_acl_from_statx():
+    """listdir zfs_attrs / acl come from statx; check them against the ioctl and the ACL itself."""
+    with (
+        create_dataset("listdir_zfsflags", {"share_type": "SMB"}) as ds,
+        create_dataset("listdir_zfsflags/child"),
+    ):
+        base = f"/mnt/{ds}"
+        ssh(f"mkdir {base}/d && touch {base}/f {base}/trivial && ln -s f {base}/lnk")
+        call("filesystem.set_zfs_attributes", {
+            "path": f"{base}/f", "zfs_file_attributes": {"hidden": True, "system": True}
+        }, job=True)
+        call("filesystem.setperm", {"path": f"{base}/trivial", "options": {"stripacl": True}}, job=True)
+
+        entries = {e["name"]: e for e in call("filesystem.listdir", base)}
+        for name in ("d", "f", "trivial", "child", "lnk"):
+            target = f"{base}/f" if name == "lnk" else f"{base}/{name}"
+            zfs_attrs = call("filesystem.get_zfs_attributes", target)
+            assert set(entries[name]["zfs_attrs"]) == {k.upper() for k, v in zfs_attrs.items() if v}, name
+            assert entries[name]["acl"] is not call("filesystem.getacl", target)["trivial"], name
+
+        assert {"HIDDEN", "SYSTEM"} <= set(entries["f"]["zfs_attrs"])
+        assert entries["trivial"]["acl"] is False
+        assert call("filesystem.stat", f"{base}/trivial")["acl"] is False
+        assert call("filesystem.stat", f"{base}/f")["acl"] is True

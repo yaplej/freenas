@@ -1,22 +1,30 @@
-from middlewared.service import private, Service
+from typing import Literal
+
+from middlewared.api.base import BaseModel
+from middlewared.api.current import NFSEntry
+
+from .utils import NFSProtocol
+
+NfsSecurityFlavor = Literal["sys", "krb5", "krb5i", "krb5p"]
 
 
-class NFSService(Service):
+class NFSSecArgs(BaseModel):
+    config: NFSEntry
+    has_nfs_principal: bool
 
-    class Config:
-        service = "nfs"
-        service_verb = "restart"
-        datastore_prefix = "nfs_srv_"
-        datastore_extend = 'nfs.nfs_extend'
 
-    @private
-    async def sec(self, config, has_nfs_principal):
-        if config["v4"]:
-            if config["v4_krb"]:
-                return ["krb5", "krb5i", "krb5p"]
-            elif has_nfs_principal:
-                return ["sys", "krb5", "krb5i", "krb5p"]
-            else:
-                return ["sys"]
+class NFSSecResult(BaseModel):
+    result: list[NfsSecurityFlavor]
 
+
+def security_flavors(config: NFSEntry, has_nfs_principal: bool) -> list[NfsSecurityFlavor]:
+    if NFSProtocol.NFSv4 not in config.protocols:
         return []
+
+    if config.v4_krb:
+        return ["krb5", "krb5i", "krb5p"]
+
+    if has_nfs_principal:
+        return ["sys", "krb5", "krb5i", "krb5p"]
+
+    return ["sys"]

@@ -1,269 +1,183 @@
-#!/usr/bin/env python3
-
-# Author: Eric Turgeon
-# License: BSD
+import time
+import os
+import errno
+import re
 
 import pytest
-import sys
-import os
-import random
-from pytest_dependency import depends
-apifolder = os.getcwd()
-sys.path.append(apifolder)
-from auto_config import ip, ha
-from functions import GET, PUT, POST
 
-if ha and 'virtual_ip' in os.environ:
-    interface = os.environ['iface']
-    controller1_ip = os.environ['controller1_ip']
-    controller2_ip = os.environ['controller2_ip']
-    virtual_ip = os.environ['virtual_ip']
-    vhid = os.environ['vhid']
-else:
-    from auto_config import interface
-
-aliases = {'address': ip}
-# Create a random IP
-vlan1_ip = f'192.168.0.{random.randint(10, 250)}'
+from middlewared.service_exception import ValidationError, ValidationErrors
+from auto_config import interface, ha, netmask
+from middlewared.test.integration.utils.client import client, truenas_server
+from middlewared.test.integration.utils import call, ha_test, ssh
 
 
-if not ha:
-    @pytest.mark.dependency(name='GET_NAME')
-    def test_01_get_interface_name():
-        results = GET(f'/interface?name={interface}')
-        assert results.status_code == 200, results.text
-        assert isinstance(results.json(), list) is True, results.text
-        assert results.json()[0]['name'] == interface, results.text
+@pytest.fixture(scope="module")
+def ws_client():
+    with client(host_ip=truenas_server.ip) as c:
+        yield c
 
-    @pytest.mark.dependency(name='GET_ALIASES')
-    def test_02_get_interface_aliases_ip(request):
-        depends(request, ['GET_NAME'])
-        results = GET(f'/interface?name={interface}')
-        assert results.status_code == 200, results.text
-        assert isinstance(results.json(), list) is True, results.text
-        for aliases_list in results.json()[0]['state']['aliases']:
-            assert isinstance(aliases_list['address'], str) is True, results.text
-            # no break to look all address value are string
-            if ip in aliases_list['address']:
-                interface_ip = aliases_list['address']
-        assert interface_ip == ip, results.text
 
-    @pytest.mark.dependency(name='GET_ALIASES_BROADCAST')
-    def test_03_get_interface_aliases_broadcast_ip(request):
-        depends(request, ['GET_ALIASES'])
-        results = GET(f'/interface?name={interface}')
-        assert results.status_code == 200, results.text
-        assert isinstance(results.json(), list) is True, results.text
-        for aliases_list in results.json()[0]['state']['aliases']:
-            if ip in aliases_list['address']:
-                broadcast_ip = aliases_list['broadcast']
-                break
-        assert isinstance(broadcast_ip, str) is True, results.text
-        aliases['broadcast'] = broadcast_ip
-
-    @pytest.mark.dependency(name='GET_ALIASES_TYPE')
-    def test_04_get_interface_aliases_type(request):
-        depends(request, ['GET_ALIASES_BROADCAST'])
-        results = GET(f'/interface?name={interface}')
-        assert results.status_code == 200, results.text
-        assert isinstance(results.json(), list) is True, results.text
-        for aliases_list in results.json()[0]['state']['aliases']:
-            assert isinstance(aliases_list['type'], str) is True, results.text
-            # no break to look all address value are string
-            if ip in aliases_list['address']:
-                types = aliases_list['type']
-        assert types in ('INET', 'INET6'), results.text
-        aliases['type'] = types
-
-    @pytest.mark.dependency(name='GET_ALIASES_NETMASK')
-    def test_05_get_interface_aliases_netmask(request):
-        depends(request, ['GET_ALIASES_TYPE'])
-        results = GET(f'/interface?name={interface}')
-        assert results.status_code == 200, results.text
-        assert isinstance(results.json(), list) is True, results.text
-        for aliases_list in results.json()[0]['state']['aliases']:
-            if ip in aliases_list['address']:
-                netmask = aliases_list['netmask']
-                break
-        assert isinstance(netmask, int) is True, results.text
-        aliases['netmask'] = netmask
-
-    @pytest.mark.dependency(name='IN_USE')
-    def test_06_get_interface_ipv4_in_use(request):
-        depends(request, ['GET_ALIASES_NETMASK'])
-        global results
-        results = POST('/interface/ip_in_use/', {'ipv4': True})
-        assert results.status_code == 200, results.text
-
-    @pytest.mark.dependency(name='VERIFY_IN_USE')
-    @pytest.mark.parametrize('dkey', ['type', 'address', 'netmask', 'broadcast'])
-    def test_07_look_at_interface_ipv4_in_use_output_(dkey, request):
-        depends(request, ['IN_USE'])
-        for dictionary in results.json():
-            if dictionary[dkey] == aliases[dkey]:
-                assert dictionary[dkey] == aliases[dkey], results.text
-                break
-        else:
-            assert False, results.text
-
-    @pytest.mark.dependency(name='INITIAL_CONFIG')
-    def test_08_set_main_interface_ipv4_to_false(request):
-        depends(request, ['VERIFY_IN_USE'])
+@pytest.fixture(scope="module")
+def get_payload(ws_client):
+    if ha:
         payload = {
-            'ipv4_dhcp': False,
-            'aliases': [
+            "ipv4_dhcp": False,
+            "ipv6_auto": False,
+            "failover_critical": True,
+            "failover_group": 1,
+            "aliases": [
                 {
-                    'address': ip,
-                    'netmask': aliases['netmask']
-                }
-            ]
-        }
-        results = PUT(f'/interface/id/{interface}/', payload)
-        assert results.status_code == 200, results.text
-        assert isinstance(results.json(), dict) is True, results.text
-        assert results.json()['ipv4_dhcp'] is False, results.text
-
-    @pytest.mark.dependency(name='DHCP_IS_FALSE')
-    def test_09_looking_main_interface_ipv4_dhcp_if_is_false(request):
-        depends(request, ['INITIAL_CONFIG'])
-        results = GET(f'/interface/id/{interface}')
-        assert results.status_code == 200, results.text
-        assert isinstance(results.json(), dict) is True, results.text
-        assert results.json()['ipv4_dhcp'] is False, results.text
-
-    @pytest.mark.dependency(name='ALIAS_VERIFICATION')
-    @pytest.mark.parametrize('dkey', ['type', 'address', 'netmask'])
-    def test_10_look_at_interface_aliases_output_(dkey, request):
-        depends(request, ['DHCP_IS_FALSE'])
-        results = GET(f'/interface/id/{interface}')
-        assert results.status_code == 200, results.text
-        assert isinstance(results.json(), dict) is True, results.text
-        assert results.json()['aliases'][0][dkey] == aliases[dkey], results.text
-
-    @pytest.mark.dependency(name='CREATE_VLAN1')
-    def test_11_creating_vlan1_interface(request):
-        depends(request, ['ALIAS_VERIFICATION'])
-        global payload
-        payload = {
-            'ipv4_dhcp': False,
-            'aliases': [
-                {
-                    'address': vlan1_ip,
-                    'netmask': aliases['netmask']
+                    "type": "INET",
+                    "address": os.environ["controller1_ip"],
+                    "netmask": int(netmask),
                 }
             ],
-            'vlan_parent_interface': interface,
-            'name': 'vlan1',
-            'type': 'VLAN',
-            'vlan_tag': 1,
-            'vlan_pcp': 1
-        }
-        global results
-        results = POST('/interface/', payload)
-        assert results.status_code == 200, results.text
-        assert isinstance(results.json(), dict) is True, results.text
-        global interfaces_id
-        interfaces_id = results.json()['id']
-
-    @pytest.mark.dependency(name='VERIFY_VLAN1')
-    @pytest.mark.parametrize('dkey', ['ipv4_dhcp', 'name', 'vlan_parent_interface',
-                                      'type', 'vlan_tag', 'vlan_pcp'])
-    def test_12_compare_payload_with_created_vlan1_interface_result_output_(dkey, request):
-        depends(request, ['CREATE_VLAN1'])
-        assert results.json()[dkey] == payload[dkey], results.text
-
-    @pytest.mark.dependency(name='GET_VLAN1')
-    def test_13_get_the_vlan1_interface_results(request):
-        depends(request, ['VERIFY_VLAN1'])
-        global results
-        results = GET(f'/interface/id/{interfaces_id}/')
-        assert results.status_code == 200, results.text
-        assert isinstance(results.json(), dict) is True, results.text
-
-    @pytest.mark.parametrize('dkey', ['ipv4_dhcp', 'name', 'vlan_parent_interface',
-                                      'type', 'vlan_tag', 'vlan_pcp'])
-    def test_14_compare_payload_with_get_vlan1_interface_result_output_(dkey, request):
-        depends(request, ['GET_VLAN1'])
-        assert results.json()[dkey] == payload[dkey], results.text
-
-
-if ha and 'virtual_ip' in os.environ:
-    @pytest.mark.dependency(name='INITIAL_CONFIG')
-    def test_15_set_interface_for_ha():
-        payload = {
-            'ipv4_dhcp': False,
-            'failover_critical': True,
-            'failover_vhid': vhid,
-            'failover_group': 1,
-            'aliases': [
+            "failover_aliases": [
                 {
-                    'type': 'INET',
-                    'address': controller1_ip,
-                    'netmask': 23
+                    "type": "INET",
+                    "address": os.environ["controller2_ip"],
                 }
             ],
-            'failover_aliases': [
+            "failover_virtual_aliases": [
                 {
-                    'type': 'INET',
-                    'address': controller2_ip,
-                }
-            ],
-            'failover_virtual_aliases': [
-                {
-                    'type': 'INET',
-                    'address': virtual_ip,
+                    "type": "INET",
+                    "address": os.environ["virtual_ip"],
                 }
             ],
         }
+        to_validate = [os.environ["controller1_ip"], os.environ["virtual_ip"]]
+    else:
+        # NOTE: on a non-HA system, this method is assuming
+        # that the machine has been handed an IPv4 address
+        # from a DHCP server. That's why we're getting this information.
+        ans = ws_client.call(
+            "interface.query", [["name", "=", interface]], {"get": True}
+        )
+        payload = {"ipv4_dhcp": False, "ipv6_auto": False, "aliases": []}
+        to_validate = []
+        ip = truenas_server.ip
+        for info in filter(lambda x: x["address"] == ip, ans["state"]["aliases"]):
+            payload["aliases"].append({"address": ip, "netmask": info["netmask"]})
+            to_validate.append(ip)
 
-        results = PUT(f'/interface/id/{interface}/', payload, controller_a=ha)
-        assert results.status_code == 200, results.text
-        global interfaces_id
-        interfaces_id = results.json()['id']
+        assert all((payload["aliases"], to_validate))
 
-
-@pytest.mark.dependency(name='PENDING_TRUE')
-def test_16_get_interface_has_pending_changes(request):
-    depends(request, ['INITIAL_CONFIG'])
-    results = GET('/interface/has_pending_changes', controller_a=ha)
-    assert results.status_code == 200, results.text
-    assert isinstance(results.json(), bool) is True, results.text
-    assert results.json() is True, results.text
-
-
-@pytest.mark.dependency(name='COMMIT')
-def test_17_commit_interface(request):
-    depends(request, ['PENDING_TRUE'])
-    results = POST('/interface/commit/', {'rollback': True, 'checkin_timeout': 10}, controller_a=ha)
-    assert results.status_code == 200, results.text
+    return payload, to_validate
 
 
-@pytest.mark.dependency(name='CHECKIN_WAITING')
-def test_18_get_interface_checkin_waiting(request):
-    depends(request, ['COMMIT'])
-    results = GET('/interface/checkin_waiting/', controller_a=ha)
-    assert results.status_code == 200, results.text
-    assert isinstance(results.json(), int), results.text
+# Make sure that our initial conditions are met
+def test_001_check_ipvx(request):
+    # Verify that DHCP is running
+    # The static IP are configured in test_002 (below)
+    result = ssh(f"python3 -c 'from middlewared.plugins.interface.dhcp import dhcp_status; print(dhcp_status(\"{interface}\").running)'")
+    assert "True" in result
+
+    # Some explanation of IPv6 routing...
+    # IPv6 Routing Mechanism: IPv6 typically uses a different mechanism for hosts
+    # to discover default gateways and configure addresses.
+    # This is primarily done through the Neighbor Discovery Protocol (NDP),
+    # specifically Router Solicitation (RS) and Router Advertisement (RA) messages.
+    # For IPv6, dpcpcd sets the interface autoconf value based on the sensed
+    # routing capability.
+    # NOTE: The 'equivalent' IPv4 proto setting is 'dhcp'
+    interface_ipv6_autoconf = int(ssh(f"sysctl -n net.ipv6.conf.{interface}.autoconf"))
+
+    # Get the route settings for this interfadce
+    ip6_route_show = ssh(f"ip -6 route show dev {interface}")
+
+    # The output looks like: 'fe80::/64 proto kernel metric 256 pref medium'
+    # We are interested in the 'proto' setting
+    match = re.search(r'\b' + 'proto' + r'\s+(\w+)\b', ip6_route_show)
+    if match.group(1) == 'ra':
+        # 'ra' means the router is dishing out IPv6 addresses and is routable.
+        # In this condition, autoconf should be '1'.
+        assert interface_ipv6_autoconf == 1
+    else:
+        # The usual other value is 'kernel' which means an address cobbled together usually
+        # based on the IPv4 address and is NOT routable.
+        assert interface_ipv6_autoconf == 0
 
 
-@pytest.mark.dependency(name='CHECKIN')
-def test_19_get_interface_checkin(request):
-    depends(request, ['CHECKIN_WAITING'])
-    results = GET('/interface/checkin/', controller_a=ha)
-    assert results.status_code == 200, results.text
-    assert results.json() is None, results.text
+def test_002_configure_interface(request, ws_client, get_payload):
+    if ha:
+        # can not make network changes on an HA system unless failover has
+        # been explicitly disabled
+        ws_client.call("failover.update", {"disabled": True, "master": True})
+        assert ws_client.call("failover.config")["disabled"] is True
+
+    # send the request to configure the interface
+    ws_client.call("interface.update", interface, get_payload[0])
+
+    # 1. Verify there are pending changes
+    assert ws_client.call("interface.has_pending_changes")
+    # 2. Verify no network configuration will be wiped by the changes
+    assert ws_client.call("interface.network_config_to_be_removed") == []
+    # 3. Commit the changes, specifying the rollback timer
+    ws_client.call("interface.commit", {"rollback": True, "checkin_timeout": 10})
+    # 4. Verify the changes that were committed need to be "checked in" (finalized)
+    assert ws_client.call("interface.checkin_waiting")
+    # 5. Finalize the changes before they are rolled back (i.e. checkin)
+    ws_client.call("interface.checkin")
+    assert ws_client.call("interface.checkin_waiting") is None
+    # 6. Verify there are no more pending interface changes
+    assert ws_client.call("interface.has_pending_changes") is False
+
+    if ha:
+        # on HA, keepalived is responsible for configuring the VIP so let's give it
+        # some time to settle
+        time.sleep(3)
+
+    # We've configured the interface so let's make sure the ip addresses on the interface
+    # match reality
+    reality = set(
+        [i["address"] for i in ws_client.call("interface.ip_in_use", {"ipv4": True})]
+    )
+    assert reality == set(get_payload[1])
+
+    if ha:
+        # let's go 1-step further and validate that the VIP accepts connections
+        with client(host_ip=os.environ["virtual_ip"]) as c:
+            assert c.call("core.ping") == "pong"
+            assert c.call("failover.call_remote", "core.ping") == "pong"
+
+        # it's very important to set this because the `tests/conftest.py` config
+        # (that pytest uses globally for the entirety of CI runs) uses this IP
+        # address and so we need to make sure it uses the VIP on HA systems
+        truenas_server.ip = os.environ["virtual_ip"]
+        truenas_server.nodea_ip = os.environ["controller1_ip"]
+        truenas_server.nodeb_ip = os.environ["controller2_ip"]
+        truenas_server.server_type = os.environ["SERVER_TYPE"]
 
 
-@pytest.mark.dependency(name='PENDING_FALSE')
-def test_20_get_interface_has_pending_changes(request):
-    depends(request, ['CHECKIN'])
-    results = GET('/interface/has_pending_changes', controller_a=ha)
-    assert results.status_code == 200, results.text
-    assert isinstance(results.json(), bool) is True, results.text
-    assert results.json() is False, results.text
+def test_003_recheck_ipvx(request):
+    assert int(ssh(f"sysctl -n net.ipv6.conf.{interface}.autoconf")) == 0
 
 
-def test_21_get_the_vlan1_interface_from_id(request):
-    depends(request, ['PENDING_FALSE'])
-    results = GET(f'/interface/id/{interfaces_id}/', controller_a=ha)
-    assert results.status_code == 200, results.text
+@ha_test
+def test_004_remove_critical_failover_group(request):
+    with pytest.raises(ValidationErrors) as ve:
+        call(
+            "interface.update",
+            interface,
+            {"failover_group": None, "failover_critical": True},
+        )
+    assert ve.value.errors == [
+        ValidationError(
+            "interface_update.failover_group",
+            "A failover group is required when configuring a critical failover interface.",
+            errno.EINVAL,
+        )
+    ]
+
+
+@ha_test
+def test_005_failover_timeout_out_of_range(request):
+    # timeout values above 120 seconds produce a VRRP advertisement interval
+    # beyond the VRRPv3 maximum of 40.95 seconds, which keepalived rejects,
+    # breaking failover entirely (SEE-577)
+    before = call("failover.config")["timeout"]
+    with pytest.raises(ValidationErrors, match="Input should be less than or equal to 120"):
+        call("failover.update", {"timeout": 3600})
+    with pytest.raises(ValidationErrors, match="Input should be greater than or equal to 0"):
+        call("failover.update", {"timeout": -1})
+    assert call("failover.config")["timeout"] == before

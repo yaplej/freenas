@@ -5,6 +5,12 @@ Middleware Daemon
     :maxdepth: 1
     :caption: Contents:
 
-    process_pool.rst
+    development.rst
+    session.rst
+    state.rst
+    service.rst
+    etc_files.rst
     jobs.rst
+    roles.rst
+    audit.rst
     plugins/index.rst

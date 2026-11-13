@@ -1,0 +1,52 @@
+from typing import Any
+
+from apps_validation.portals import (
+    IX_ACTION_REQUIRED_KEY,
+    IX_NOTES_KEY,
+    IX_PORTAL_KEY,
+    ValidationErrors,
+    validate_portals_and_notes,
+)
+
+from .lifecycle import get_rendered_template_config_of_app
+
+
+def normalized_port_value(scheme: str, port: int) -> str:
+    return '' if ((scheme == 'http' and port == 80) or (scheme == 'https' and port == 443)) else f':{port}'
+
+
+def normalized_host_value(host: str) -> str:
+    if ':' in host:
+        return f'[{host}]'
+    return host
+
+
+def get_portals_and_app_notes(app_name: str, version: str) -> dict[str, Any]:
+    rendered_config = get_rendered_template_config_of_app(app_name, version)
+    portal_and_notes_config = {
+        k: rendered_config[k]
+        for k in (IX_NOTES_KEY, IX_PORTAL_KEY, IX_ACTION_REQUIRED_KEY)
+        if k in rendered_config
+    }
+    config: dict[str, Any] = {
+        'portals': {},
+        'notes': None,
+        'action_required': False,
+    }
+    if portal_and_notes_config:
+        try:
+            validate_portals_and_notes('portal', portal_and_notes_config)
+        except ValidationErrors:
+            return config
+
+    portals = {}
+    for portal in portal_and_notes_config.get(IX_PORTAL_KEY, []):
+        port_value = normalized_port_value(portal['scheme'], portal['port'])
+        host_value = normalized_host_value(portal['host'])
+        portals[portal['name']] = f'{portal["scheme"]}://{host_value}{port_value}{portal.get("path", "")}'
+
+    return {
+        'portals': portals,
+        'notes': portal_and_notes_config.get(IX_NOTES_KEY),
+        'action_required': bool(portal_and_notes_config.get(IX_ACTION_REQUIRED_KEY)),
+    }

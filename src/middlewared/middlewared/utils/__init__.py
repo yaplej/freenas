@@ -1,307 +1,159 @@
 import asyncio
+import dataclasses
+import errno
+import functools
+import json
 import logging
-import re
-import signal
 import subprocess
-from datetime import datetime, timedelta
-from functools import wraps
-from threading import Lock
+import time
+import typing
+from typing import Any, Sequence
 
-from middlewared.service_exception import MatchNotFound
-from middlewared.utils import osc
-from middlewared.utils.threading import start_daemon_thread  # noqa
+from .prctl import die_with_parent
 
-BUILDTIME = None
-VERSION = None
-MID_PID = None
-MIDDLEWARE_RUN_DIR = '/var/run/middleware'
+
+# Define Product Strings
+@dataclasses.dataclass(slots=True, frozen=True)
+class ProductTypes:
+    COMMUNITY_EDITION: str = 'COMMUNITY_EDITION'
+    ENTERPRISE: str = 'ENTERPRISE'
+
+
+@dataclasses.dataclass(slots=True, frozen=True)
+class ProductNames:
+    PRODUCT_NAME: str = 'TrueNAS'
+
+
+ProductType = ProductTypes()
+ProductName = ProductNames()
+
+MIDDLEWARE_RUN_DIR = '/run/middleware'
+# Private unix socket that nginx reverse-proxies all external API/UI traffic over.
+# Locked down to the nginx worker uid so this traffic is not exposed on loopback TCP.
+MIDDLEWARE_NGINX_SOCK = f'{MIDDLEWARE_RUN_DIR}/middlewared-nginx.sock'
+MIDDLEWARE_BOOT_ENV_STATE_DIR = '/var/lib/truenas-middleware'
+MIDDLEWARE_STARTED_SENTINEL_PATH = f'{MIDDLEWARE_RUN_DIR}/middlewared-started'
+BOOTREADY = f'{MIDDLEWARE_RUN_DIR}/.bootready'
+MANIFEST_FILE = '/data/manifest.json'
+UPDATE_TRAINS_FILE_NAME = 'trains_v2.json'
+BRAND = ProductName.PRODUCT_NAME
 
 logger = logging.getLogger(__name__)
 
 
-def bisect(condition, iterable):
-    a = []
-    b = []
-    for val in iterable:
-        if condition(val):
-            a.append(val)
-        else:
-            b.append(val)
-
-    return a, b
+class UnexpectedFailure(Exception):
+    pass
 
 
-def Popen(args, **kwargs):
-    shell = kwargs.pop('shell', None)
-    if shell:
-        return asyncio.create_subprocess_shell(args, **kwargs)
-    else:
-        return asyncio.create_subprocess_exec(*args, **kwargs)
+currently_running_subprocesses: set[str] = set()
 
 
-async def run(*args, **kwargs):
+@typing.overload
+async def run(*args: Any, encoding: None = None, **kwargs: Any) -> subprocess.CompletedProcess[bytes]: ...
+
+
+@typing.overload
+async def run(*args: Any, encoding: str, **kwargs: Any) -> subprocess.CompletedProcess[str]: ...
+
+
+async def run(*args: Any, **kwargs: Any) -> subprocess.CompletedProcess[bytes] | subprocess.CompletedProcess[str]:
     if isinstance(args[0], list):
         args = tuple(args[0])
+
     kwargs.setdefault('stdout', subprocess.PIPE)
     kwargs.setdefault('stderr', subprocess.PIPE)
-    check = kwargs.pop('check', True)
-    encoding = kwargs.pop('encoding', None)
-    errors = kwargs.pop('errors', None) or 'strict'
-    abort_signal = kwargs.pop('abort_signal', signal.SIGKILL)
-    proc = await asyncio.create_subprocess_exec(*args, **kwargs)
+    kwargs.setdefault('check', True)
+    if 'encoding' in kwargs:
+        kwargs.setdefault('errors', 'strict')
+    kwargs.setdefault('close_fds', True)
+    kwargs['preexec_fn'] = die_with_parent
+
+    subprocess_identifier = f"{time.monotonic()}: {args!r}"
     try:
-        stdout, stderr = await proc.communicate()
-    except asyncio.CancelledError:
-        if abort_signal is not None:
-            proc.send_signal(abort_signal)
-        raise
-    if encoding:
-        if stdout is not None:
-            stdout = stdout.decode(encoding, errors)
-        if stderr is not None:
-            stderr = stderr.decode(encoding, errors)
-    cp = subprocess.CompletedProcess(args, proc.returncode, stdout=stdout, stderr=stderr)
-    if check:
-        cp.check_returncode()
-    return cp
-
-
-def partition(s):
-    rv = ''
-    while True:
-        left, sep, right = s.partition('.')
-        if not sep:
-            return rv + left, right
-        if left[-1] == '\\':
-            rv += left[:-1] + sep
-            s = right
-        else:
-            return rv + left, right
-
-
-def get(obj, path):
-    """
-    Get a path in obj using dot notation
-
-    e.g.
-        obj = {'foo': {'bar': '1'}, 'foo.bar': '2', 'foobar': ['first', 'second', 'third']}
-
-        path = 'foo.bar' returns '1'
-        path = 'foo\\.bar' returns '2'
-        path = 'foobar.0' returns 'first'
-    """
-    right = path
-    cur = obj
-    while right:
-        left, right = partition(right)
-        if isinstance(cur, dict):
-            cur = cur.get(left)
-        elif isinstance(cur, (list, tuple)):
-            left = int(left)
-            cur = cur[left] if left < len(cur) else None
-    return cur
-
-
-def filter_list(_list, filters=None, options=None):
-
-    opmap = {
-        '=': lambda x, y: x == y,
-        '!=': lambda x, y: x != y,
-        '>': lambda x, y: x > y,
-        '>=': lambda x, y: x >= y,
-        '<': lambda x, y: x < y,
-        '<=': lambda x, y: x <= y,
-        '~': lambda x, y: re.match(y, x),
-        'in': lambda x, y: x in y,
-        'nin': lambda x, y: x not in y,
-        'rin': lambda x, y: x is not None and y in x,
-        'rnin': lambda x, y: x is not None and y not in x,
-        '^': lambda x, y: x is not None and x.startswith(y),
-        '!^': lambda x, y: x is not None and not x.startswith(y),
-        '$': lambda x, y: x is not None and x.endswith(y),
-        '!$': lambda x, y: x is not None and not x.endswith(y),
-    }
-
-    if filters is None:
-        filters = {}
-    if options is None:
-        options = {}
-
-    select = options.get('select')
-
-    rv = []
-    if filters:
-
-        def filterop(f):
-            if len(f) != 3:
-                raise ValueError(f'Invalid filter {f}')
-            name, op, value = f
-            if op not in opmap:
-                raise ValueError('Invalid operation: {}'.format(op))
-            if isinstance(i, dict):
-                source = get(i, name)
-            else:
-                source = getattr(i, name)
-            if opmap[op](source, value):
-                return True
-            return False
-
-        for i in _list:
-            valid = True
-            for f in filters:
-                if len(f) == 2:
-                    op, value = f
-                    if op == 'OR':
-                        for f in value:
-                            if filterop(f):
-                                break
-                        else:
-                            valid = False
-                            break
-                    else:
-                        raise ValueError(f'Invalid operation: {op}')
-                elif not filterop(f):
-                    valid = False
-                    break
-
-            if not valid:
-                continue
-            if select:
-                entry = {}
-                for s in select:
-                    if s in i:
-                        entry[s] = i[s]
-            else:
-                entry = i
-            rv.append(entry)
-            if options.get('get') is True:
-                return entry
-    elif select:
-        rv = []
-        for i in _list:
-            entry = {}
-            for s in select:
-                if s in i:
-                    entry[s] = i[s]
-            rv.append(entry)
-    else:
-        rv = _list
-
-    if options.get('count') is True:
-        return len(rv)
-
-    if options.get('order_by'):
-        for o in options.get('order_by'):
-            if o.startswith('-'):
-                o = o[1:]
-                reverse = True
-            else:
-                reverse = False
-            rv = sorted(rv, key=lambda x: get(x, o), reverse=reverse)
-
-    if options.get('get') is True:
+        currently_running_subprocesses.add(subprocess_identifier)
         try:
-            return rv[0]
-        except IndexError:
-            raise MatchNotFound() from None
+            return await asyncio.to_thread(functools.partial(subprocess.run, args, **kwargs))
+        finally:
+            currently_running_subprocesses.discard(subprocess_identifier)
+    except OSError as e:
+        if e.errno == errno.EMFILE:
+            logger.warning("Currently running async subprocesses: %r", currently_running_subprocesses)
 
-    if options.get('offset'):
-        rv = rv[options['offset']:]
-
-    if options.get('limit'):
-        return rv[:options['limit']]
-
-    return rv
+        raise
 
 
-def filter_getattrs(filters):
-    """
-    Get a set of attributes in a filter list.
-    """
-    attrs = set()
-    if not filters:
-        return attrs
-
-    f = filters.copy()
-    while f:
-        filter_ = f.pop()
-        if len(filter_) == 2:
-            f.append(filter_[1])
-        elif len(filter_) == 3:
-            attrs.add(filter_[0])
-        else:
-            raise ValueError('Invalid filter.')
-    return attrs
+@dataclasses.dataclass(slots=True, frozen=True, kw_only=True)
+class SwInfo:
+    stable: bool
+    version: str
+    fullname: str
+    buildtime: int
 
 
-def sw_buildtime():
-    global BUILDTIME
-    if BUILDTIME is None:
-        version = osc.get_app_version()
-        BUILDTIME = version['buildtime']
-    return BUILDTIME
-
-
-def sw_version():
-    global VERSION
-    if VERSION is None:
-        version = osc.get_app_version()
-        VERSION = version['fullname']
-    return VERSION
-
-
-def sw_version_is_stable():
-    version = osc.get_app_version()
-    return version['stable']
-
-
-def is_empty(val):
-    """
-    A small utility function that check if the provided string is either None, '',
-    or just a string containing only spaces
-    """
-    return val in [None, ''] or val.isspace()
-
-
-class Nid(object):
-
-    def __init__(self, _id):
-        self._id = _id
-
-    def __call__(self):
-        num = self._id
-        self._id += 1
-        return num
-
-
-class cache_with_autorefresh(object):
-    """
-    A decorator which caches the result of a function (with no arguments as yet)
-    and returns the cache untill the autorefresh timeout is hit, upon which it
-    call the function again and caches the result for future calls.
-    """
-
-    def __init__(self, seconds=0, minutes=0, hours=0):
-        self.refresh_period = timedelta(
-            seconds=seconds, minutes=minutes, hours=hours
+@functools.cache
+def sw_info() -> SwInfo:
+    """Returns the various software information from the manifest file."""
+    with open(MANIFEST_FILE) as f:
+        manifest = json.load(f)
+        version = manifest['version']
+        return SwInfo(
+            stable='MASTER' not in manifest['version'],
+            version=version,
+            fullname=f'{BRAND}-{version}',
+            buildtime=manifest['buildtime'],
         )
-        self.cached_return = None
-        self.first = True
-        self.time_of_last_call = datetime.min
-        self.lock = Lock()
 
-    def __call__(self, fn):
-        @wraps(fn)
-        def wrapper(*args, **kwargs):
-            now = datetime.now()
-            time_since_last_call = now - self.time_of_last_call
 
-            with self.lock:
-                if time_since_last_call > self.refresh_period or self.first:
-                    self.first = False
-                    self.time_of_last_call = now
-                    self.cached_return = fn(*args, **kwargs)
+def sw_buildtime() -> int:
+    return sw_info().buildtime
 
-            return self.cached_return
 
-        return wrapper
+def sw_version() -> str:
+    return sw_info().fullname
+
+
+def are_indices_in_consecutive_order(arr: Sequence[int]) -> bool:
+    """
+    Determine if the integers in an array form a consecutive sequence
+    with respect to their indices.
+
+    This function checks whether each integer at a given index position is
+    exactly one greater than the integer at the previous index. In other
+    words, it verifies that the sequence of numbers increases by exactly one
+    as you move from left to right through the array.
+
+    Parameters:
+    arr (list[int]): A list of integers whose index-based order needs to be
+                     validated.
+
+    Returns:
+    bool:
+        - True if the numbers are consecutive.
+        - False if any number does not follow the previous number by exactly one.
+
+    Examples:
+    >>> are_indices_in_consecutive_order([1, 2])
+    True
+
+    >>> are_indices_in_consecutive_order([1, 3])
+    False
+
+    >>> are_indices_in_consecutive_order([5, 6, 7])
+    True
+
+    >>> are_indices_in_consecutive_order([4, 6, 7])
+    False
+
+    Edge Cases:
+    - An empty array will return True as there are no elements to violate
+      the order.
+    - A single-element array will also return True for the same reason.
+
+    Notes:
+    - The function does not modify the input array and operates in O(n) time
+      complexity, where n is the number of elements in the list.
+    """
+    for i in range(1, len(arr)):
+        if arr[i] != arr[i - 1] + 1:
+            return False
+    return True

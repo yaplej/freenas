@@ -1,63 +1,110 @@
-from middlewared.service import private, Service
-from .netif import netif
+from __future__ import annotations
+
+import socket
+
+from truenas_pynetif.address.get_links import get_link
+from truenas_pynetif.configure import (
+    BridgeConfig,
+)
+from truenas_pynetif.configure import (
+    configure_bridge as pynetif_configure_bridge,
+)
+from truenas_pynetif.netlink import DeviceNotFound, LinkInfo
+
+from middlewared.service import ServiceContext
+
+from .sync_data import SyncData
+
+__all__ = ("configure_bridges_impl",)
 
 
-class InterfaceService(Service):
+def configure_bridges_impl(
+    ctx: ServiceContext,
+    sock: socket.socket,
+    links: dict[str, LinkInfo],
+    sync_data: SyncData,
+) -> tuple[list[str], list[str]]:
+    """Configure all bridge interfaces from database.
 
-    class Config:
-        namespace_alias = 'interfaces'
+    Args:
+        ctx: Service context
+        sock: Netlink socket from netlink_route()
+        links: Dict of LinkInfo objects from get_links()
+        sync_data: Combined database data
 
-    @private
-    def bridge_setup(self, bridge, parent_interfaces):
-        name = bridge['interface']['int_interface']
-        bridge_mtu = bridge['interface']['int_mtu'] or 1500
+    Returns:
+        Tuple of (configured bridge interface names, descriptions of bridges that failed)
+    """
+    configured = []
+    failures = []
+    for bridge in sync_data.bridges:
+        name = bridge["interface"]["int_interface"]
         try:
-            iface = netif.get_interface(name)
-        except KeyError:
-            netif.create_interface(name)
-            iface = netif.get_interface(name)
+            configure_bridge_impl(ctx, sock, links, bridge)
+            configured.append(name)
+        except Exception as e:
+            ctx.logger.error("Error configuring bridge %s", name, exc_info=True)
+            failures.append(describe_bridge_failure(sock, name, bridge["members"], e))
+    return configured, failures
 
-        self.logger.info('Setting up %r', name)
 
-        if iface.mtu != bridge_mtu:
-            self.logger.info('Setting %r MTU to %d', name, bridge_mtu)
-            iface.mtu = bridge_mtu
+def describe_bridge_failure(sock: socket.socket, name: str, members: list[str], error: Exception) -> str:
+    """Describe a failed bridge configuration, naming the members that were not enslaved.
 
-        db_members = set(bridge['members'])
-        os_members = set(iface.members)
-        for member in os_members - db_members:
-            # We do not remove vnetX interfaces from bridge as they would be consumed by libvirt
-            if member.startswith('vnet'):
-                continue
+    The netlink error alone does not say which member was refused, and the
+    kernel gives no reason beyond an errno (EBUSY, for one, means the member
+    already hosts macvlan/macvtap ports).
 
-            # remove members from the bridge that aren't in the db
-            self.logger.info('Removing member interface %r from %r', member, name)
-            iface.delete_member(member)
+    Args:
+        sock: Netlink socket from netlink_route()
+        name: Bridge interface name
+        members: Members the bridge should have
+        error: Exception raised while configuring the bridge
 
-        for member in db_members - os_members:
-            # now add members that are written in db but do not exist in
-            # the bridge on OS side
-            try:
-                self.logger.info('Adding member interface %r to %r', member, name)
-                iface.add_member(member)
-            except FileNotFoundError:
-                self.logger.error('Bridge member %r not found', member)
-                continue
+    Returns:
+        One-line description suitable for an error message
+    """
+    try:
+        bridge_index = get_link(sock, name).index
+    except DeviceNotFound:
+        return f"{name}: failed to create bridge ({error})"
 
-            # now make sure the bridge member is up
-            member_iface = netif.get_interface(member)
-            if netif.InterfaceFlags.UP not in member_iface.flags:
-                self.logger.info('Bringing up member interface %r in %r', member_iface.name, name)
-                member_iface.up()
+    missing = []
+    for member in members:
+        try:
+            if get_link(sock, member).master != bridge_index:
+                missing.append(member)
+        except DeviceNotFound:
+            missing.append(member)
 
-            parent_interfaces.append(member)
+    if missing:
+        return f"{name}: failed to add member(s) {', '.join(missing)} ({error})"
+    return f"{name}: {error}"
 
-        if iface.stp != bridge['stp']:
-            verb = 'off' if not bridge['stp'] else 'on'
-            self.logger.info(f'Turning STP {verb} for {name!r}')
-            iface.toggle_stp(name, int(bridge['stp']))
 
-        # finally we need to up the main bridge if it's not already up
-        if netif.InterfaceFlags.UP not in iface.flags:
-            self.logger.info('Bringing up %r', name)
-            iface.up()
+def configure_bridge_impl(
+    ctx: ServiceContext,
+    sock: socket.socket,
+    links: dict[str, LinkInfo],
+    bridge: dict,
+) -> None:
+    """Configure a single bridge interface.
+
+    Args:
+        ctx: Service context
+        sock: Netlink socket from netlink_route()
+        links: Dict of LinkInfo objects from get_links()
+        bridge: Database record for the bridge interface
+    """
+    name = bridge["interface"]["int_interface"]
+    ctx.logger.info("Configuring bridge %s", name)
+    config = BridgeConfig(
+        name=name,
+        members=bridge["members"],
+        stp=bridge["stp"],
+        mtu=bridge["interface"]["int_mtu"] or None,
+        enable_learning=bridge.get("enable_learning", True),
+        preserve_member_prefixes=("vnet",),
+    )
+    ctx.logger.debug("Configuring %s with config: %r", name, config)
+    pynetif_configure_bridge(sock, config, links)

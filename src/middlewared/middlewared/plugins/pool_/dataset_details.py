@@ -1,9 +1,51 @@
-import os
+import pathlib
 
+from truenas_os_pyutils.mount import statmount
+import truenas_pylibzfs
+
+from middlewared.api import api_method
+from middlewared.api.current import (
+    PoolDatasetDetailsArgs,
+    PoolDatasetDetailsResult,
+    ZFSResourceQuery,
+    ZFSResourceSnapshotCountQuery,
+)
+from middlewared.plugins.nvmet.constants import NAMESPACE_DEVICE_TYPE
+from middlewared.plugins.zfs_.utils import TNUserProp, zvol_path_to_name
 from middlewared.service import Service, private
-from middlewared.schema import accepts, List, returns
-from middlewared.plugins.zfs_.utils import ZFSCTL
-from middlewared.utils.osc.linux.mount import getmntinfo
+
+from .dataset_query_utils import normalize_user_properties, normalize_zfs_properties
+
+INTERNAL_USER_PROPERTIES = frozenset(prop.value for prop in TNUserProp)
+
+
+def legacy_dataset(row, snapshot_count):
+    props = row['properties']
+    props.pop('keylocation', None)
+    for prop in props.values():
+        prop['source']['type'] = truenas_pylibzfs.PropertySource[prop['source']['type']]
+
+    dataset = {'id': row['name'], 'type': row['type'], 'name': row['name'], 'pool': row['pool']}
+    dataset.update(normalize_zfs_properties(props))
+    dataset['user_properties'] = {
+        k: v for k, v in normalize_user_properties(row['user_properties']).items()
+        if k not in INTERNAL_USER_PROPERTIES
+    }
+    if props['encryption']['raw'] != 'off':
+        key_loaded = props['keystatus']['raw'] == 'available'
+        dataset.update(
+            encrypted=True, encryption_root=props['encryptionroot']['raw'], key_loaded=key_loaded,
+            locked=not key_loaded,
+        )
+    else:
+        dataset.update(encrypted=False, encryption_root=None, key_loaded=False, locked=False)
+    if row['type'] == 'VOLUME':
+        dataset['mountpoint'] = None
+    dataset['children'] = []
+    dataset['snapshot_count'] = snapshot_count
+    if 'tier' in row:
+        dataset['tier'] = row['tier']
+    return dataset
 
 
 class PoolDatasetService(Service):
@@ -11,252 +53,101 @@ class PoolDatasetService(Service):
     class Config:
         namespace = 'pool.dataset'
 
-    @accepts()
-    @returns(List(
-        'dataset_details',
-        example=[{
-            'id': 'tank',
-            'type': 'FILESYSTEM',
-            'name': 'tank',
-            'pool': 'tank',
-            'encrypted': False,
-            'encryption_root': None,
-            'key_loaded': False,
-            'children': [
-                {
-                    'id': 'tank/soemthing',
-                    'type': 'VOLUME',
-                    'name': 'tank/soemthing',
-                    'pool': 'tank',
-                    'encrypted': False,
-                    'encryption_root': None,
-                    'key_loaded': False,
-                    'children': [],
-                    'managed_by': {
-                        'value': '10.231.1.155',
-                        'rawvalue': '10.231.1.155',
-                        'source': 'LOCAL',
-                        'parsed': '10.231.1.155'
-                    },
-                    'quota_warning': {'value': '80', 'rawvalue': '80', 'source': 'LOCAL', 'parsed': '80'},
-                    'quota_critical': {'value': '95', 'rawvalue': '95', 'source': 'LOCAL', 'parsed': '95'},
-                    'refquota_warning': {'value': '80', 'rawvalue': '80', 'source': 'LOCAL', 'parsed': '80'},
-                    'refquota_critical': {'value': '95', 'rawvalue': '95', 'source': 'LOCAL', 'parsed': '95'},
-                    'reservation': {
-                        'parsed': None, 'rawvalue': '0', 'value': None, 'source': 'DEFAULT', 'source_info': None
-                    },
-                    'refreservation': {
-                        'parsed': None, 'rawvalue': '0', 'value': None, 'source': 'DEFAULT', 'source_info': None
-                    },
-                    'key_format': {
-                        'parsed': 'none', 'rawvalue': 'none', 'value': None, 'source': 'DEFAULT', 'source_info': None
-                    },
-                    'volsize': {
-                        'parsed': 57344, 'rawvalue': '57344', 'value': '56K', 'source': 'LOCAL', 'source_info': None
-                    },
-                    'encryption_algorithm': {
-                        'parsed': 'off', 'rawvalue': 'off', 'value': None, 'source': 'DEFAULT', 'source_info': None
-                    },
-                    'used': {
-                        'parsed': 57344, 'rawvalue': '57344', 'value': '56K', 'source': 'NONE', 'source_info': None
-                    },
-                    'usedbychildren': {
-                        'parsed': 0, 'rawvalue': '0', 'value': '0B', 'source': 'NONE', 'source_info': None
-                    },
-                    'usedbydataset': {
-                        'parsed': 57344, 'rawvalue': '57344', 'value': '56K', 'source': 'NONE', 'source_info': None
-                    },
-                    'usedbysnapshots': {
-                        'parsed': 0, 'rawvalue': '0', 'value': '0B', 'source': 'NONE', 'source_info': None
-                    },
-                    'available': {
-                        'parsed': 14328811520, 'rawvalue': '14328811520',
-                        'value': '13.3G', 'source': 'NONE', 'source_info': None
-                    },
-                    'mountpoint': '/mnt/tank/something',
-                    'sync': {
-                        'parsed': 'standard', 'rawvalue': 'standard',
-                        'value': 'STANDARD', 'source': 'DEFAULT', 'source_info': None
-                    },
-                    'compression': {
-                        'parsed': 'lz4', 'rawvalue': 'lz4',
-                        'value': 'LZ4', 'source': 'INHERITED', 'source_info': 'tank',
-                    },
-                    'deduplication': {
-                        'parsed': 'on', 'rawvalue': 'on',
-                        'value': 'ON', 'source': 'LOCAL', 'source_info': None,
-                    },
-                    'user_properties': {},
-                    'snapshot_count': 0,
-                    'locked': False,
-                    'thick_provisioned': True,
-                    'nfs_shares': [{
-                        'enabled': True,
-                        'path': '/mnt/tank/something'
-                    }],
-                    'smb_shares': [{
-                        'enabled': False,
-                        'path': '/mnt/tank/something/smbshare01',
-                        'share_name': 'Home Pictures',
-                    }],
-                    'iscsi_shares': [{
-                        'enabled': False,
-                        'type': 'DISK',
-                        'path': '/mnt/tank/something',
-                    }],
-                    'vms': [{
-                        'name': 'deb01',
-                        'path': '/dev/zvol/tank/something',
-                    }],
-                    'apps': [{
-                        'name': 'diskoverdata',
-                        'path': '/mnt/tank/something'
-                    }],
-                    'replication_tasks_count': 0,
-                    'snapshot_tasks_count': 0,
-                    'cloudsync_tasks_count': 0,
-                    'rsync_tasks_count': 0
-                }
-            ],
-            'mountpoint': '/mnt/tank',
-            'quota': {'parsed': None, 'rawvalue': '0', 'value': None, 'source': 'DEFAULT', 'source_info': None},
-            'refquota': {'parsed': None, 'rawvalue': '0', 'value': None, 'source': 'DEFAULT', 'source_info': None},
-            'reservation': {'parsed': None, 'rawvalue': '0', 'value': None, 'source': 'DEFAULT', 'source_info': None},
-            'refreservation': {
-                'parsed': None, 'rawvalue': '0', 'value': None, 'source': 'DEFAULT', 'source_info': None
-            },
-            'encryption_algorithm': {
-                'parsed': 'off', 'rawvalue': 'off', 'value': None, 'source': 'DEFAULT', 'source_info': None
-            },
-            'used': {
-                'parsed': 3874467840, 'rawvalue': '3874467840', 'value': '3.61G', 'source': 'NONE', 'source_info': None
-            },
-            'usedbychildren': {
-                'parsed': 3874369536, 'rawvalue': '3874369536', 'value': '3.61G', 'source': 'NONE', 'source_info': None
-            },
-            'usedbydataset': {
-                'parsed': 98304, 'rawvalue': '98304', 'value': '96K', 'source': 'NONE', 'source_info': None
-            },
-            'usedbysnapshots': {'parsed': 0, 'rawvalue': '0', 'value': '0B', 'source': 'NONE', 'source_info': None},
-            'available': {
-                'parsed': 14328811520, 'rawvalue': '14328811520',
-                'value': '13.3G', 'source': 'NONE', 'source_info': None
-            },
-            'user_properties': {},
-            'snapshot_count': 0,
-            'locked': False,
-            'atime': False,
-            'casesensitive': True,
-            'nfs_shares': [],
-            'smb_shares': [],
-            'iscsi_shares': [],
-            'vms': [],
-            'apps': [{
-                'name': 'plex',
-                'path': '/mnt/evo/data',
-            }],
-            'replication_tasks_count': 0,
-            'snapshot_tasks_count': 0,
-            'cloudsync_tasks_count': 0,
-            'rsync_tasks_count': 0,
-        }]
-    ))
+    @api_method(PoolDatasetDetailsArgs, PoolDatasetDetailsResult, roles=['DATASET_READ'])
     def details(self):
         """
-        Retrieve all dataset(s) details outlining any services/tasks which might be consuming the dataset(s).
+        Retrieve all dataset(s) details outlining any
+        services/tasks which might be consuming them.
         """
-        options = {
-            'extra': {
-                'flat': False,
-                'order_by': 'name',
-                'properties': [
-                    'used',
-                    'available',
-                    'usedbysnapshots',
-                    'usedbydataset',
-                    'usedbychildren',
-                    'refquota',
-                    'org.freenas:refquota_critical',
-                    'org.freenas:refquota_warning',
-                    'quota',
-                    'org.freenas:quota_critical',
-                    'org.freenas:quota_warning',
-                    'refreservation',
-                    'reservation',
-                    'mountpoint',
-                    'encryption',
-                    'encryptionroot',
-                    'keyformat',
-                    'keystatus',
-                    'volsize',
-                    'sync',
-                    'compression',
-                    'dedup',
-                ]
-            }
-        }
-        collapsed = []
-        datasets = self.middleware.call_sync('pool.dataset.query', [], options)
+        rows = self.call_sync2(self.s.zfs.resource.list_impl, ZFSResourceQuery(
+            properties=[
+                'atime', 'casesensitivity', 'readonly', 'used', 'available', 'usedbysnapshots', 'usedbydataset',
+                'usedbychildren', 'refquota', 'origin', 'quota', 'refreservation', 'reservation', 'mountpoint',
+                'mounted', 'encryption', 'encryptionroot', 'keyformat', 'keystatus', 'volsize', 'sync', 'compression',
+                'compressratio', 'dedup',
+            ],
+            get_user_properties=True, get_source=True, get_children=True, get_tier=True,
+        ))
+        counts = self._snapshot_counts([row['name'] for row in rows])
+        info = self.build_details()
+        datasets, by_name = [], {}
+        for row in rows:
+            dataset = legacy_dataset(row, counts.get(row['name'], 0))
+            if parent := by_name.get(row['name'].rpartition('/')[0]):
+                parent['children'].append(dataset)
+            by_name[row['name']] = dataset
+            datasets.append(dataset)
         for dataset in datasets:
-            self.collapse_datasets(dataset, collapsed)
-
-        mntinfo = getmntinfo()
-        info = self.build_details(mntinfo)
-        for i in collapsed:
-            snapshot_count, locked = self.get_snapcount_and_encryption_status(i, mntinfo)
-            atime, case = self.get_atime_and_casesensitivity(i, mntinfo)
-            i['snapshot_count'] = snapshot_count
-            i['locked'] = locked
-            i['atime'] = atime
-            i['casesensitive'] = case
-            i['thick_provisioned'] = any((i['reservation']['value'], i['refreservation']['value']))
-            i['nfs_shares'] = self.get_nfs_shares(i, info['nfs'])
-            i['smb_shares'] = self.get_smb_shares(i, info['smb'])
-            i['iscsi_shares'] = self.get_iscsi_shares(i, info['iscsi'])
-            i['vms'] = self.get_vms(i, info['vm'])
-            i['apps'] = self.get_apps(i, info['app'])
-            i['replication_tasks_count'] = self.get_repl_tasks_count(i, info['repl'])
-            i['snapshot_tasks_count'] = self.get_snapshot_tasks_count(i, info['snap'])
-            i['cloudsync_tasks_count'] = self.get_cloudsync_tasks_count(i, info['cloud'])
-            i['rsync_tasks_count'] = self.get_rsync_tasks_count(i, info['rsync'])
-
+            self.normalize_dataset(dataset, info)
         return datasets
 
-    @private
-    def collapse_datasets(self, dataset, collapsed):
-        collapsed.append(dataset)
-        for child in dataset.get('children', []):
-            self.collapse_datasets(child, collapsed)
+    def _snapshot_counts(self, names):
+        try:
+            return self.call_sync2(
+                self.s.zfs.resource.snapshot.count_impl, ZFSResourceSnapshotCountQuery(recursive=True),
+            )
+        except Exception:
+            self.logger.warning('pool.dataset.details: recursive snapshot count failed', exc_info=True)
+
+        # one failing dataset aborts the recursive count, so count each alone and let only that one read 0
+        counts = {}
+        for name in names:
+            try:
+                counts |= self.call_sync2(
+                    self.s.zfs.resource.snapshot.count_impl, ZFSResourceSnapshotCountQuery(paths=[name]),
+                )
+            except Exception:
+                self.logger.debug('%s: failed to count snapshots', name, exc_info=True)
+        return counts
 
     @private
-    def get_mount_info(self, path, mntinfo):
-        mount_info = {}
+    def normalize_dataset(self, dataset, info):
+        dataset['thick_provisioned'] = any((dataset['reservation']['value'], dataset['refreservation']['value']))
+        dataset['nfs_shares'] = self.get_nfs_shares(dataset, info['nfs'])
+        dataset['smb_shares'] = self.get_smb_shares(dataset, info['smb'])
+        dataset['webshare_shares'] = self.get_webshare_shares(dataset, info['webshare'])
+        dataset['iscsi_shares'] = self.get_iscsi_shares(dataset, info['iscsi'])
+        dataset['nvmet_shares'] = self.get_nvmet_shares(dataset, info['nvmet'])
+        dataset['vms'] = self.get_vms(dataset, info['vm'])
+        dataset['containers'] = self.get_containers(dataset, info['container'])
+        dataset['apps'] = self.get_apps(dataset, info['app'])
+        dataset['replication_tasks_count'] = self.get_repl_tasks_count(dataset, info['repl'])
+        dataset['snapshot_tasks_count'] = self.get_snapshot_tasks_count(dataset, info['snap'])
+        dataset['cloudsync_tasks_count'] = self.get_cloudsync_tasks_count(dataset, info['cloud'])
+        dataset['rsync_tasks_count'] = self.get_rsync_tasks_count(dataset, info['rsync'])
+
+    @private
+    def get_mount_info(self, path):
+        if path.startswith('zvol/'):
+            return {}
+
         try:
-            devid = os.stat(path).st_dev
+            mount_info = statmount(path=path)
         except Exception:
             # path deleted/umounted/locked etc
-            pass
-        else:
-            if devid in mntinfo:
-                mount_info = mntinfo[devid]
+            mount_info = {}
 
         return mount_info
 
-    @private
-    def get_atime_and_casesensitivity(self, ds, mntinfo):
-        atime = case = True
-        for devid, info in filter(lambda x: x[1]['mountpoint'] == ds['mountpoint'], mntinfo.items()):
-            atime = not ('NOATIME' in info['super_opts'])
-            case = 'CASESENSITIVE' in info['super_opts']
+    def _parse_virtualization_device_info(self, dev_):
+        info = {}
+        if dev_['attributes']['dtype'] == 'DISK':
+            # disk type is always a zvol
+            info['zvol'] = zvol_path_to_name(dev_['attributes']['path'])
+        elif dev_['attributes']['dtype'] == 'RAW':
+            # raw type is always a file
+            info['mount_info'] = self.get_mount_info(dev_['attributes']['path'])
+        else:
+            # filesystem type is always a directory
+            info['mount_info'] = self.get_mount_info(dev_['attributes']['source'])
+        return info
 
-        return atime, case
-
     @private
-    def build_details(self, mntinfo):
+    def build_details(self):
         results = {
-            'iscsi': [], 'nfs': [], 'smb': [],
+            'iscsi': [], 'nfs': [], 'nvmet': [], 'smb': [], 'webshare': [],
             'repl': [], 'snap': [], 'cloud': [],
-            'rsync': [], 'vm': [], 'app': []
+            'rsync': [], 'vm': [], 'app': [], 'container': [],
         }
 
         # iscsi
@@ -272,14 +163,25 @@ class PoolDatasetService(Service):
             results['iscsi'].append({
                 'extent': e[i['extent']],
                 'target': t[i['target']],
-                'mount_info': self.get_mount_info(e[i['extent']]['path'], mntinfo),
+                'mount_info': self.get_mount_info(e[i['extent']]['path']),
             })
 
-        # nfs and smb
-        for key in ('nfs', 'smb'):
+        # nfs, smb and webshare
+        for key in ('nfs', 'smb', 'webshare'):
             for share in self.middleware.call_sync(f'sharing.{key}.query'):
-                share['mount_info'] = self.get_mount_info(share['path'], mntinfo)
+                if not isinstance(share, dict):
+                    # FIXME: Remove this eventually
+                    share = share.model_dump()
+
+                share['mount_info'] = self.get_mount_info(share['path'])
                 results[key].append(share)
+
+        # nvmet
+        for ns in self.middleware.call_sync('nvmet.namespace.query'):
+            results['nvmet'].append({
+                'namespace': ns,
+                'mount_info': self.get_mount_info(ns['device_path']),
+            })
 
         # replication
         options = {'prefix': 'repl_'}
@@ -294,71 +196,50 @@ class PoolDatasetService(Service):
 
         # cloud sync
         for task in self.middleware.call_sync('datastore.query', 'tasks.cloudsync'):
-            task['mount_info'] = self.get_mount_info(task['path'], mntinfo)
+            task['mount_info'] = self.get_mount_info(task['path'])
             results['cloud'].append(task)
 
         # rsync
-        for task in self.middleware.call_sync('rsynctask.query'):
-            task['mount_info'] = self.get_mount_info(task['path'], mntinfo)
+        for rsync_task in self.call_sync2(self.s.rsynctask.query):
+            task = rsync_task.model_dump()
+            task['mount_info'] = self.get_mount_info(task['path'])
             results['rsync'].append(task)
 
         # vm
-        for vm in self.middleware.call_sync('datastore.query', 'vm.device', [['dtype', 'in', ['RAW', 'DISK']]]):
-            if vm['dtype'] == 'DISK':
-                # disk type is always a zvol
-                vm['zvol'] = vm['attributes']['path'].removeprefix('/dev/zvol/')
-            else:
-                # raw type is always a file
-                vm['mount_info'] = self.get_mount_info(vm['attributes']['path'], mntinfo)
+        vms = {vm['id']: vm for vm in self.middleware.call_sync('datastore.query', 'vm.vm')}
+        for vm_device in self.call_sync2(self.s.vm.device.query, [['attributes.dtype', 'in', ['RAW', 'DISK']]]):
+            vm_device_dict = vm_device.model_dump()
+            results['vm'].append(vm_device_dict | self._parse_virtualization_device_info(vm_device_dict) | {
+                'vm_name': vms[vm_device.vm]['name'],
+            })
 
-            results['vm'].append(vm)
+        # containers
+        containers = {
+            container['id']: container
+            for container in self.middleware.call_sync('datastore.query', 'container.container')
+        }
+        for container_dev_entry in self.middleware.call_sync(
+            'container.device.query', [['attributes.dtype', 'in', ['RAW', 'DISK', 'FILESYSTEM']]]
+        ):
+            container_dev = container_dev_entry.model_dump()
+            results['container'].append(
+                container_dev | self._parse_virtualization_device_info(container_dev) | {
+                    'container_name': containers[container_dev['container']]['name'],
+                }
+            )
 
-        # app
-        for app_name, paths in self.middleware.call_sync('chart.release.get_consumed_host_paths').items():
-            # We want to filter out any other paths which might be consumed to improve performance here
-            # and avoid unnecessary mount info calls i.e /proc /sys /etc/ etc
-            for path in filter(
-                lambda x: x.startswith('/mnt/') and 'ix-applications/' not in x,
-                paths
+        for app in self.call_sync2(self.s.app.query):
+            for path_config in filter(
+                lambda p: p.source.startswith('/mnt/') and not p.source.startswith('/mnt/.ix-'),
+                app.active_workloads.volumes
             ):
                 results['app'].append({
-                    'name': app_name,
-                    'path': path,
-                    'mount_info': self.get_mount_info(path, mntinfo),
+                    'name': app.name,
+                    'path': path_config.source,
+                    'mount_info': self.get_mount_info(path_config.source),
                 })
 
         return results
-
-    @private
-    def get_snapcount_and_encryption_status(self, ds, mntinfo):
-        snap_count = 0
-        locked = False
-        if ds['type'] == 'FILESYSTEM':
-            # FIXME: determining zvol snapshot count requires iterating over
-            # all snapshots for a given zvol and then counting them which is
-            # painful. This will be moot when this is merged upstream
-            # https://github.com/openzfs/zfs/pull/13635
-
-            try:
-                st = os.stat(f'{ds["mountpoint"]}/.zfs/snapshot')
-            except FileNotFoundError:
-                # means that the zfs snapshot dir doesn't exist which
-                # can only happen if the dataset is encrypted and "locked"
-                # (unmounted) or the dataset is unmounted
-                locked = ds['encrypted']
-            else:
-                if st.st_ino == ZFSCTL.INO_SNAPDIR:
-                    # dataset isn't locked and the inode of the snapshot dir
-                    # is what we expect so we're able to determine the snapshot
-                    # count by reading st_nlink
-                    snap_count = st.st_nlink - 2  # (remove 2 for `.` and `..`)
-                else:
-                    # zfs snapshot dir exists but inode doesn't match reality
-                    # which can only happen if dataset is unmounted and the
-                    # same directory structure is created manually
-                    locked = ds['encrypted']
-
-        return snap_count, locked
 
     @private
     def get_nfs_shares(self, ds, nfsshares):
@@ -386,24 +267,65 @@ class PoolDatasetService(Service):
     def get_iscsi_shares(self, ds, iscsishares):
         iscsi_shares = []
         for share in iscsishares:
-            if share['extent']['type'] == 'DISK' and share['extent']['path'].removeprefix('zvol/') == ds['id']:
-                # we store extent information prefixed with `zvol/` (i.e. zvol/tank/zvol01).
-                iscsi_shares.append({
-                    'enabled': share['extent']['enabled'],
-                    'type': 'DISK',
-                    'path': f'/dev/{share["extent"]["path"]}',
-                })
-            elif share['extent']['type'] == 'FILE' and share['mount_info'].get('mount_source') == ds['id']:
-                # this isn't common but possible, you can share a "file"
-                # via iscsi which means it's not a dataset but a file inside
-                # a dataset so we need to find the source dataset for the file
-                iscsi_shares.append({
-                    'enabled': share['extent']['enabled'],
-                    'type': 'FILE',
-                    'path': share['extent']['path'],
-                })
+            if share['extent']['type'] == 'DISK' and ds['type'] == 'VOLUME':
+                if zvol_path_to_name(f"/dev/{share['extent']['path']}") == ds['id']:
+                    # we store extent information prefixed with `zvol/` (i.e. zvol/tank/zvol01).
+                    iscsi_shares.append({
+                        'enabled': share['extent']['enabled'],
+                        'type': 'DISK',
+                        'path': f'/dev/{share["extent"]["path"]}',
+                    })
+            elif share['extent']['type'] == 'FILE' and ds['type'] == 'FILESYSTEM':
+                if share['mount_info'].get('mount_source') == ds['id']:
+                    # this isn't common but possible, you can share a "file"
+                    # via iscsi which means it's not a dataset but a file inside
+                    # a dataset so we need to find the source dataset for the file
+                    iscsi_shares.append({
+                        'enabled': share['extent']['enabled'],
+                        'type': 'FILE',
+                        'path': share['extent']['path'],
+                    })
 
         return iscsi_shares
+
+    @private
+    def get_webshare_shares(self, ds, webshareshares):
+        webshare_shares = []
+        for share in webshareshares:
+            if share['path'] == ds['mountpoint'] or share['mount_info'].get('mount_source') == ds['id']:
+                webshare_shares.append({
+                    'enabled': share['enabled'],
+                    'path': share['path'],
+                    'share_name': share['name']
+                })
+
+        return webshare_shares
+
+    @private
+    def get_nvmet_shares(self, ds, nvmetshares):
+        nvmet_shares = []
+        for share in nvmetshares:
+            pass
+            if share['namespace']['device_type'] == NAMESPACE_DEVICE_TYPE.ZVOL.api and ds['type'] == 'VOLUME':
+                if zvol_path_to_name(f"/dev/{share['namespace']['device_path']}") == ds['id']:
+                    # we store extent information prefixed with `zvol/` (i.e. zvol/tank/zvol01).
+                    nvmet_shares.append({
+                        'enabled': share['namespace']['enabled'],
+                        'type': 'ZVOL',
+                        'path': f'/dev/{share["namespace"]["device_path"]}',
+                    })
+            elif share['namespace']['device_type'] == NAMESPACE_DEVICE_TYPE.FILE.api and ds['type'] == 'FILESYSTEM':
+                if share['mount_info'].get('mount_source') == ds['id']:
+                    # this isn't common but possible, you can share a "file"
+                    # via nvmet which means it's not a dataset but a file inside
+                    # a dataset so we need to find the source dataset for the file
+                    nvmet_shares.append({
+                        'enabled': share['namespace']['enabled'],
+                        'type': 'FILE',
+                        'path': share['namespace']['device_path'],
+                    })
+
+        return nvmet_shares
 
     @private
     def get_repl_tasks_count(self, ds, repltasks):
@@ -421,21 +343,19 @@ class PoolDatasetService(Service):
 
     @private
     def get_cloudsync_tasks_count(self, ds, cldtasks):
-        count = 0
-        for i in filter(lambda x: x['direction'] == 'PUSH', cldtasks):
-            # we only care about cloud sync tasks that are configured to push
-            if i['path'] == ds['mountpoint'] or i['mount_info'].get('mount_source') == ds['id']:
-                count += 1
-
-        return count
+        return self._get_push_tasks_count(ds, cldtasks)
 
     @private
     def get_rsync_tasks_count(self, ds, rsynctasks):
+        return self._get_push_tasks_count(ds, rsynctasks)
+
+    def _get_push_tasks_count(self, ds, tasks):
         count = 0
-        for i in filter(lambda x: x['direction'] == 'PUSH', rsynctasks):
-            # we only care about rsync tasks that are configured to push
-            if i['path'] == ds['mountpoint'] or i['mount_info'].get('mount_source') == ds['id']:
-                count += 1
+        if ds['mountpoint']:
+            for i in filter(lambda x: x['direction'] == 'PUSH', tasks):
+                # we only care about cloud sync tasks that are configured to push
+                if pathlib.Path(ds['mountpoint']).is_relative_to(i['path']):
+                    count += 1
 
         return count
 
@@ -448,9 +368,25 @@ class PoolDatasetService(Service):
                 i['attributes']['path'] == ds['mountpoint'] or
                 i.get('mount_info', {}).get('mount_source') == ds['id']
             ):
-                vms.append({'name': i['vm']['name'], 'path': i['attributes']['path']})
+                vms.append({'name': i['vm_name'], 'path': i['attributes']['path']})
 
         return vms
+
+    @private
+    def get_containers(self, ds, _containers):
+        containers = []
+        for i in _containers:
+            path_in_use = i['attributes'].get('path') or i['attributes']['source']
+            if (
+                'zvol' in i and i['zvol'] == ds['id'] or
+                path_in_use == ds['mountpoint'] or
+                i.get('mount_info', {}).get('mount_source') == ds['id']
+            ):
+                containers.append(
+                    {'name': i['container_name'], 'path': path_in_use}
+                )
+
+        return containers
 
     @private
     def get_apps(self, ds, _apps):

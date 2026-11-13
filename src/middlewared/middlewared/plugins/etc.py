@@ -1,42 +1,131 @@
+import asyncio
+from dataclasses import dataclass, field
+from enum import StrEnum
+import importlib.util
+import os
+from types import MappingProxyType, ModuleType
+
 from mako import exceptions
+from mako.template import Template
+from truenas_pylicensed.features import LicenseFeature
+
+from middlewared.plugins.account.constants import CONTAINER_ROOT_UID
 from middlewared.service import CallError, Service
-from middlewared.utils import osc
-from middlewared.utils.io import write_if_changed
+from middlewared.utils.io import FileChanges, write_if_changed
 from middlewared.utils.mako import get_template
 
-
-import asyncio
-from collections import defaultdict
-import imp
-import os
-import stat
-
 DEFAULT_ETC_PERMS = 0o644
+DEFAULT_ETC_XID = 0
 
 
 class FileShouldNotExist(Exception):
     pass
 
 
-class MakoRenderer(object):
+class Checkpoint(StrEnum):
+    """Boot-sequence checkpoints at which etc.generate_checkpoint() is called.
+
+    An EtcEntry with checkpoint=None is skipped during checkpoint-triggered generation;
+    it only renders when generate() is called directly without a checkpoint argument.
+    """
+    INITIAL = 'initial'
+    INTERFACE_SYNC = 'interface_sync'
+    POST_INIT = 'post_init'
+    POOL_IMPORT = 'pool_import'
+    PRE_INTERFACE_SYNC = 'pre_interface_sync'
+    SYSTEM_DATASET_MOUNTED = 'system_dataset_mounted'
+
+
+class RendererType(StrEnum):
+    """Renderer used to produce a config file's contents.
+
+    MAKO renders a .mako template from etc_files/. PY executes a .py script from etc_files/ whose
+    render() function returns the file contents as bytes or str, or None if the script writes the
+    file itself (in which case change detection via write_if_changed is unavailable).
+    """
+    MAKO = 'mako'
+    PY = 'py'
+
+
+@dataclass(slots=True, frozen=True, kw_only=True)
+class CtxMethod:
+    """A middleware method call whose result is shared across all renderers in an EtcGroup.
+
+    method:     middleware method name passed to middleware.call().
+    args:       positional arguments forwarded to the method call.
+    ctx_prefix: when set, the result is stored in the context dict as '<ctx_prefix>.<method>'
+                instead of '<method>', allowing the same method to appear multiple times with
+                different args (e.g. nvmet.port.transport_address_choices for TCP and RDMA).
+    """
+    method: str
+    args: list = field(default_factory=list)
+    ctx_prefix: str | None = None
+
+
+@dataclass(slots=True, frozen=True, kw_only=True)
+class EtcEntry:
+    """A single config file to be generated.
+
+    renderer_type: selects the renderer (mako template or python script).
+    path:          output path written as /etc/<path>, with a leading 'local/' stripped.
+                   also the source template path under etc_files/ unless local_path overrides it.
+    local_path:    overrides the source template lookup path under etc_files/.
+    checkpoint:    the boot checkpoint at which this entry is rendered; None means the entry is
+                   only rendered when generate() is called without a checkpoint argument.
+    mode:          octal permission bits applied to the output file.
+    owner:         if set, the output file is chowned to this builtin username; otherwise uid 0.
+    group:         if set, the output file is chgrped to this builtin group name; otherwise gid 0.
+    """
+    renderer_type: RendererType
+    path: str
+    local_path: str | None = None
+    checkpoint: Checkpoint | None = Checkpoint.INITIAL
+    mode: int = DEFAULT_ETC_PERMS
+    owner: str | None = None
+    group: str | None = None
+
+
+@dataclass(slots=True, frozen=True, kw_only=True)
+class EtcGroup:
+    """A named set of config files that share render context.
+
+    entries: the config files to generate; rendered in order.
+    ctx:     middleware calls executed once per generate() call; results are passed as a dict
+             to every renderer in entries. Empty when no shared context is needed.
+    """
+    entries: tuple[EtcEntry, ...]
+    ctx: tuple[CtxMethod, ...] = field(default_factory=tuple)
+    lock: asyncio.Lock = field(default_factory=asyncio.Lock, init=False, compare=False, hash=False, repr=False)
+
+
+class MakoRenderer:
 
     def __init__(self, service):
         self.service = service
+        self._templates: dict[str, Template] = {}
+
+    def initialize(self, groups: MappingProxyType, files_dir: str) -> None:
+        for group in groups.values():
+            for entry in group.entries:
+                if entry.renderer_type != RendererType.MAKO:
+                    continue
+
+                path = os.path.join(files_dir, entry.local_path or entry.path)
+                if path in self._templates:
+                    continue
+
+                self._templates[path] = get_template(
+                    os.path.relpath(path, os.path.dirname(os.path.dirname(__file__))) + '.mako'
+                )
 
     async def render(self, path, ctx):
         try:
             # Mako is not asyncio friendly so run it within a thread
             def do():
-                # Get the template by its relative path
-                tmpl = get_template(os.path.relpath(path, os.path.dirname(os.path.dirname(__file__))) + ".mako")
-
-                # Render the template
-                return tmpl.render(
+                return self._templates[path].render(
                     middleware=self.service.middleware,
                     service=self.service,
                     FileShouldNotExist=FileShouldNotExist,
-                    IS_FREEBSD=osc.IS_FREEBSD,
-                    IS_LINUX=osc.IS_LINUX,
                     render_ctx=ctx
                 )
 
@@ -44,21 +133,39 @@ class MakoRenderer(object):
         except FileShouldNotExist:
             raise
         except Exception:
-            self.service.logger.debug('Failed to render mako template: {0}'.format(
-                exceptions.text_error_template().render()
-            ))
+            self.service.logger.debug('Failed to render mako template: %s',
+                                      exceptions.text_error_template().render())
             raise
 
 
-class PyRenderer(object):
+class PyRenderer:
 
     def __init__(self, service):
         self.service = service
+        self._modules: dict[str, ModuleType] = {}
+
+    def initialize(self, groups: MappingProxyType, files_dir: str) -> None:
+        for group in groups.values():
+            for entry in group.entries:
+                if entry.renderer_type != RendererType.PY:
+                    continue
+
+                path = os.path.join(files_dir, entry.local_path or entry.path)
+                if path in self._modules:
+                    continue
+
+                filepath = f'{path}.py'
+                name = os.path.basename(path)
+                spec = importlib.util.spec_from_file_location(name, filepath)
+                if spec is None or spec.loader is None:
+                    raise RuntimeError(f'Cannot load spec for {name!r} from {filepath!r}')
+
+                mod = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(mod)
+                self._modules[path] = mod
 
     async def render(self, path, ctx):
-        name = os.path.basename(path)
-        find = imp.find_module(name, [os.path.dirname(path)])
-        mod = imp.load_module(name, *find)
+        mod = self._modules[path]
         args = [self.service, self.service.middleware]
         if ctx is not None:
             args.append(ctx)
@@ -71,436 +178,607 @@ class PyRenderer(object):
 
 class EtcService(Service):
 
-    GROUPS = {
-        'truenas_nvdimm': [
-            {'type': 'py', 'path': 'truenas_nvdimm', 'checkpoint': 'post_init'},
-        ],
-        'user': {
-            'ctx': [
-                {'method': 'user.query'},
-                {'method': 'group.query'},
-            ],
-            'entries': [
-                {'type': 'mako', 'path': 'group'},
-                {'type': 'mako', 'path': 'passwd', 'local_path': 'master.passwd'},
-                {'type': 'mako', 'path': 'shadow', 'group': 'shadow', 'mode': 0o0640},
-                {'type': 'mako', 'path': 'local/sudoers'},
-                {'type': 'mako', 'path': 'aliases', 'local_path': 'mail/aliases'}
-            ]
-        },
-        'fstab': [
-            {'type': 'mako', 'path': 'fstab'},
-            {'type': 'py', 'path': 'fstab_configure', 'checkpoint_linux': 'post_init'}
-        ],
-        'kerberos': [
-            {'type': 'mako', 'path': 'krb5.conf'},
-            {'type': 'py', 'path': 'krb5.keytab'},
-        ],
-        'cron': [
-            {'type': 'mako', 'path': 'cron.d/middlewared', 'checkpoint': 'pool_import'},
-        ],
-        'grub': [
-            {'type': 'py', 'path': 'grub', 'checkpoint': 'post_init'},
-        ],
-        'keyboard': [
-            {'type': 'mako', 'path': 'default/keyboard'},
-            {'type': 'mako', 'path': 'vconsole.conf'},
-        ],
-        'ldap': [
-            {'type': 'mako', 'path': 'local/openldap/ldap.conf'},
-            {'type': 'mako', 'path': 'local/nslcd.conf', 'owner': 'nslcd', 'group': 'nslcd', 'mode': 0o0400},
-        ],
-        'dhclient': [
-            {'type': 'mako', 'path': 'dhcp/dhclient.conf', 'local_path': 'dhclient.conf'},
-        ],
-        'nfsd': {
-            'ctx': [
-                {'method': 'sharing.nfs.query', 'args': [[("enabled", "=", True), ("locked", "=", False)]]},
-                {'method': 'nfs.config'},
-            ],
-            'entries': [
-                {'type': 'mako', 'path': 'default/nfs-common'},
-                {'type': 'mako', 'path': 'default/nfs-kernel-server'},
-                {'type': 'mako', 'path': 'default/rpcbind'},
-                {'type': 'mako', 'path': 'idmapd.conf'},
-                {'type': 'mako', 'path': 'exports', 'checkpoint': 'interface_sync'},
-            ]
-        },
-        'pam': {
-            'ctx': [
-                {'method': 'activedirectory.config'},
-                {'method': 'ldap.config'},
-            ],
-            'entries': [
-                {'type': 'mako', 'path': 'pam.d/common-account'},
-                {'type': 'mako', 'path': 'pam.d/common-auth'},
-                {'type': 'mako', 'path': 'pam.d/common-password'},
-                {'type': 'mako', 'path': 'pam.d/common-session-noninteractive'},
-                {'type': 'mako', 'path': 'pam.d/common-session'},
-            ]
-        },
-        'ftp': [
-            {'type': 'mako', 'path': 'proftpd/proftpd.conf',
-             'local_path': 'local/proftpd.conf'},
-            {'type': 'py', 'path': 'local/proftpd'},
-        ],
-        'kdump': [
-            {'type': 'mako', 'path': 'default/kdump-tools'},
-        ],
-        'rc': [
-            {'type': 'py', 'path': 'systemd'},
-        ],
-        'sysctl': [
-            {'type': 'mako', 'path': 'sysctl.d/tunables.conf'},
-        ],
-        's3': [
-            {'type': 'py', 'path': 'local/minio/configure', 'checkpoint': 'pool_import'},
-        ],
-        'smartd': [
-            {'type': 'mako', 'path': 'default/smartmontools'},
-            {'type': 'py', 'path': 'smartd'},
-        ],
-        'ssl': [
-            {'type': 'py', 'path': 'generate_ssl_certs'},
-        ],
-        'scst': [
-            {'type': 'mako', 'path': 'scst.conf', 'checkpoint': 'pool_import'},
-            {'type': 'mako', 'path': 'scst.env', 'checkpoint': 'pool_import', 'mode': 0o744},
-        ],
-        'scst_targets': [
-            {'type': 'mako', 'path': 'initiators.allow', 'checkpoint': 'pool_import'},
-            {'type': 'mako', 'path': 'initiators.deny', 'checkpoint': 'pool_import'},
-        ],
-        'udev': [
-            {'type': 'py', 'path': 'udev'},
-        ],
-        'webdav': {
-            'ctx': [
-                {'method': 'sharing.webdav.query', 'args': [[('enabled', '=', True)]]},
-                {'method': 'webdav.config'},
-            ],
-            'entries': [
-                {
-                    'type': 'mako',
-                    'local_path': 'local/apache24/httpd.conf',
-                    'path': 'local/apache2/apache2.conf',
-                },
-                {
-                    'type': 'mako',
-                    'local_path': 'local/apache24/Includes/webdav.conf',
-                    'path': 'local/apache2/Includes/webdav.conf',
-                    'checkpoint': 'pool_import'
-                },
-                {
-                    'type': 'py',
-                    'local_path': 'local/apache24/webdav_config',
-                    'path': 'local/apache2/webdav_config',
-                    'checkpoint': 'pool_import',
-                },
-            ]
-        },
-        'nginx': [
-            {'type': 'mako', 'path': 'local/nginx/nginx.conf', 'checkpoint': 'interface_sync'}
-        ],
-        'haproxy': [
-            {'type': 'mako', 'path': 'haproxy/haproxy.cfg', 'checkpoint': 'interface_sync'},
-        ],
-        'glusterd': [
-            {
-                'type': 'mako',
-                'path': 'glusterfs/glusterd.vol',
-                'local_path': 'glusterd.conf',
-                'user': 'root', 'group': 'root', 'mode': 0o644,
-                'checkpoint': 'pool_import',
-            },
-        ],
-        'keepalived': [
-            {
-                'type': 'mako',
-                'path': 'keepalived/keepalived.conf',
-                'user': 'root', 'group': 'root', 'mode': 0o644,
-                'local_path': 'keepalived.conf',
-            },
-
-        ],
-        'collectd': [
-            {
-                'type': 'mako', 'path': 'collectd/collectd.conf',
-                'local_path': 'local/collectd.conf', 'checkpoint': 'pool_import',
-            },
-            {'type': 'mako', 'path': 'default/rrdcached', 'checkpoint': 'pool_import'},
-        ],
-        'docker': [
-            {'type': 'mako', 'path': 'systemd/system/docker.service.d/http-proxy.conf', 'checkpoint': None},
-            {'type': 'py', 'path': 'docker', 'checkpoint': None},
-        ],
-        'motd': [
-            {'type': 'mako', 'path': 'motd'}
-        ],
-        'mdns': [
-            {'type': 'mako', 'path': 'local/avahi/avahi-daemon.conf', 'checkpoint': None},
-            {'type': 'py', 'path': 'local/avahi/avahi_services', 'checkpoint': None}
-        ],
-        'nscd': [
-            {'type': 'mako', 'path': 'nscd.conf'},
-        ],
-        'wsd': [
-            {'type': 'mako', 'path': 'local/wsdd.conf', 'checkpoint': 'post_init'},
-        ],
-        'ups': [
-            {'type': 'py', 'path': 'local/nut/ups_config'},
-            {'type': 'mako', 'path': 'local/nut/ups.conf', 'owner': 'root', 'group': 'nut', 'mode': 0o440},
-            {'type': 'mako', 'path': 'local/nut/upsd.conf', 'owner': 'root', 'group': 'nut', 'mode': 0o440},
-            {'type': 'mako', 'path': 'local/nut/upsd.users', 'owner': 'root', 'group': 'nut', 'mode': 0o440},
-            {'type': 'mako', 'path': 'local/nut/upsmon.conf', 'owner': 'root', 'group': 'nut', 'mode': 0o440},
-            {'type': 'mako', 'path': 'local/nut/upssched.conf', 'owner': 'root', 'group': 'nut', 'mode': 0o440},
-            {'type': 'mako', 'path': 'local/nut/nut.conf', 'owner': 'root', 'group': 'nut', 'mode': 0o440},
-            {'type': 'py', 'path': 'local/nut/ups_perms'}
-        ],
-        'rsync': [
-            {'type': 'mako', 'path': 'local/rsyncd.conf', 'checkpoint': 'pool_import'}
-        ],
-        'smb': [
-            {'type': 'mako', 'path': 'local/smb4.conf'},
-            {'type': 'mako', 'path': 'security/pam_winbind.conf', 'checkpoint': 'pool_import'},
-        ],
-        'ctdb': [
-            {
-                'type': 'mako',
-                'path': 'ctdb/ctdb.conf',
-                'checkpoint': 'pool_import',
-                'local_path': 'ctdb.conf',
-            },
-        ],
-        'snmpd': [
-            {'type': 'mako', 'path': 'snmp/snmpd.conf', 'local_path': 'local/snmpd.conf'},
-        ],
-        'syslogd': [
-            {'type': 'mako', 'path': 'default/syslog-ng', 'checkpoint': 'pool_import'},
-            {'type': 'py', 'path': 'syslogd', 'checkpoint': 'pool_import'},
-        ],
-        'hosts': [{'type': 'mako', 'path': 'hosts', 'mode': 0o644, 'checkpoint': 'pre_interface_sync'}],
-        'hostname': [{'type': 'py', 'path': 'hostname', 'checkpoint': 'pre_interface_sync'}],
-        'ssh': {
-            "ctx": [
-                {'method': 'ssh.config'},
-                {'method': 'activedirectory.config'},
-                {'method': 'ldap.config'},
-                {'method': 'auth.twofactor.config'},
-                {'method': 'interface.query'},
-            ],
-            "entries": [
-                {'type': 'mako', 'path': 'local/ssh/sshd_config', 'checkpoint': 'interface_sync'},
-                {'type': 'mako', 'path': 'pam.d/sshd', 'local_path': 'pam.d/sshd_linux'},
-                {'type': 'mako', 'path': 'local/users.oath', 'mode': 0o0600},
-                {'type': 'py', 'path': 'local/ssh/config'},
-            ]
-        },
-        'ntpd': [
-            {'type': 'mako', 'path': 'ntp.conf'}
-        ],
-        'localtime': [
-            {'type': 'py', 'path': 'localtime_config'}
-        ],
-        'inadyn': [
-            {'type': 'mako', 'path': 'local/inadyn.conf'}
-        ],
-        'openvpn_server': [
-            {
-                'type': 'mako', 'local_path': 'local/openvpn/server/openvpn_server.conf',
-                'path': 'local/openvpn/server/server.conf'
-            }
-        ],
-        'openvpn_client': [
-            {
-                'type': 'mako', 'local_path': 'local/openvpn/client/openvpn_client.conf',
-                'path': 'local/openvpn/client/client.conf'
-            }
-        ],
-        'kmip': [
-            {'type': 'mako', 'path': 'pykmip/pykmip.conf'}
-        ],
-        'tftp': [
-            {'type': 'mako', 'path': 'default/tftpd-hpa'},
-        ],
-        'truecommand': [
-            {'type': 'mako', 'path': 'wireguard/wg0.conf'}
-        ],
-        'k3s': [
-            {'type': 'py', 'path': 'rancher/k3s/flags', 'checkpoint': None},
-            {'type': 'py', 'path': 'rancher/node/node_passwd', 'checkpoint': None},
-        ],
-        'cni': [
-            {'type': 'py', 'path': 'cni/multus', 'checkpoint': None},
-            {'type': 'py', 'path': 'cni/kube-router', 'checkpoint': None},
-            {'type': 'mako', 'path': 'cni/net.d/multus.d/multus.kubeconfig', 'checkpoint': None},
-            {'type': 'mako', 'path': 'cni/net.d/kube-router.d/kubeconfig', 'checkpoint': None},
-        ],
-        'libvirt': [
-            {'type': 'py', 'path': 'libvirt', 'checkpoint': None},
-        ],
-        'libvirt_guests': [
-            {'type': 'mako', 'path': 'default/libvirt-guests', 'checkpoint': None},
-        ]
-    }
-    LOCKS = defaultdict(asyncio.Lock)
-
-    checkpoints = ['initial', 'interface_sync', 'post_init', 'pool_import', 'pre_interface_sync']
+    GROUPS: MappingProxyType[str, EtcGroup] = MappingProxyType({
+        'audit': EtcGroup(
+            ctx=(CtxMethod(method='system.security.config'),),
+            entries=(
+                EtcEntry(renderer_type=RendererType.PY, path='audit_setup'),
+            ),
+        ),
+        'app_registry': EtcGroup(entries=(
+            EtcEntry(renderer_type=RendererType.PY, path='docker/config.json'),
+        )),
+        'docker': EtcGroup(entries=(
+            EtcEntry(renderer_type=RendererType.PY, path='docker/daemon.json'),
+        )),
+        'truesearch': EtcGroup(entries=(
+            EtcEntry(renderer_type=RendererType.PY, path='truesearchd/truesearch.conf'),
+        )),
+        'truenas_s3': EtcGroup(
+            ctx=(CtxMethod(method='s3.render_data'),),
+            entries=(
+                # the files describe buckets on user pools, so they wait for the
+                # boot-time bulk import
+                EtcEntry(
+                    renderer_type=RendererType.MAKO, path='truenas_s3/buckets.conf', checkpoint=Checkpoint.POOL_IMPORT,
+                ),
+                EtcEntry(
+                    renderer_type=RendererType.MAKO, path='truenas_s3/policies.conf', checkpoint=Checkpoint.POOL_IMPORT,
+                ),
+                EtcEntry(
+                    renderer_type=RendererType.MAKO, path='truenas_s3/credentials.conf', mode=0o600,
+                    checkpoint=Checkpoint.POOL_IMPORT,
+                ),
+            ),
+        ),
+        'webshare': EtcGroup(entries=(
+            # All webshare-related entries refuse to generate their config files if `WEBSHARE_PATH` does not exist.
+            # `WEBSHARE_PATH` resides on the system dataset, so system dataset must be mounted before we try to generate
+            # a webshare-related entry. That's why we set `checkpoint=Checkpoint.SYSTEM_DATASET_MOUNTED`.
+            EtcEntry(
+                renderer_type=RendererType.PY,
+                path='webshare/config.json',
+                checkpoint=Checkpoint.SYSTEM_DATASET_MOUNTED,
+            ),
+            EtcEntry(
+                renderer_type=RendererType.PY,
+                path='webshare-auth/config.json',
+                checkpoint=Checkpoint.SYSTEM_DATASET_MOUNTED,
+            ),
+            EtcEntry(
+                renderer_type=RendererType.PY,
+                path='webshare-link/config.json',
+                checkpoint=Checkpoint.SYSTEM_DATASET_MOUNTED,
+            ),
+        )),
+        'truenas_nvdimm': EtcGroup(entries=(
+            EtcEntry(renderer_type=RendererType.PY, path='truenas_nvdimm', checkpoint=Checkpoint.POST_INIT),
+        )),
+        'truenas_zfstierd': EtcGroup(entries=(
+            EtcEntry(
+                renderer_type=RendererType.PY,
+                path='truenas_zfstierd.conf',
+                local_path='truenas_zfstierd',
+                checkpoint=None,
+            ),
+        )),
+        'shadow': EtcGroup(
+            ctx=(
+                CtxMethod(method='user.query', args=[[['local', '=', True], ['uid', '!=', CONTAINER_ROOT_UID]]]),
+                CtxMethod(method='system.security.config'),
+            ),
+            entries=(
+                EtcEntry(renderer_type=RendererType.MAKO, path='shadow', group='shadow', mode=0o0640),
+            ),
+        ),
+        'user': EtcGroup(
+            ctx=(
+                CtxMethod(method='system.security.config'),
+                CtxMethod(method='user.query', args=[[['local', '=', True], ['uid', '!=', CONTAINER_ROOT_UID]]]),
+                CtxMethod(method='group.query', args=[[['local', '=', True]]]),
+                CtxMethod(method='auth.twofactor.config'),
+                CtxMethod(
+                    method='truenas.entitlements.check',
+                    args=[LicenseFeature.SUPPORT],
+                    ctx_prefix='support',
+                ),
+            ),
+            entries=(
+                EtcEntry(renderer_type=RendererType.MAKO, path='group'),
+                EtcEntry(renderer_type=RendererType.MAKO, path='passwd', local_path='master.passwd'),
+                EtcEntry(renderer_type=RendererType.MAKO, path='shadow', group='shadow', mode=0o0640),
+                EtcEntry(renderer_type=RendererType.MAKO, path='local/sudoers', mode=0o440),
+                EtcEntry(renderer_type=RendererType.MAKO, path='aliases', local_path='mail/aliases'),
+                EtcEntry(renderer_type=RendererType.PY, path='web_ui_root_login_alert'),
+                EtcEntry(renderer_type=RendererType.MAKO, path='subuid'),
+                EtcEntry(renderer_type=RendererType.MAKO, path='subgid'),
+                EtcEntry(renderer_type=RendererType.MAKO, path='local/users.oath',
+                         mode=0o0600, checkpoint=Checkpoint.POOL_IMPORT),
+            ),
+        ),
+        'netdata': EtcGroup(entries=(
+            EtcEntry(renderer_type=RendererType.MAKO, path='netdata/netdata.conf', checkpoint=Checkpoint.POOL_IMPORT),
+            EtcEntry(renderer_type=RendererType.MAKO,
+                     path='netdata/charts.d/exclude_netdata.conf', checkpoint=Checkpoint.POOL_IMPORT),
+            EtcEntry(renderer_type=RendererType.MAKO, path='netdata/go.d/upsd.conf'),
+            EtcEntry(renderer_type=RendererType.MAKO, path='netdata/exporting.conf'),
+        )),
+        'fstab': EtcGroup(entries=(
+            EtcEntry(renderer_type=RendererType.MAKO, path='fstab'),
+            EtcEntry(renderer_type=RendererType.PY, path='fstab_configure', checkpoint=Checkpoint.POST_INIT),
+        )),
+        'ipa': EtcGroup(
+            ctx=(
+                CtxMethod(method='directoryservices.config'),
+            ),
+            entries=(
+                EtcEntry(renderer_type=RendererType.PY, path='ipa/default.conf'),
+                EtcEntry(renderer_type=RendererType.PY, path='ipa/ca.crt'),
+                EtcEntry(renderer_type=RendererType.PY, path='ipa/smb.keytab', mode=0o600),
+            ),
+        ),
+        'kerberos': EtcGroup(
+            ctx=(
+                CtxMethod(method='directoryservices.status'),
+                CtxMethod(method='kerberos.config'),
+                CtxMethod(method='kerberos.realm.query'),
+            ),
+            entries=(
+                EtcEntry(renderer_type=RendererType.PY, path='krb5.conf', mode=0o644),
+                EtcEntry(renderer_type=RendererType.PY, path='krb5.keytab', mode=0o600),
+            ),
+        ),
+        'cron': EtcGroup(entries=(
+            EtcEntry(renderer_type=RendererType.MAKO, path='cron.d/middlewared', checkpoint=Checkpoint.POOL_IMPORT),
+        )),
+        'grub': EtcGroup(entries=(
+            EtcEntry(renderer_type=RendererType.PY, path='grub', checkpoint=None),
+        )),
+        'fips': EtcGroup(entries=(
+            EtcEntry(renderer_type=RendererType.PY, path='fips', checkpoint=None),
+        )),
+        'keyboard': EtcGroup(
+            ctx=(
+                CtxMethod(method='system.general.config'),
+            ),
+            entries=(
+                EtcEntry(renderer_type=RendererType.MAKO, path='default/keyboard'),
+            ),
+        ),
+        'ldap': EtcGroup(
+            ctx=(
+                CtxMethod(method='directoryservices.config'),
+            ),
+            entries=(
+                EtcEntry(renderer_type=RendererType.MAKO, path='local/openldap/ldap.conf'),
+                EtcEntry(renderer_type=RendererType.MAKO, path='sssd/sssd.conf', mode=0o0600),
+            ),
+        ),
+        'dhcpcd': EtcGroup(entries=(
+            EtcEntry(renderer_type=RendererType.MAKO, path='dhcpcd.conf'),
+        )),
+        'nfsd': EtcGroup(
+            ctx=(
+                CtxMethod(method='sharing.nfs.query', args=[[('enabled', '=', True)]]),
+                CtxMethod(method='nfs.config'),
+            ),
+            entries=(
+                EtcEntry(renderer_type=RendererType.MAKO, path='nfs.conf'),
+                EtcEntry(renderer_type=RendererType.MAKO, path='default/rpcbind'),
+                EtcEntry(renderer_type=RendererType.MAKO, path='idmapd.conf'),
+                EtcEntry(renderer_type=RendererType.MAKO, path='exports', checkpoint=Checkpoint.INTERFACE_SYNC),
+            ),
+        ),
+        'nvmet': EtcGroup(
+            ctx=(
+                CtxMethod(method='failover.licensed'),
+                CtxMethod(method='failover.node'),
+                CtxMethod(method='failover.status'),
+                CtxMethod(method='nvmet.global.ana_active'),
+                CtxMethod(method='nvmet.global.ana_enabled'),
+                CtxMethod(method='nvmet.global.config'),
+                CtxMethod(method='nvmet.global.rdma_enabled'),
+                CtxMethod(method='nvmet.host.query'),
+                CtxMethod(method='nvmet.namespace.query'),
+                CtxMethod(method='nvmet.port.query'),
+                CtxMethod(method='nvmet.port.usage'),
+                CtxMethod(method='nvmet.subsys.firmware'),
+                CtxMethod(method='nvmet.subsys.model'),
+                CtxMethod(method='nvmet.subsys.query'),
+                CtxMethod(method='nvmet.host_subsys.query'),
+                CtxMethod(method='nvmet.port_subsys.query'),
+                CtxMethod(method='nvmet.port.transport_address_choices', args=['TCP', True], ctx_prefix='tcp'),
+                CtxMethod(method='nvmet.port.transport_address_choices', args=['RDMA', True], ctx_prefix='rdma'),
+            ),
+            entries=(
+                EtcEntry(renderer_type=RendererType.PY, path='nvmet_kernel'),
+                EtcEntry(renderer_type=RendererType.PY, path='nvmet_spdk'),
+            ),
+        ),
+        'pam': EtcGroup(
+            ctx=(
+                CtxMethod(method='datastore.config', args=['system.settings']),
+                CtxMethod(method='directoryservices.status'),
+                CtxMethod(method='system.security.config'),
+                CtxMethod(method='auth.twofactor.config'),
+                CtxMethod(method='api_key.query', args=[[['revoked', '=', False]]]),
+            ),
+            entries=(
+                EtcEntry(renderer_type=RendererType.MAKO, path='pam.d/common-account'),
+                EtcEntry(renderer_type=RendererType.MAKO, path='pam.d/common-auth'),
+                EtcEntry(renderer_type=RendererType.MAKO, path='pam.d/common-auth-unix'),
+                EtcEntry(renderer_type=RendererType.MAKO, path='pam.d/common-password'),
+                EtcEntry(renderer_type=RendererType.MAKO, path='pam.d/common-session-noninteractive'),
+                EtcEntry(renderer_type=RendererType.MAKO, path='pam.d/common-session'),
+                EtcEntry(renderer_type=RendererType.MAKO, path='security/pam_winbind.conf'),
+                EtcEntry(renderer_type=RendererType.MAKO, path='security/limits.conf'),
+                EtcEntry(renderer_type=RendererType.MAKO, path='pam.d/truenas'),
+                EtcEntry(renderer_type=RendererType.MAKO, path='pam.d/truenas-api-key'),
+                EtcEntry(renderer_type=RendererType.MAKO, path='pam.d/truenas-session'),
+                EtcEntry(renderer_type=RendererType.MAKO, path='pam.d/truenas-unix'),
+                EtcEntry(renderer_type=RendererType.PY, path='pam_keyring'),
+            ),
+        ),
+        'ftp': EtcGroup(
+            ctx=(
+                CtxMethod(method='ftp.config'),
+                CtxMethod(method='user.query', args=[[['builtin', '=', True], ['username', '!=', 'ftp']]]),
+                CtxMethod(method='network.configuration.config'),
+                CtxMethod(method='directoryservices.config'),
+            ),
+            entries=(
+                EtcEntry(renderer_type=RendererType.MAKO, path='proftpd/proftpd.conf'),
+                EtcEntry(renderer_type=RendererType.MAKO, path='proftpd/proftpd.motd'),
+                EtcEntry(renderer_type=RendererType.MAKO, path='proftpd/tls.conf'),
+                EtcEntry(renderer_type=RendererType.MAKO, path='ftpusers'),
+            ),
+        ),
+        'kdump': EtcGroup(entries=(
+            EtcEntry(renderer_type=RendererType.MAKO, path='default/kdump-tools'),
+        )),
+        'rc': EtcGroup(entries=(
+            EtcEntry(renderer_type=RendererType.PY, path='systemd'),
+        )),
+        'sysctl': EtcGroup(entries=(
+            EtcEntry(renderer_type=RendererType.MAKO, path='sysctl.d/tunables.conf'),
+        )),
+        'ssl': EtcGroup(entries=(
+            EtcEntry(renderer_type=RendererType.PY, path='generate_ssl_certs'),
+        )),
+        'scst': EtcGroup(
+            ctx=(
+                CtxMethod(method='failover.licensed'),
+                CtxMethod(method='failover.node'),
+                CtxMethod(method='failover.status'),
+                CtxMethod(method='fc.capable'),
+                CtxMethod(method='fcport.query'),
+                CtxMethod(method='iscsi.auth.query'),
+                CtxMethod(method='iscsi.extent.query', args=[[['enabled', '=', True]]]),
+                CtxMethod(method='iscsi.global.alua_enabled'),
+                CtxMethod(method='iscsi.global.config'),
+                CtxMethod(method='iscsi.initiator.query'),
+                CtxMethod(method='iscsi.portal.query'),
+                CtxMethod(method='iscsi.target.query'),
+                CtxMethod(method='iscsi.targetextent.query'),
+            ),
+            entries=(
+                EtcEntry(renderer_type=RendererType.MAKO, path='scst.conf',
+                         checkpoint=Checkpoint.POOL_IMPORT, mode=0o600),
+                EtcEntry(renderer_type=RendererType.MAKO, path='scst.env',
+                         checkpoint=Checkpoint.POOL_IMPORT, mode=0o744),
+            ),
+        ),
+        'lio': EtcGroup(
+            ctx=(
+                CtxMethod(method='failover.licensed'),
+                CtxMethod(method='failover.node'),
+                CtxMethod(method='failover.status'),
+                CtxMethod(method='fc.capable'),
+                CtxMethod(method='fcport.query'),
+                CtxMethod(method='iscsi.auth.query'),
+                CtxMethod(method='iscsi.extent.query', args=[[['enabled', '=', True]]]),
+                CtxMethod(method='iscsi.global.config'),
+                CtxMethod(method='iscsi.global.iser_enabled'),
+                CtxMethod(method='iscsi.initiator.query'),
+                CtxMethod(method='iscsi.portal.query'),
+                CtxMethod(method='iscsi.target.query'),
+                CtxMethod(method='iscsi.targetextent.query'),
+            ),
+            entries=(
+                EtcEntry(renderer_type=RendererType.PY, path='lio',
+                         checkpoint=Checkpoint.POOL_IMPORT),
+            ),
+        ),
+        'scst_direct': EtcGroup(entries=(
+            EtcEntry(renderer_type=RendererType.MAKO, path='scst.direct',
+                     checkpoint=Checkpoint.POOL_IMPORT, mode=0o600),
+        )),
+        'scst_targets': EtcGroup(
+            ctx=(
+                CtxMethod(method='iscsi.global.config'),
+                CtxMethod(method='iscsi.target.query', args=[[['auth_networks', '!=', []]]]),
+            ),
+            entries=(
+                EtcEntry(renderer_type=RendererType.MAKO, path='initiators.allow', checkpoint=Checkpoint.POOL_IMPORT),
+                EtcEntry(renderer_type=RendererType.MAKO, path='initiators.deny', checkpoint=Checkpoint.POOL_IMPORT),
+            ),
+        ),
+        'udev': EtcGroup(entries=(
+            EtcEntry(renderer_type=RendererType.PY, path='udev'),
+        )),
+        'nginx': EtcGroup(entries=(
+            EtcEntry(renderer_type=RendererType.MAKO, path='local/nginx/nginx.conf',
+                     checkpoint=Checkpoint.INTERFACE_SYNC),
+        )),
+        'keepalived': EtcGroup(entries=(
+            EtcEntry(renderer_type=RendererType.MAKO, path='keepalived/keepalived.conf',
+                     group='root', mode=0o644, local_path='keepalived.conf'),
+        )),
+        'motd': EtcGroup(entries=(
+            EtcEntry(renderer_type=RendererType.MAKO, path='motd'),
+        )),
+        'discovery': EtcGroup(
+            ctx=(
+                CtxMethod(method='directoryservices.config'),
+                CtxMethod(method='failover.status'),
+                CtxMethod(method='interface.query'),
+                CtxMethod(method='smb.config'),
+                CtxMethod(method='ups.config'),
+                CtxMethod(method='system.general.config'),
+                CtxMethod(method='network.configuration.config'),
+                CtxMethod(method='service.started_or_enabled', args=['cifs']),
+                CtxMethod(method='service.started_or_enabled', args=['ups'], ctx_prefix='ups'),
+            ),
+            entries=(
+                EtcEntry(renderer_type=RendererType.PY,
+                         path='local/truenas-discovery/truenas-discoveryd.conf',
+                         checkpoint=Checkpoint.POST_INIT),
+                EtcEntry(renderer_type=RendererType.PY,
+                         path='local/truenas-discovery/services.d/ADISK.conf', checkpoint=None),
+                EtcEntry(renderer_type=RendererType.PY,
+                         path='local/truenas-discovery/services.d/DEV_INFO.conf', checkpoint=None),
+                EtcEntry(renderer_type=RendererType.PY,
+                         path='local/truenas-discovery/services.d/HTTP.conf', checkpoint=None),
+                EtcEntry(renderer_type=RendererType.PY,
+                         path='local/truenas-discovery/services.d/SMB.conf', checkpoint=None),
+                EtcEntry(renderer_type=RendererType.PY,
+                         path='local/truenas-discovery/services.d/NUT.conf', checkpoint=None),
+            ),
+        ),
+        'nscd': EtcGroup(entries=(
+            EtcEntry(renderer_type=RendererType.MAKO, path='nscd.conf'),
+        )),
+        'nss': EtcGroup(entries=(
+            EtcEntry(renderer_type=RendererType.MAKO, path='nsswitch.conf'),
+        )),
+        'ups': EtcGroup(
+            ctx=(
+                CtxMethod(method='ups.config'),
+            ),
+            entries=(
+                EtcEntry(renderer_type=RendererType.PY, path='local/nut/ups_config'),
+                EtcEntry(renderer_type=RendererType.MAKO, path='local/nut/ups.conf',
+                         owner='root', group='nut', mode=0o440),
+                EtcEntry(renderer_type=RendererType.MAKO, path='local/nut/upsd.conf',
+                         owner='root', group='nut', mode=0o440),
+                EtcEntry(renderer_type=RendererType.MAKO, path='local/nut/upsd.users',
+                         owner='root', group='nut', mode=0o440),
+                EtcEntry(renderer_type=RendererType.MAKO, path='local/nut/upsmon.conf',
+                         owner='root', group='nut', mode=0o440),
+                EtcEntry(renderer_type=RendererType.MAKO, path='local/nut/upssched.conf',
+                         owner='root', group='nut', mode=0o440),
+                EtcEntry(renderer_type=RendererType.MAKO, path='local/nut/nut.conf',
+                         owner='root', group='nut', mode=0o440),
+                EtcEntry(renderer_type=RendererType.PY, path='local/nut/ups_perms'),
+            ),
+        ),
+        'smb': EtcGroup(
+            ctx=(
+                CtxMethod(method='smb.generate_smb_configuration'),
+            ),
+            entries=(
+                EtcEntry(renderer_type=RendererType.MAKO, path='local/smb4.conf'),
+            ),
+        ),
+        'truenas_smbhad': EtcGroup(
+            ctx=(
+                CtxMethod(method='failover.licensed'),
+                CtxMethod(method='failover.node'),
+            ),
+            entries=(
+                EtcEntry(renderer_type=RendererType.MAKO, path='truenas_smbhad.conf'),
+            ),
+        ),
+        'snmpd': EtcGroup(entries=(
+            EtcEntry(
+                renderer_type=RendererType.MAKO, path='snmp/snmpd.conf',
+                local_path='local/snmpd.conf', owner='root', group='Debian-snmp', mode=0o640,
+            ),
+        )),
+        'syslogd': EtcGroup(
+            ctx=(
+                CtxMethod(method='system.advanced.config'),
+                CtxMethod(method='nfs.config'),
+            ),
+            entries=(
+                EtcEntry(renderer_type=RendererType.MAKO, path='syslog-ng/syslog-ng.conf'),
+                EtcEntry(renderer_type=RendererType.MAKO, path='syslog-ng/conf.d/tndestinations.conf'),
+                EtcEntry(renderer_type=RendererType.MAKO, path='syslog-ng/conf.d/tnfilters.conf'),
+                EtcEntry(renderer_type=RendererType.MAKO, path='syslog-ng/conf.d/tnaudit.conf', mode=0o600),
+            ),
+        ),
+        'hosts': EtcGroup(entries=(
+            EtcEntry(renderer_type=RendererType.MAKO, path='hosts',
+                     mode=0o644, checkpoint=Checkpoint.PRE_INTERFACE_SYNC),
+        )),
+        'hostname': EtcGroup(entries=(
+            EtcEntry(renderer_type=RendererType.PY, path='hostname', checkpoint=Checkpoint.PRE_INTERFACE_SYNC),
+        )),
+        'ssh': EtcGroup(
+            ctx=(
+                CtxMethod(method='ssh.config'),
+                CtxMethod(method='interface.query'),
+                CtxMethod(method='system.advanced.login_banner'),
+            ),
+            entries=(
+                EtcEntry(renderer_type=RendererType.MAKO, path='local/ssh/sshd_config',
+                         checkpoint=Checkpoint.INTERFACE_SYNC),
+                EtcEntry(renderer_type=RendererType.MAKO, path='pam.d/sshd', local_path='pam.d/sshd_linux'),
+                EtcEntry(renderer_type=RendererType.PY, path='local/ssh/config'),
+                EtcEntry(renderer_type=RendererType.MAKO, path='login_banner', mode=0o600),
+            ),
+        ),
+        'ntpd': EtcGroup(entries=(
+            EtcEntry(renderer_type=RendererType.MAKO, path='chrony/chrony.conf'),
+        )),
+        'localtime': EtcGroup(entries=(
+            EtcEntry(renderer_type=RendererType.PY, path='localtime_config'),
+        )),
+        'truecommand': EtcGroup(entries=(
+            EtcEntry(renderer_type=RendererType.MAKO, path='wireguard/ix-truecommand.conf'),
+        )),
+        'libvirt': EtcGroup(entries=(
+            EtcEntry(renderer_type=RendererType.PY, path='libvirt', checkpoint=None),
+        )),
+        'libvirt_guests': EtcGroup(entries=(
+            EtcEntry(renderer_type=RendererType.MAKO, path='default/libvirt-guests', checkpoint=None),
+        )),
+        'subids': EtcGroup(entries=(
+            EtcEntry(renderer_type=RendererType.MAKO, path='subuid', checkpoint=None),
+            EtcEntry(renderer_type=RendererType.MAKO, path='subgid', checkpoint=None),
+        )),
+    })
 
     class Config:
         private = True
 
     def __init__(self, *args, **kwargs):
-        super(EtcService, self).__init__(*args, **kwargs)
+        super().__init__(*args, **kwargs)
         self.files_dir = os.path.realpath(
             os.path.join(os.path.dirname(__file__), '..', 'etc_files')
         )
-        self._renderers = {
-            'mako': MakoRenderer(self),
-            'py': PyRenderer(self),
-        }
+        self._renderers = MappingProxyType({
+            RendererType.MAKO: MakoRenderer(self),
+            RendererType.PY: PyRenderer(self),
+        })
+        self.initialize_renderers()
 
-    async def gather_ctx(self, methods):
+    async def gather_ctx(self, methods: tuple[CtxMethod, ...]) -> dict:
         rv = {}
         for m in methods:
-            method = m['method']
-            args = m.get('args', [])
-            rv[method] = await self.middleware.call(method, *args)
+            key = f'{m.ctx_prefix}.{m.method}' if m.ctx_prefix else m.method
+            rv[key] = await self.middleware.call(m.method, *m.args)
 
         return rv
 
-    def set_etc_file_perms(self, fd, entry):
-        perm_changed = False
-        user_name = entry.get('owner')
-        group_name = entry.get('group')
-        mode = entry.get('mode', DEFAULT_ETC_PERMS)
+    def get_perms_and_ownership(self, entry: EtcEntry) -> dict:
+        if entry.owner:
+            uid = self.call_sync2(self.s.user.get_builtin_user_id, entry.owner)
+        else:
+            uid = DEFAULT_ETC_XID
 
-        if all(i is None for i in (user_name, group_name, mode)):
-            return perm_changed
+        if entry.group:
+            gid = self.call_sync2(self.s.group.get_builtin_group_id, entry.group)
+        else:
+            gid = DEFAULT_ETC_XID
 
-        uid = self.middleware.call_sync('user.get_builtin_user_id', user_name) if user_name else -1
-        gid = self.middleware.call_sync('group.get_builtin_group_id', group_name) if group_name else -1
-        st = os.fstat(fd)
-        uid_to_set = -1
-        gid_to_set = -1
+        return {'uid': uid, 'gid': gid, 'perms': entry.mode}
 
-        if uid != -1 and st.st_uid != uid:
-            uid_to_set = uid
-
-        if gid != -1 and st.st_gid != gid:
-            gid_to_set = gid
-
-        if gid_to_set != -1 or uid_to_set != -1:
-            os.fchown(fd, uid_to_set, gid_to_set)
-            perm_changed = True
-
-        if mode and stat.S_IMODE(st.st_mode) != mode:
-            os.fchmod(fd, mode)
-            perm_changed = True
-
-        return perm_changed
-
-    def make_changes(self, full_path, entry, rendered):
-        mode = entry.get('mode', DEFAULT_ETC_PERMS)
-
-        def opener(path, flags):
-            return os.open(path, os.O_CREAT | os.O_RDWR, mode=mode)
-
+    def make_changes(self, full_path, entry: EtcEntry, rendered):
         outfile_dirname = os.path.dirname(full_path)
         if outfile_dirname != '/etc':
             os.makedirs(outfile_dirname, exist_ok=True)
 
-        with open(full_path, "w", opener=opener) as f:
-            perms_changed = self.set_etc_file_perms(f.fileno(), entry)
-            contents_changed = write_if_changed(f.fileno(), rendered)
+        payload = self.get_perms_and_ownership(entry)
+        try:
+            changes = write_if_changed(full_path, rendered, tmpdir='/etc', **payload)
+        except Exception:
+            changes = 0
+            self.logger.warning('%s: failed to write changes to configuration file', full_path, exc_info=True)
 
-        return perms_changed or contents_changed
+        if (unexpected_changes := changes & ~FileChanges.CONTENTS):
+            self.logger.error(
+                '%s: unexpected changes [%s] were made to configuration file that may '
+                'allow unauthorized user to alter service behavior', full_path,
+                ', '.join(FileChanges.dump(unexpected_changes))
+            )
+
+        return changes
 
     async def generate(self, name, checkpoint=None):
         group = self.GROUPS.get(name)
         if group is None:
-            raise ValueError('{0} group not found'.format(name))
+            raise ValueError(f'{name!r} group not found')
 
-        async with self.LOCKS[name]:
-            if isinstance(group, dict):
-                ctx = await self.gather_ctx(group['ctx'])
-                entries = group['entries']
-            else:
-                ctx = None
-                entries = group
+        output = []
+        async with group.lock:
+            ctx = await self.gather_ctx(group.ctx) if group.ctx else None
 
-            for entry in entries:
-                renderer = self._renderers.get(entry['type'])
-                if renderer is None:
-                    raise ValueError(f'Unknown type: {entry["type"]}')
-
-                if 'platform' in entry and entry['platform'].upper() != osc.SYSTEM:
+            for entry in group.entries:
+                renderer = self._renderers[entry.renderer_type]
+                if checkpoint and entry.checkpoint != checkpoint:
                     continue
 
-                if checkpoint:
-                    checkpoint_system = f'checkpoint_{osc.SYSTEM.lower()}'
-                    if checkpoint_system in entry:
-                        entry_checkpoint = entry[checkpoint_system]
-                    else:
-                        entry_checkpoint = entry.get('checkpoint', 'initial')
-                    if entry_checkpoint != checkpoint:
-                        continue
-
-                path = os.path.join(self.files_dir, entry.get('local_path') or entry['path'])
-                entry_path = entry['path']
-                if entry_path.startswith('local/'):
-                    entry_path = entry_path[len('local/'):]
-                outfile = f'/etc/{entry_path}'
+                path = os.path.join(self.files_dir, entry.local_path or entry.path)
+                outfile = '/etc/' + entry.path.removeprefix('local/')
 
                 try:
                     rendered = await renderer.render(path, ctx)
                 except FileShouldNotExist:
                     try:
                         await self.middleware.run_in_thread(os.unlink, outfile)
-                        self.logger.debug(f'{entry["type"]}:{entry["path"]} file removed.')
+                        self.logger.debug('%s:%s file removed.', entry.renderer_type, entry.path)
+                        output.append({
+                            'path': outfile,
+                            'status': 'REMOVED',
+                            'changes': FileChanges.dump(FileChanges.CONTENTS)
+                        })
                     except FileNotFoundError:
+                        # Nothing to log
                         pass
 
                     continue
                 except Exception:
-                    self.logger.error(f'Failed to render {entry["type"]}:{entry["path"]}', exc_info=True)
+                    self.logger.exception('Failed to render %s: %s', entry.renderer_type, entry.path)
                     continue
 
                 if rendered is None:
+                    # TODO: scripts that write config files internally should be refacorted
+                    # to return bytes or str so that we can properly monitor for changes
                     continue
 
                 changes = await self.middleware.run_in_thread(self.make_changes, outfile, entry, rendered)
 
                 if not changes:
-                    self.logger.debug(f'No new changes for {outfile}')
+                    self.logger.trace('No new changes for %s', outfile)
+
+                else:
+                    output.append({
+                        'path': outfile,
+                        'status': 'CHANGED',
+                        'changes': FileChanges.dump(changes)
+                    })
+
+        return output
 
     async def generate_checkpoint(self, checkpoint):
-        if checkpoint not in await self.get_checkpoints():
+        try:
+            checkpoint = Checkpoint(checkpoint)
+        except ValueError:
             raise CallError(f'"{checkpoint}" not recognised')
 
         for name in self.GROUPS.keys():
             try:
                 await self.generate(name, checkpoint)
             except Exception:
-                self.logger.error(f'Failed to generate {name} group', exc_info=True)
+                self.logger.exception('Failed to generate %s group', name)
 
-    async def get_checkpoints(self):
-        return self.checkpoints
+    def initialize_renderers(self):
+        for renderer in self._renderers.values():
+            renderer.initialize(self.GROUPS, self.files_dir)
 
 
 async def __event_system_ready(middleware, event_type, args):
-    if args['id'] == 'ready':
-        asyncio.ensure_future(middleware.call('etc.generate_checkpoint', 'post_init'))
+    middleware.create_task(middleware.call('etc.generate_checkpoint', Checkpoint.POST_INIT))
 
 
 async def pool_post_import(middleware, pool):
     if pool is None:
-        await middleware.call('etc.generate_checkpoint', 'pool_import')
+        await middleware.call('etc.generate_checkpoint', Checkpoint.POOL_IMPORT)
+
+
+async def systemdataset_setup_hook(middleware, data):
+    if not data["in_progress"]:  # System dataset mount complete
+        await middleware.call('etc.generate_checkpoint', Checkpoint.SYSTEM_DATASET_MOUNTED)
 
 
 async def setup(middleware):
-    middleware.event_subscribe('system', __event_system_ready)
+    middleware.event_subscribe('system.ready', __event_system_ready)
     # Generate `etc` files before executing other post-boot-time-pool-import actions.
     # There are no explicit requirements for that, we are just preserving execution order
     # when moving checkpoint generation to pool.post_import hook.
     middleware.register_hook('pool.post_import', pool_post_import, order=-1000)
+    # FIXME: Investigate whether we can change the above to generate `etc` files _after_ all other
+    #  post-boot-time-pool-import actions are completed. That will eliminate the need for a separate
+    #  `SYSTEM_DATASET_MOUNTED` checkpoint.
+    middleware.register_hook('sysdataset.setup', systemdataset_setup_hook)

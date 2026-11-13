@@ -7,6 +7,9 @@ Jobs
 Jobs are middleware methods that might run for a long amount of time. This implies a certain infrastructure: we can
 obtain a list of currently running jobs, jobs can report their completion progress...
 
+NOTE: Credentials without full administrative privileges are only able to view and interact with jobs that are started
+by the same credentials. This limitation also applies to events that are sent to subscribors of `core.get_jobs`.
+
 Defining a job method
 *********************
 
@@ -30,7 +33,7 @@ Using the pipes in the job object
 =================================
 
 .. automodule:: middlewared.pipe
-    :members: Pipes
+    :members: Pipes, InputPipes
 
 .. automodule:: middlewared.pipe
     :members: Pipe
@@ -43,11 +46,11 @@ From midclt
 ===========
 
 Calling a job method will immediately print its job ID and exit. To wait for a job to complete (and observe its progress
-meanwhile) use `-job` parameter. At the end the job return value will be printed:
+meanwhile) use `--job` parameter. At the end the job return value will be printed:
 
 .. code-block:: text
 
-    root@truenas[~]# midclt call -job core.job_test '{"sleep": 5}'
+    root@truenas[~]# midclt call --job core.job_test '{"sleep": 5}'
     Status: (none)
     Total Progress: [########################################] 100.00%
     True
@@ -111,6 +114,28 @@ You can upload a file to the job's `input` pipe using `/_upload` API endpoint.
         -F 'file=@config.tar'
 
     {"job_id": 4501}
+
+Uploading multiple files to the job's `inputs` pipes
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+You can upload multiple files to the job's `inputs` pipes using the same `/_upload` API endpoint.
+
+.. code-block:: bash
+
+    curl localhost/_upload \
+        -u root:abcd1234 \
+        -F 'data={"method": "vm.create", "params": []}' \
+        -F 'file=@metadata.json' \
+        -F 'file=@rootfs.squashfs'
+
+    {"job_id": 4501}
+
+The files must be accessed sequentially iterating over the `job.pipes.inputs`:
+
+.. code-block:: python
+
+    for pipe in job.pipes.inputs:
+        pipe.r.read()
 
 Downloading the job's `output` pipe
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^

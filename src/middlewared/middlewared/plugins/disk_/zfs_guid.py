@@ -1,18 +1,58 @@
-import bidict
-
-from middlewared.service import private, Service
+from middlewared.service import Service, private
 from middlewared.service_exception import MatchNotFound
+from middlewared.utils.zfs.event import ZfsConfigSyncEvent, ZfsEvent
 
 
 class DiskService(Service):
     @private
     async def disk_by_zfs_guid(self, guid):
-        try:
-            return await self.middleware.call(
-                "disk.query", [["zfs_guid", "=", guid]], {"extra": {"include_expired": True}, "get": True},
-            )
-        except MatchNotFound:
-            return None
+        """
+        This method returns a single disk entry with the specified
+        ZFS guid. The database however may contain multiple disks
+        with the same GUID differentiated by the `expiretime` key.
+
+        The `expiretime` key has the following special meaning depending
+        on value type:
+        `None` - disk is currently detected and in the system
+        `datetime` - disk was removed and will expire at the specified
+        time.
+
+        Since type is inconsistent for this value, it cannot be used
+        for ordering disks using builtin sorted() method in filter_list.
+        """
+        disk = None
+
+        disks_with_zfs_guid = await self.middleware.call(
+            "disk.query",
+            [["zfs_guid", "=", guid]],
+            {"extra": {"include_expired": True}},
+        )
+
+        for entry in disks_with_zfs_guid:
+            if entry['expiretime'] is None:
+                disk = entry
+                break
+
+            if disk is None:
+                disk = entry
+            elif entry['expiretime'] > disk['expiretime']:
+                disk = entry
+
+        return disk
+
+    @private
+    async def sync_all_zfs_guid(self):
+        boot_pool = await self.call2(self.s.boot.pool_name)
+        for pool in await self.middleware.call("zpool.query_impl", {"topology": True}):
+            if pool["name"] == boot_pool:
+                continue
+            try:
+                await self.sync_zfs_guid({
+                    **pool,
+                    "topology": await self.middleware.call("pool.transform_topology", pool["topology"])
+                })
+            except Exception:
+                self.logger.error("Error running sync_zfs_guid for pool %r", pool["name"])
 
     @private
     async def sync_zfs_guid(self, pool_id_or_pool):
@@ -20,8 +60,13 @@ class DiskService(Service):
             pool = pool_id_or_pool
             topology = pool_id_or_pool["topology"]
         elif isinstance(pool_id_or_pool, str):
-            pool = await self.middleware.call("zfs.pool.query", [["name", "=", pool_id_or_pool]], {"get": True})
-            topology = await self.middleware.call("pool.transform_topology", pool["groups"])
+            results = await self.middleware.call(
+                "zpool.query_impl", {"pool_names": [pool_id_or_pool], "topology": True}
+            )
+            if not results:
+                raise MatchNotFound()
+            pool = results[0]
+            topology = await self.middleware.call("pool.transform_topology", pool["topology"])
         else:
             pool = await self.middleware.call("pool.get_instance", pool_id_or_pool)
             topology = pool["topology"]
@@ -29,11 +74,12 @@ class DiskService(Service):
         if topology is None:
             return
 
-        disk_to_guid = bidict.bidict()
+        disk_to_guid, guid_to_disk = dict(), dict()
         for vdev in await self.middleware.call("pool.flatten_topology", topology):
             if vdev["type"] == "DISK":
                 if vdev["disk"] is not None:
                     disk_to_guid[vdev["disk"]] = vdev["guid"]
+                    guid_to_disk[vdev["guid"]] = vdev["disk"]
                 else:
                     self.logger.debug("Pool %r vdev %r disk is None", pool["name"], vdev["guid"])
 
@@ -41,16 +87,23 @@ class DiskService(Service):
         for disk in await self.middleware.call("disk.query", [], {"extra": {"include_expired": True}}):
             guid = disk_to_guid.get(disk["devname"])
             if guid is not None and guid != disk["zfs_guid"]:
-                self.logger.debug("Setting disk %r zfs_guid %r", disk["identifier"], guid)
-                events.add(disk["identifier"])
-                await self.middleware.call(
-                    "datastore.update", "storage.disk", disk["identifier"],
-                    {"zfs_guid": guid}, {"prefix": "disk_", "send_events": False},
-                )
+                if not disk["expiretime"]:
+                    self.logger.debug(
+                        "Setting disk %r (%r) zfs_guid %r",
+                        disk["identifier"], disk["devname"], guid,
+                    )
+                    events.add(disk["identifier"])
+                    await self.middleware.call(
+                        "datastore.update", "storage.disk", disk["identifier"],
+                        {"zfs_guid": guid}, {"prefix": "disk_", "send_events": False},
+                    )
             elif disk["zfs_guid"]:
-                devname = disk_to_guid.inv.get(disk["zfs_guid"])
+                devname = guid_to_disk.get(disk["zfs_guid"])
                 if devname is not None and devname != disk["devname"]:
-                    self.logger.debug("Removing disk %r zfs_guid as %r has it", disk["identifier"], devname)
+                    self.logger.debug(
+                        "Removing disk %r (%r) zfs_guid %r as %r has it",
+                        disk["identifier"], disk["devname"], disk["zfs_guid"], devname,
+                    )
                     events.add(disk["identifier"])
                     await self.middleware.call(
                         "datastore.update", "storage.disk", disk["identifier"],
@@ -58,16 +111,16 @@ class DiskService(Service):
                     )
 
         if events:
-            disks = {i["identifier"]: i for i in await self.middleware.call("disk.query", [], {"prefix": "disk_"})}
+            disks = {i["identifier"]: i for i in await self.middleware.call("disk.query")}
             for event in events:
                 if event in disks:
                     self.middleware.send_event("disk.query", "CHANGED", id=event, fields=disks[event])
 
 
-async def zfs_events_hook(middleware, data):
-    if data["class"] == "sysevent.fs.zfs.config_sync":
+async def zfs_events_hook(middleware, event: ZfsEvent):
+    if isinstance(event, ZfsConfigSyncEvent):
         try:
-            await middleware.call("disk.sync_zfs_guid", data["pool"])
+            await middleware.call("disk.sync_zfs_guid", event.pool)
         except MatchNotFound:
             pass
 

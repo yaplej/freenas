@@ -1,0 +1,127 @@
+import dataclasses
+from typing import Any
+
+from truenas_pylibzfs import ZFSError, ZFSException
+
+from .exceptions import ZFSPathNotFoundException
+from .normalization import normalize_asdict_result
+from .property_management import DeterminedProperties, build_set_of_zfs_props
+from .tier import get_dataset_tier_info_cached
+from .utils import has_internal_path
+
+__all__ = ("query_impl",)
+
+
+@dataclasses.dataclass(slots=True, kw_only=True)
+class CallbackState:
+    results: list[dict[str, Any]]
+    query_args: dict[str, Any]
+    dp: DeterminedProperties
+    eip: bool
+    """(e)xclude (i)nternal (p)aths. Unless
+    someone is querying an internal path, we
+    will exclude them."""
+    current_depth: int = 0
+    """Current recursion depth."""
+    pool_special_cache: dict[str, bool] = dataclasses.field(default_factory=dict)
+    """Cache of {pool_name -> has_special_vdevs} populated during iteration."""
+    tier_enabled: bool = False
+    """True only when the caller requested get_tier and zfs.tier.config.enabled is True."""
+
+
+def __query_impl_callback(hdl: Any, state: CallbackState) -> bool:
+    if state.eip and has_internal_path(hdl.name):
+        # returning False here will halt the iteration
+        # entirely which is not what we want to do
+        return True
+
+    info = normalize_asdict_result(
+        hdl.asdict(
+            properties=build_set_of_zfs_props(
+                hdl.type, state.dp, state.query_args["properties"]
+            ),
+            get_user_properties=state.query_args["get_user_properties"],
+            get_source=state.query_args["get_source"],
+        ),
+        normalize_source=state.query_args["get_source"],
+    )
+    info["children"] = None
+
+    if state.tier_enabled and info.get('type') == 'FILESYSTEM':
+        info['tier'] = get_dataset_tier_info_cached(hdl, state.pool_special_cache)
+
+    state.results.append(info)
+
+    # Check if we should get children based on get_children or max_depth
+    # max_depth > 0 takes priority, or get_children is True and we haven't exceeded depth
+    should_get_children = False
+    if state.query_args["max_depth"] > 0:
+        # max_depth is set, check if we're within the limit
+        should_get_children = state.current_depth < state.query_args["max_depth"]
+    elif state.query_args["get_children"]:
+        # get_children is True and no max_depth limit (or max_depth == 0 meaning unlimited)
+        should_get_children = True
+
+    if should_get_children:
+        info["children"] = list()
+        child_state = CallbackState(
+            results=state.results,
+            query_args=state.query_args,
+            dp=state.dp,
+            eip=state.eip,
+            current_depth=state.current_depth + 1,
+            pool_special_cache=state.pool_special_cache,
+            tier_enabled=state.tier_enabled,
+        )
+        hdl.iter_filesystems(callback=__query_impl_callback, state=child_state)
+    return True
+
+
+def __query_impl_paths(hdl: Any, state: CallbackState) -> None:
+    for path in state.query_args["paths"]:
+        try:
+            rsrc = hdl.open_resource(name=path)
+            __query_impl_callback(rsrc, state)
+        except ZFSException as e:
+            if e.code == ZFSError.EZFS_NOENT:
+                if state.query_args.get("raise_on_noent", False):
+                    raise ZFSPathNotFoundException(path)
+                else:
+                    continue
+            raise
+
+
+def __should_exclude_internal_paths(data: dict[str, Any]) -> bool:
+    for path in data["paths"]:
+        if has_internal_path(path):
+            # somone is explicilty querying an
+            # internal path
+            return False
+    # 1. no paths specified are internal path
+    # 2. no paths specified at all (empty query)
+    # 3. or someone exclusively asks for internal paths
+    #   NOTE: (the `exclude_internal_paths` is a private
+    #   internal argument that is set internally within
+    #   middleware. It's not exposed to public.)
+    return data.get("exclude_internal_paths", True)  # type: ignore[no-any-return]
+
+
+def query_impl(hdl: Any, data: dict[str, Any], tier_enabled: bool = False) -> list[dict[str, Any]]:
+    if data["max_depth"] > 0 and data["get_children"] is False:
+        # If max_depth > 0, enable get_children implicitly
+        data["get_children"] = True
+
+    state = CallbackState(
+        results=list(),
+        query_args=data,
+        dp=DeterminedProperties(),
+        eip=__should_exclude_internal_paths(data),
+        current_depth=0,
+        pool_special_cache={},
+        tier_enabled=tier_enabled,
+    )
+    if state.query_args["paths"]:
+        __query_impl_paths(hdl, state)
+    else:
+        hdl.iter_root_filesystems(callback=__query_impl_callback, state=state)
+    return state.results

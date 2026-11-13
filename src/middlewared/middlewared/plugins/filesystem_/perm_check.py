@@ -1,26 +1,56 @@
 import errno
 import os
 import pathlib
+from types import MappingProxyType
+from typing import Any
 
-from middlewared.schema import accepts, Bool, Dict, returns, Str
+import truenas_os
+
+from middlewared.api.current import GroupGetGroupObj, UserGetUserObj
 from middlewared.service import CallError, Service, private
+from middlewared.utils.filesystem.access import get_user_details
 
-from middlewared.utils.osc import run_with_user_context
+_PERM_TOKEN_TO_BIT = MappingProxyType({
+    'READ': os.R_OK,
+    'WRITE': os.W_OK,
+    'EXECUTE': os.X_OK,
+})
 
 
-def check_access(path: str, check_perms: dict) -> bool:
-    flag = True
-    for perm, check_flag in filter(
-        lambda v: v[0] is not None, (
-            (check_perms['read'], os.R_OK),
-            (check_perms['write'], os.W_OK),
-            (check_perms['execute'], os.X_OK),
-        )
-    ):
-        perm_check = os.access(path, check_flag)
-        flag &= (perm_check if perm else not perm_check)
+def _perms_to_mode(perms: list[str]) -> int:
+    """Translate a list of ``"READ"`` / ``"WRITE"`` / ``"EXECUTE"`` tokens into
+    the bitmask that ``truenas_os.check_path_access`` forwards to faccessat2."""
+    mode = 0
+    for token in perms:
+        bit = _PERM_TOKEN_TO_BIT.get(token)
+        if bit is None:
+            raise CallError(
+                f'{token!r}: invalid perm token; must be one of '
+                f'{sorted(_PERM_TOKEN_TO_BIT)}',
+                errno.EINVAL,
+            )
+        mode |= bit
+    return mode
 
-    return flag
+
+def _path_ancestor_components(path: str) -> list[bytes]:
+    """Build the ancestor-component byte list expected by truenas_os.check_path_access.
+
+    For ``/mnt/tank/share/file`` this yields ``[b"/mnt", b"/mnt/tank", b"/mnt/tank/share"]``
+    — every parent directory between the filesystem root and the leaf, exclusive
+    of the leaf itself.
+    """
+    parts = pathlib.Path(path).parts
+    return [('/' + '/'.join(parts[1:i])).encode() for i in range(2, len(parts))]
+
+
+def _cred_from_user_details(user_details: dict) -> truenas_os.CredEntry:
+    return truenas_os.create_cred_entry(
+        user_details['id_name'],
+        user_details['pw_uid'],
+        user_details['pw_gid'],
+        user_details['grouplist'],
+    )
 
 
 class FilesystemService(Service):
@@ -32,33 +62,29 @@ class FilesystemService(Service):
 
         if id_type == 'USER':
             try:
-                out = self.middleware.call_sync(
-                    'user.get_user_obj',
-                    {'uid': xid, 'get_groups': True}
+                user_obj = self.call_sync2(
+                    self.s.user.get_user_obj, UserGetUserObj(uid=xid, get_groups=True),
                 )
-                out['id_name'] = out['pw_name']
-                return out
             except KeyError:
                 return None
 
+            return user_obj.model_dump() | {'id_name': user_obj.pw_name}
+
         try:
-            grp = self.middleware.call_sync('group.get_group_obj', {'gid': xid})
+            grp = self.call_sync2(self.s.group.get_group_obj, GroupGetGroupObj(gid=xid))
         except KeyError:
             return None
 
         # get a UID not currently in use
-        tmp_uid = self.middleware.call_sync('user.get_next_uid')
+        tmp_uid = self.call_sync2(self.s.user.get_next_uid)
 
         try:
-            res = self.middleware.call_sync(
-                'user.get_user_obj',
-                {'uid': tmp_uid}
-            )
+            res = self.call_sync2(self.s.user.get_user_obj, UserGetUserObj(uid=tmp_uid))
             self.logger.warning(
                 '%s: user exists on system but not in TrueNAS configuration. '
                 'This may indicate that it was created manually from shell '
                 'or there is an unexpected overlap between local and directory '
-                'services user accounts', res['pw_name']
+                'services user accounts', res.pw_name
             )
             # daemon user probably should not have access to user data
             # so we'll use this for testing
@@ -69,53 +95,86 @@ class FilesystemService(Service):
         return {
             'pw_name': 'synthetic_user',
             'pw_uid': uid,
-            'pw_gid': grp['gr_gid'],
+            'pw_gid': grp.gr_gid,
             'pw_gecos': 'synthetic user',
             'pw_dir': '/var/empty',
             'pw_shell': '/usr/bin/zsh',
-            'grouplist': [grp['gr_gid']],
-            'id_name': grp['gr_name']
+            'grouplist': [grp.gr_gid],
+            'id_name': grp.gr_name
         }
 
     @private
-    def check_as_user_impl(self, user_details, path, perms):
-        return run_with_user_context(check_access, user_details, [path, perms])
-
-    @accepts(
-        Str('username', empty=False),
-        Str('path', empty=False),
-        Dict(
-            'permissions',
-            Bool('read', default=None, null=True),
-            Bool('write', default=None, null=True),
-            Bool('execute', default=None, null=True),
-        )
-    )
-    @returns(Bool())
-    def can_access_as_user(self, username, path, perms):
+    def can_access_as_user(self, username: str, path: str, perms: list[str]) -> bool:
         """
-        Check if `username` is able to access `path` with specific `permissions`. At least one of `read/write/execute`
-        permission must be specified for checking with each of these defaulting to `null`. `null` for
-        `read/write/execute` represents that the permission should not be checked.
+        Check whether `username` is granted every permission in `perms` on `path`.
+
+        `perms` is a list of ``"READ"`` / ``"WRITE"`` / ``"EXECUTE"`` tokens —
+        at least one must be specified.  Returns True if every requested bit
+        is granted by the filesystem (mode bits + native ACLs).
         """
-        path_obj = pathlib.Path(path)
-        if not path_obj.is_absolute():
-            raise CallError('A valid absolute path must be provided', errno.EINVAL)
-        elif not path_obj.exists():
-            raise CallError(f'{path!r} does not exist', errno.EINVAL)
+        return not self.can_access_as_user_errors(username, path, perms)
 
-        if all(v is None for v in perms.values()):
-            raise CallError('At least one of read/write/execute flags must be set', errno.EINVAL)
-
+    @private
+    def can_access_as_user_errors(
+        self, username: str, path: str, perms: list[str], path_must_exist: bool = True,
+        probe_ancestors: bool = False
+    ) -> list[truenas_os.AccessFailure]:
+        """
+        `can_access_as_user` but return a list of access errors.
+        """
         try:
-            user_details = self.middleware.call_sync('user.get_user_obj', {'username': username, 'get_groups': True})
+            user_obj = self.call_sync2(
+                self.s.user.get_user_obj, UserGetUserObj(username=username, get_groups=True),
+            )
         except KeyError:
             raise CallError(f'{username!r} user does not exist', errno=errno.ENOENT)
 
-        return self.check_as_user_impl(user_details, path, perms)
+        return self.can_access_as_cred_errors(
+            user_obj.model_dump(), path, perms, path_must_exist, probe_ancestors
+        )
 
     @private
-    def check_path_execute(self, path, id_type, xid):
+    def can_access_as_cred_errors(
+        self, user_details: dict[str, Any], path: str, perms: list[str], path_must_exist: bool = True,
+        probe_ancestors: bool = False
+    ) -> list[truenas_os.AccessFailure]:
+        """
+        `can_access_as_user_errors` but for user that might not exist yet.
+
+        Setting `path_must_exist` to False skips missing components.
+        """
+        if not perms:
+            raise CallError('At least one of READ/WRITE/EXECUTE must be set', errno.EINVAL)
+
+        mode = _perms_to_mode(perms)
+
+        path_obj = pathlib.Path(path)
+        if not path_obj.is_absolute():
+            raise CallError('A valid absolute path must be provided', errno.EINVAL)
+        elif path_must_exist and not path_obj.exists():
+            raise CallError(f'{path!r} does not exist', errno.EINVAL)
+
+        cred_entry = _cred_from_user_details({**user_details, 'id_name': user_details['pw_name']})
+
+        if probe_ancestors:
+            if ancestors := _path_ancestor_components(path):
+                failures = truenas_os.check_path_access(
+                    creds=[cred_entry],
+                    components=ancestors,
+                    path_must_exist=path_must_exist,
+                )
+                if failures:
+                    return failures
+
+        return truenas_os.check_path_access(
+            creds=[cred_entry],
+            components=[path.encode()],
+            mode=mode,
+            path_must_exist=path_must_exist,
+        )
+
+    @private
+    def check_path_execute(self, path, id_type, xid, path_must_exist):
         user_details = self.generate_user_details(id_type, xid)
         if user_details is None:
             # User or group does not exist on server.
@@ -126,44 +185,87 @@ class FilesystemService(Service):
                               id_type.lower(), xid)
             return
 
-        parts = pathlib.Path(path).parts
-        for idx, part in enumerate(parts):
-            if idx < 2:
-                continue
+        components = _path_ancestor_components(path)
+        if not components:
+            return
 
-            path_to_check = f'/{"/".join(parts[1:idx])}'
-            ok = self.check_as_user_impl(user_details, path_to_check, {'read': None, 'write': None, 'execute': True})
-            if not ok:
-                raise CallError(
-                    f'Filesystem permissions on path {path_to_check} prevent access for '
-                    f'{id_type.lower()} {user_details["id_name"]} to the path {path}. '
-                    f'This may be fixed by granting the aforementioned {id_type.lower()} '
-                    f'execute permissions on the path: {path_to_check}.', errno.EPERM
-                )
+        failures = truenas_os.check_path_access(
+            creds=[_cred_from_user_details(user_details)],
+            components=components,
+            path_must_exist=path_must_exist,
+        )
+        if not failures:
+            return
+
+        f = failures[0]
+        failing_component = f.failing_component.decode()
+        if f.errnum == errno.ENOENT:
+            raise CallError(f'{failing_component}: path component does not exist.', errno.ENOENT)
+
+        raise CallError(
+            f'Filesystem permissions on path {failing_component} prevent access for '
+            f'{id_type.lower()} "{user_details["id_name"]}" to the path {path}. '
+            f'This may be fixed by granting the aforementioned {id_type.lower()} '
+            f'execute permissions on the path: {failing_component}.', errno.EPERM
+        )
 
     @private
-    def check_acl_execute(self, path, acl, uid, gid):
+    def check_acl_execute(self, path, acl, uid, gid, path_must_exist=False):
+        components = _path_ancestor_components(path)
+        if not components:
+            return
+
+        creds: list[truenas_os.CredEntry] = []
+        id_type_by_name: dict[str, str] = {}
+        seen: set[tuple[str, int]] = set()
+
         for entry in acl:
             if entry['tag'] in ('everyone@', 'OTHER', 'MASK'):
                 continue
-
             if entry.get('type', 'ALLOW') != 'ALLOW':
                 continue
 
-            id_info = {'id_type': None, 'xid': entry['id']}
-
             if entry['tag'] == 'GROUP':
-                id_info['id_type'] = 'GROUP'
-
+                id_type, xid = 'GROUP', entry['id']
             elif entry['tag'] == 'USER':
-                id_info['id_type'] = 'USER'
-
+                id_type, xid = 'USER', entry['id']
             elif entry['tag'] in ('owner@', 'USER_OBJ'):
-                id_info['id_type'] = 'USER'
-                id_info['xid'] = uid
-
+                id_type, xid = 'USER', uid
             elif entry['tag'] in ('group@', 'GROUP_OBJ'):
-                id_info['id_type'] = 'USER'
-                id_info['xid'] = gid
+                id_type, xid = 'GROUP', gid
+            else:
+                continue
 
-            self.check_path_execute(path, id_info['id_type'], id_info['xid'])
+            key = (id_type, xid)
+            if key in seen:
+                continue
+            seen.add(key)
+
+            details = get_user_details(id_type, xid)
+            if details is None:
+                continue
+
+            creds.append(_cred_from_user_details(details))
+            id_type_by_name[details['id_name']] = id_type
+
+        if not creds:
+            return
+
+        failures = truenas_os.check_path_access(
+            creds=creds, components=components, path_must_exist=path_must_exist,
+        )
+        if not failures:
+            return
+
+        f = failures[0]
+        failing_component = f.failing_component.decode()
+        if f.errnum == errno.ENOENT:
+            raise CallError(f'{failing_component}: path component does not exist.', errno.ENOENT)
+
+        id_type_lower = id_type_by_name[f.id_name].lower()
+        raise CallError(
+            f'Filesystem permissions on path {failing_component} prevent access for '
+            f'{id_type_lower} "{f.id_name}" to the path {path}. '
+            f'This may be fixed by granting the aforementioned {id_type_lower} '
+            f'execute permissions on the path: {failing_component}.', errno.EPERM
+        )

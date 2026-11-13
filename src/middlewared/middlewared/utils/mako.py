@@ -3,6 +3,7 @@ import logging
 import os
 
 from mako.lookup import TemplateLookup
+from mako.template import Template
 
 logger = logging.getLogger(__name__)
 
@@ -14,5 +15,5 @@ lookup = TemplateLookup(
 )
 
 
-def get_template(name):
+def get_template(name: str) -> Template:
     return lookup.get_template(name)

@@ -1,157 +1,127 @@
+from dataclasses import dataclass
 from datetime import datetime
+from typing import Any
 
-from middlewared.alert.base import AlertClass, SimpleOneShotAlertClass, AlertCategory, AlertLevel, Alert, AlertSource
+from middlewared.alert.base import (
+    Alert,
+    AlertCategory,
+    AlertClass,
+    AlertClassConfig,
+    AlertLevel,
+    AlertSource,
+    OneShotAlertClass,
+)
 from middlewared.alert.schedule import CrontabSchedule
+from middlewared.utils.time_utils import utc_now
 
 
-class CertificateIsExpiringAlertClass(AlertClass):
-    category = AlertCategory.CERTIFICATES
-    level = AlertLevel.NOTICE
-    title = "Certificate Is Expiring"
-    text = "Certificate %(name)r is expiring within %(days)d days."
+@dataclass(kw_only=True)
+class CertificateIsExpiringAlert(AlertClass):
+    config = AlertClassConfig(
+        category=AlertCategory.CERTIFICATES,
+        level=AlertLevel.NOTICE,
+        title="Certificate Is Expiring",
+        text="Certificate %(name)r is expiring within %(days)d days.",
+    )
+
+    name: str
+    days: int
+
+    @classmethod
+    def key_from_args(cls, args: Any) -> Any:
+        return [args['name']]
 
 
-class CertificateIsExpiringSoonAlertClass(AlertClass):
-    category = AlertCategory.CERTIFICATES
-    level = AlertLevel.WARNING
-    title = "Certificate Is Expiring Soon"
-    text = "Certificate %(name)r is expiring within %(days)d days."
+@dataclass(kw_only=True)
+class CertificateIsExpiringSoonAlert(AlertClass):
+    config = AlertClassConfig(
+        category=AlertCategory.CERTIFICATES,
+        level=AlertLevel.WARNING,
+        title="Certificate Is Expiring Soon",
+        text="Certificate %(name)r is expiring within %(days)d days.",
+    )
+
+    name: str
+    days: int
+
+    @classmethod
+    def key_from_args(cls, args: Any) -> Any:
+        return [args['name']]
 
 
-class CertificateExpiredAlertClass(AlertClass):
-    category = AlertCategory.CERTIFICATES
-    level = AlertLevel.CRITICAL
-    title = "Certificate Has Expired"
-    text = "Certificate %(name)r has expired."
+@dataclass(kw_only=True)
+class CertificateExpiredAlert(AlertClass):
+    config = AlertClassConfig(
+        category=AlertCategory.CERTIFICATES,
+        level=AlertLevel.CRITICAL,
+        title="Certificate Has Expired",
+        text="Certificate %(name)r has expired.",
+    )
+
+    name: str
+
+    @classmethod
+    def key_from_args(cls, args: Any) -> Any:
+        return [args['name']]
 
 
-class CertificateParsingFailedAlertClass(AlertClass):
-    category = AlertCategory.CERTIFICATES
-    level = AlertLevel.WARNING
-    title = "Certificate Parsing Failed"
-    text = "Failed to parse %(type)s %(name)r."
+@dataclass(kw_only=True)
+class CertificateParsingFailedAlert(AlertClass):
+    config = AlertClassConfig(
+        category=AlertCategory.CERTIFICATES,
+        level=AlertLevel.WARNING,
+        title="Certificate Parsing Failed",
+        text="Failed to parse %(type)s %(name)r.",
+    )
+
+    type: str
+    name: str
 
 
-class CertificateRevokedAlertClass(AlertClass):
-    category = AlertCategory.CERTIFICATES
-    level = AlertLevel.CRITICAL
-    title = 'Certificate Revoked'
-    text = '%(service)s %(type)s has been revoked. Please replace the certificate immediately.'
-
-
-class WebUiCertificateSetupFailedAlertClass(AlertClass, SimpleOneShotAlertClass):
+class WebUiCertificateSetupFailedAlert(OneShotAlertClass):
     # this is consumed in nginx.conf in the etc plugin
     # you don't have to specify the `AlertClass` verbiage
     # of the class name when calling it
-    category = AlertCategory.CERTIFICATES
-    level = AlertLevel.CRITICAL
-    title = "Web UI HTTPS Certificate Setup Failed"
-    text = "Web UI HTTPS certificate setup failed."
+    config = AlertClassConfig(
+        category=AlertCategory.CERTIFICATES,
+        level=AlertLevel.CRITICAL,
+        title="Web UI HTTPS Certificate Setup Failed",
+        text="Web UI HTTPS certificate setup failed.",
+    )
 
 
 class CertificateChecksAlertSource(AlertSource):
     schedule = CrontabSchedule(hour=0)  # every 24 hours
     run_on_backup_node = False
 
-    async def _get_service_certs(self):
-        _type = 'certificate'
-        service_certs = [
-            {
-                'id': (await self.middleware.call('ftp.config'))['ssltls_certificate'],
-                'service': 'FTP',
-                'type': _type,
-            },
-            {
-                'id': (await self.middleware.call('s3.config'))['certificate'],
-                'service': 'S3',
-                'type': _type,
-            },
-            {
-                'id': (await self.middleware.call('webdav.config'))['certssl'],
-                'service': 'Webdav',
-                'type': _type,
-            },
-            {
-                'id': (await self.middleware.call('openvpn.server.config'))['server_certificate'],
-                'service': 'OpenVPN Server',
-                'type': _type,
-            },
-            {
-                'id': (await self.middleware.call('openvpn.client.config'))['client_certificate'],
-                'service': 'OpenVPN Client',
-                'type': _type,
-            },
-            {
-                'id': (await self.middleware.call('system.general.config'))['ui_certificate']['id'],
-                'service': 'Web UI',
-                'type': _type,
-            },
-            {
-                'id': (await self.middleware.call('system.advanced.config'))['syslog_tls_certificate'],
-                'service': 'Syslog',
-                'type': _type,
-            },
-        ]
-        return service_certs
+    async def check(self) -> list[Alert[Any]]:
+        alerts: list[Alert[Any]] = []
 
-    async def _get_cas(self):
-        _type = 'root certificate authority'
-        ca_certs = [
-            {
-                'id': (await self.middleware.call('openvpn.server.config'))['root_ca'],
-                'service': 'Web UI',
-                'type': _type,
-            },
-            {
-                'id': (await self.middleware.call('openvpn.client.config'))['root_ca'],
-                'service': 'Syslog',
-                'type': _type,
-            },
-        ]
-        return ca_certs
+        # system certs
+        certs = await self.call2(
+            self.s.certificate.query, [['certificate', '!=', None]],
+        )
 
-    async def check(self):
-        alerts = []
-
-        # system certs/cas
-        certs = await self.middleware.call('certificate.query', [['certificate', '!=', None]])
-        certs.extend(await self.middleware.call('certificateauthority.query'))
-
-        # service certs/cas
-        check_for_revocation = await self._get_service_certs()
-        check_for_revocation.extend(await self._get_cas())
-
-        parsed = {}
         for cert in certs:
             # make the sure certs have been parsed correctly
-            if not cert['parsed']:
+            if not cert.parsed:
                 alerts.append(Alert(
-                    CertificateParsingFailedAlertClass,
-                    {"type": cert["cert_type"].capitalize(), "name": cert["name"]},
+                    CertificateParsingFailedAlert(type=cert.cert_type.capitalize(), name=cert.name),
                 ))
             else:
                 # check the parsed certificate(s) for expiration
-                if cert['cert_type'].capitalize() == 'CERTIFICATE':
-                    diff = (datetime.strptime(cert['until'], '%a %b %d %H:%M:%S %Y') - datetime.utcnow()).days
-                    if diff < 10:
+                if cert.cert_type == 'CERTIFICATE' and cert.until:
+                    diff = (datetime.strptime(cert.until, '%a %b %d %H:%M:%S %Y') - utc_now()).days
+                    alert_threshold = (cert.renew_days or 10) - 1
+                    if diff < alert_threshold:
                         if diff >= 0:
+                            klass = CertificateIsExpiringSoonAlert if diff <= 2 else CertificateIsExpiringAlert
                             alerts.append(Alert(
-                                CertificateIsExpiringSoonAlertClass if diff <= 2 else CertificateIsExpiringAlertClass,
-                                {'name': cert['name'], 'days': diff}, key=[cert['name']],
+                                klass(name=cert.name, days=diff),
                             ))
                         else:
                             alerts.append(Alert(
-                                CertificateExpiredAlertClass,
-                                {'name': cert['name']}, key=[cert['name']]
+                                CertificateExpiredAlert(name=cert.name),
                             ))
-
-                parsed[cert['id']] = cert['revoked']
-
-        # check the parsed certificate(s) for revocation
-        for i in filter(lambda i: parsed.get(i['id']), check_for_revocation):
-            alerts.append(Alert(
-                CertificateRevokedAlertClass,
-                {'service': i['service'], 'type': i['type']}
-            ))
 
         return alerts

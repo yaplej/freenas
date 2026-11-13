@@ -1,0 +1,119 @@
+from collections.abc import Collection
+import dataclasses
+import errno
+from typing import Any
+
+import truenas_pylibzfs
+
+from .exceptions import (
+    ZFSPathAlreadyExistsException,
+    ZFSPathInvalidException,
+    ZFSPathNotFoundException,
+)
+
+__all__ = ("create_snapshots_impl",)
+
+
+@dataclasses.dataclass(slots=True, kw_only=True)
+class CollectDatasetsState:
+    datasets: list[str]
+    exclude: set[str]
+
+
+def __collect_datasets_callback(child_hdl: Any, state: CollectDatasetsState) -> bool:
+    """Callback for collecting child dataset names recursively."""
+    name = child_hdl.name
+    if name not in state.exclude:
+        state.datasets.append(name)
+        # Recurse into children
+        child_hdl.iter_filesystems(callback=__collect_datasets_callback, state=state)
+    return True
+
+
+def _collect_child_datasets(ds_hdl: Any, exclude: set[str]) -> list[str]:
+    """Collect all child dataset names recursively.
+
+    Args:
+        ds_hdl: Dataset handle from pylibzfs
+        exclude: Set of dataset names to exclude
+
+    Returns:
+        List of child dataset names (not including the parent)
+    """
+    state = CollectDatasetsState(datasets=[], exclude=exclude)
+    ds_hdl.iter_filesystems(callback=__collect_datasets_callback, state=state)
+    return state.datasets
+
+
+def create_snapshots_impl(
+    tls: Any,
+    dataset: str,
+    name: str,
+    recursive: bool = False,
+    exclude: Collection[str] | None = None,
+    user_properties: dict[str, str] | None = None,
+) -> list[str]:
+    """Create ZFS snapshot(s).
+
+    Args:
+        tls: Thread local storage containing lzh (libzfs handle)
+        dataset: The dataset path to snapshot (e.g., 'pool/dataset').
+        name: The snapshot name (the part after @).
+        recursive: Create snapshots recursively for child datasets.
+        exclude: Datasets to exclude when creating recursive snapshots.
+        user_properties: User properties to set on the snapshot.
+
+    Returns:
+        The snapshot paths created.
+
+    Raises:
+        ZFSPathNotFoundException: If the dataset doesn't exist
+        ZFSPathAlreadyExistsException: If snapshot already exists
+        ZFSPathInvalidException: If no datasets to snapshot (all excluded)
+        ZFSCoreException: If snapshot creation fails
+    """
+    snap_name = name
+    exclude = set(exclude or [])
+
+    # Build list of datasets to snapshot
+    datasets_to_snap = []
+
+    # Open the primary dataset to verify it exists
+    try:
+        ds_hdl = tls.lzh.open_resource(name=dataset)
+    except truenas_pylibzfs.ZFSException as e:
+        if e.code == truenas_pylibzfs.ZFSError.EZFS_NOENT:
+            raise ZFSPathNotFoundException(dataset)
+        raise
+
+    # Add primary dataset if not excluded
+    if dataset not in exclude:
+        datasets_to_snap.append(dataset)
+
+    # Collect child datasets if recursive
+    if recursive:
+        child_datasets = _collect_child_datasets(ds_hdl, exclude)
+        datasets_to_snap.extend(child_datasets)
+
+    if not datasets_to_snap:
+        raise ZFSPathInvalidException(dataset, "and all of its children are excluded, leaving nothing to snapshot")
+
+    # Build snapshot names: "{dataset}@{name}"
+    snapshot_names = [f"{ds}@{snap_name}" for ds in datasets_to_snap]
+
+    # Create the snapshots
+    # Note: lzc.create_snapshots is atomic - all succeed or all fail
+    kwargs: dict[str, Any] = {"snapshot_names": snapshot_names}
+    if user_properties:
+        kwargs["user_properties"] = user_properties
+
+    try:
+        truenas_pylibzfs.lzc.create_snapshots(**kwargs)
+    except truenas_pylibzfs.lzc.ZFSCoreException as e:
+        # errors is tuple of (snapshot_path, error_code) pairs
+        for snap_path, err_code in (e.errors or ()):
+            if err_code == errno.EEXIST:
+                raise ZFSPathAlreadyExistsException(snap_path)
+        raise
+
+    return snapshot_names

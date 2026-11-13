@@ -1,27 +1,77 @@
-from middlewared.service import ServiceChangeMixin
-from middlewared.utils.path import is_child
+from __future__ import annotations
+
+from dataclasses import dataclass
+import functools
+from typing import TYPE_CHECKING, Any, Awaitable, Callable, Generator, Iterable, Protocol, TypeAlias
+
+from middlewared.service import GenericSharingTaskService, LocalPathInfo, ServiceChangeMixin, SharingTaskService
+from middlewared.service.sharing_task_service_part import dataset_split
+
+if TYPE_CHECKING:
+    from middlewared.api.current import ZFSResourceRenameArgsData
+    from middlewared.main import Middleware
+    from middlewared.plugins.zfs.set_rules import SetContext
 
 
-class FSAttachmentDelegate(ServiceChangeMixin):
+# A dataset that was unlocked, paired with the mountpoint its filesystem lives at. `dataset` is in
+# `pool.dataset.query` form; `mountpoint` is the fabricated `/mnt/<name>` path for a zvol and `None`
+# when the dataset has a `legacy` mountpoint.
+UnlockedDataset: TypeAlias = tuple[dict[str, Any], str | None]
+
+
+class Entry(Protocol):
+    id: int
+
+
+@dataclass(slots=True, frozen=True, kw_only=True)
+class LocalPathWriter:
+    """An enabled item that may write the files under `path`. `dataset` and `relative_path` are the path as the
+    kernel resolved it when the item was saved."""
+
+    name: str
+    path: str
+    dataset: str | None
+    relative_path: str | None
+    crosses_mounts: bool
+
+
+def uncovered_mountpoints(mountpoints: Iterable[str]) -> Generator[str]:
+    # Keep only the top-most mountpoints: a mountpoint nested under another in the set is already
+    # covered because attachment `query` matches child paths recursively.
+    kept: list[str] = []
+    for mountpoint in sorted(set(mountpoints), key=len):
+        if any(mountpoint == top or mountpoint.startswith(top + '/') for top in kept):
+            continue
+        yield mountpoint
+        kept.append(mountpoint)
+
+
+class FSAttachmentDelegate[E](ServiceChangeMixin):
     """
     Represents something (share, automatic task, etc.) that needs to be enabled or disabled when dataset
     becomes available or unavailable (due to import/export, encryption/decryption, etc.)
     """
 
     # Unique identifier among all FSAttachmentDelegate classes
-    name = NotImplementedError
+    name: str
     # Human-readable name of item handled by this delegate (e.g. "NFS Share")
-    title = NotImplementedError
+    title: str
     # If is not None, corresponding service will be restarted after performing tasks on item
-    service = None
+    service: str | None = None
     # attribute which is used to identify human readable description of an attachment
-    resource_name = 'name'
+    resource_name = "name"
+    # Priority for ordering delegate operations
+    # On start: delegates are processed high-to-low priority (infrastructure starts first)
+    # On stop: delegates are processed low-to-high priority (dependent services stop first)
+    # Delegates with same priority maintain registration order among themselves.
+    priority = 0
+    set_triggers: frozenset[str] = frozenset()
 
-    def __init__(self, middleware):
+    def __init__(self, middleware: Middleware) -> None:
         self.middleware = middleware
         self.logger = middleware.logger
 
-    async def query(self, path, enabled, options=None):
+    async def query(self, path: str, enabled: bool, options: dict[str, Any] | None = None) -> list[E]:
         """
         Lists enabled/disabled items that depend on a dataset
         :param path: mountpoint of the dataset (e.g. "/mnt/tank/work")
@@ -31,16 +81,20 @@ class FSAttachmentDelegate(ServiceChangeMixin):
         """
         raise NotImplementedError
 
-    async def get_attachment_name(self, attachment):
+    async def get_attachment_name(self, attachment: E) -> str:
         """
         Returns human-readable description of item (e.g. it's path). Will be combined with `cls.title`.
         I.e. if you return here `/mnt/tank/work`, user will see: `NFS Share "/mnt/tank/work"`
         :param attachment: one of the items returned by `query`
         :return: string described above
         """
-        return attachment[self.resource_name]
+        if isinstance(attachment, dict):
+            # FIXME: This must be eventually removed
+            return attachment[self.resource_name]  # type: ignore[no-any-return]
+        else:
+            return getattr(attachment, self.resource_name)  # type: ignore[no-any-return]
 
-    async def delete(self, attachments):
+    async def delete(self, attachments: list[E]) -> None:
         """
         Permanently delete said items
         :param attachments: list of the items returned by `query`
@@ -48,7 +102,7 @@ class FSAttachmentDelegate(ServiceChangeMixin):
         """
         raise NotImplementedError
 
-    async def toggle(self, attachments, enabled):
+    async def toggle(self, attachments: list[E], enabled: bool) -> None:
         """
         Enable or disable said items
         :param attachments: list of the items returned by `query`
@@ -57,54 +111,203 @@ class FSAttachmentDelegate(ServiceChangeMixin):
         """
         raise NotImplementedError
 
-    async def start(self, attachments):
+    async def start(self, attachments: list[E]) -> None:
         pass
 
-    async def stop(self, attachments):
+    async def stop(self, attachments: list[E]) -> None:
         pass
 
+    async def start_on_unlock(self, datasets: list[UnlockedDataset]) -> None:
+        """
+        Bring this delegate's attachments back up after datasets are unlocked.
 
-class LockableFSAttachmentDelegate(FSAttachmentDelegate):
+        :param datasets: list of `(dataset, mountpoint)` tuples, one per encryption root that was
+            actually unlocked. `dataset` is the dataset dict; `mountpoint` is where its filesystem
+            lives (for a zvol this is the fabricated `/mnt/<name>` path, and it is `None` when the
+            dataset has a `legacy` mountpoint).
+
+        The default implementation starts the share/service style attachments that the generic
+        `query`/`start` contract describes. Stateful workloads (VMs, containers) whose `query`
+        only reports already-running items override this to honor their autostart configuration.
+        (Apps are a deliberate exception: they have no autostart flag and are never started
+        automatically when a path becomes available.)
+        """
+        attachments: list[E] = []
+        # `query` matches recursively, so querying only the top-most mountpoints avoids re-running
+        # `{namespace}.query` (and an is_child per share) for every child dataset of a recursively
+        # unlocked pool, while still covering a legacy-mountpoint parent or a child mounted outside
+        # its parent's subtree.
+        for mountpoint in uncovered_mountpoints(mountpoint for _, mountpoint in datasets if mountpoint):
+            for attachment in await self.query(mountpoint, True, {'locked': False}):
+                if attachment not in attachments:
+                    attachments.append(attachment)
+
+        if attachments:
+            await self.start(attachments)
+
+    async def start_on_import(self, path: str) -> None:
+        """
+        Bring this delegate's attachments back up after the pool mounted at `path` was re-imported.
+
+        :param path: mountpoint of the re-imported pool (e.g. "/mnt/tank")
+
+        The default implementation starts the share/service style attachments that the generic
+        `query`/`start` contract describes. Stateful workloads (VMs, containers) override this to
+        honor their autostart configuration rather than booting everything that lives on the pool.
+        """
+        if attachments := await self.query(path, False):
+            await self.start(attachments)
+
+    async def disable(self, attachments: list[E]) -> None:
+        """
+        Disable said items, this is used when we export pool but do not want to delete
+        related attachments
+        :param attachments: list of the items returned by `query`
+        :return: None
+        """
+        await self.toggle(attachments, False)
+
+    async def destroy(self, path: str) -> None:
+        """
+        Discard whatever only made sense while the data on `path` existed, now that the pool
+        mounted there has actually been destroyed.
+
+        :param path: mountpoint of the destroyed pool (e.g. "/mnt/tank")
+
+        Called once per delegate by `pool.export`, only when the export was cascaded *and* the
+        pool's data really went away, and only after the zpool destroy has returned: `delete` has
+        to run first so the datasets are released, whereas discarding configuration is safe only
+        once the data it describes is confirmed gone.
+
+        Do not assume `delete` saw the same items. It is driven by `query(path, True)`, which
+        reports only running attachments and also matches items that merely reference this pool
+        from storage elsewhere, so this is handed the pool and selects for itself.
+
+        The default is a no-op: `delete` already disposed of the share/task style attachments
+        while the pool was still there.
+        """
+
+    def validate_set(self, state: SetContext) -> None:
+        pass
+
+    def validate_rename(self, data: ZFSResourceRenameArgsData) -> None:
+        pass
+
+    def after_set(self, state: SetContext) -> None:
+        """Raising fails the set once every delegate has run; the write is not undone."""
+
+
+class LockableFSAttachmentDelegate[E: Entry](FSAttachmentDelegate[E]):
     """
     Represents a share/task/resource which is affected if the dataset underlying is locked
     """
 
-    # service object
-    service_class = NotImplementedError
+    service: str
+    service_class: type[SharingTaskService[E]] | type[GenericSharingTaskService[E]]
 
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        self.enabled_field = self.service_class.enabled_field
-        self.locked_field = self.service_class.locked_field
-        self.path_field = self.service_class.path_field
-        self.datastore_model = self.service_class._config.datastore
-        self.datastore_prefix = self.service_class._config.datastore_prefix
-        self.namespace = self.service_class._config.namespace
+    def __init__(self, middleware: Middleware) -> None:
+        super().__init__(middleware)
+        self.namespace = self.service_class._config.namespace  # type: ignore[attr-defined]
+        if self.service_class._config.datastore:  # type: ignore[attr-defined]
+            # Legacy SharingTaskService: field config + datastore live on the service class.
+            svc = self.service_class
+            self.enabled_field = svc.enabled_field  # type: ignore[union-attr]
+            self.locked_field = svc.locked_field  # type: ignore[union-attr]
+            self.path_field = svc.path_field  # type: ignore[union-attr]
+            self.datastore_model = svc._config.datastore  # type: ignore[attr-defined]
+            self.datastore_prefix = svc._config.datastore_prefix  # type: ignore[attr-defined]
+            self._resource_path = functools.partial(svc.get_path_field, svc)  # type: ignore[union-attr,arg-type]
+            self._local_path_info: Callable[[Any], Awaitable[LocalPathInfo | None]] = functools.partial(
+                svc.local_path_info, svc  # type: ignore[union-attr,arg-type]
+            )
+            self.crosses_mounts = svc.crosses_mounts  # type: ignore[union-attr]
+        else:
+            # Typesafe GenericSharingTaskService: field config + datastore live on the service
+            # part; read them off the running instance's part.
+            part = self.middleware.get_service(self.namespace)._svc_part  # type: ignore[attr-defined]
+            self.enabled_field = part.enabled_field
+            self.locked_field = part.locked_field
+            self.path_field = part.path_field
+            self.datastore_model = part._datastore
+            self.datastore_prefix = part._datastore_prefix
+            self._resource_path = part.get_path_field
+            self._local_path_info = lambda item: part.local_path_info(item.model_dump())
+            self.crosses_mounts = part.crosses_mounts
         if not self.service:
-            self.service = self.service_class._config.service
+            self.service = self.service_class._config.service  # type: ignore[attr-defined]
 
-    async def get_query_filters(self, enabled, options=None):
-        options = options or {}
-        filters = [[self.enabled_field, '=', enabled]]
-        if 'locked' in options:
-            filters += [[self.locked_field, '=', options['locked']]]
-        return filters
+    def get_query_filters(self, enabled: bool) -> list[Any]:
+        """
+        Filters that select this delegate's items. `query` runs them in SQL, so they may only name database
+        columns, never an extended field such as the locked field.
+        """
+        return [[self.enabled_field, "=", enabled]]
 
-    async def query(self, path, enabled, options=None):
-        results = []
-        for resource in await self.middleware.call(
-            f'{self.namespace}.query', await self.get_query_filters(enabled, options)
+    async def local_path_writers(self) -> list[LocalPathWriter]:
+        """The enabled items that may write their local path, as `local_path_info` judges them when saved."""
+        writers = []
+        for item in await self.middleware.call(
+            f"{self.namespace}.query",
+            # not get_query_filters, which may narrow to the items a lock affects
+            [[self.enabled_field, "=", True]],
+            {"force_sql_filters": True, "extra": {"retrieve_locked_info": False}},
         ):
-            if await self.is_child_of_path(resource, path):
+            if (info := await self._local_path_info(item)) is not None and info.readonly:
+                continue
+            dataset, relative_path = dataset_split(item)
+            writers.append(LocalPathWriter(
+                name=await self.get_attachment_name(item), path=await self._resource_path(item), dataset=dataset,
+                relative_path=relative_path, crosses_mounts=self.crosses_mounts,
+            ))
+        return writers
+
+    async def start_service(self) -> None:
+        if (
+            not (service_obj := await self.call2(self.s.service.query, [["service", "=", self.service]]))
+            or not service_obj[0].enable
+            or service_obj[0].state == "RUNNING"
+        ):
+            return
+
+        await (await self.call2(self.s.service.control, "START", self.service)).wait(raise_error=True)
+
+    async def query(self, path: str, enabled: bool, options: dict[str, Any] | None = None) -> list[E]:
+        results = []
+        options = options or {}
+        check_parent = options.get("check_parent", False)
+        exact_match = options.get("exact_match", False)
+        filter_locked = "locked" in options
+        for resource in await self.middleware.call(
+            f"{self.namespace}.query",
+            self.get_query_filters(enabled),
+            # Lock state costs a lookup per row, so compute it only when filtering on it
+            {"force_sql_filters": True, "extra": {"retrieve_locked_info": filter_locked}},
+        ):
+            if filter_locked:
+                if isinstance(resource, dict):
+                    # FIXME: This must be eventually removed
+                    locked = resource[self.locked_field]
+                else:
+                    locked = getattr(resource, self.locked_field)
+                if locked != options["locked"]:
+                    continue
+            if await self.is_child_of_path(resource, path, check_parent, exact_match):
                 results.append(resource)
         return results
 
-    async def toggle(self, attachments, enabled):
+    async def toggle(self, attachments: list[E], enabled: bool) -> None:
         for attachment in attachments:
+            if isinstance(attachment, dict):
+                # FIXME: This must be eventually removed
+                attachment_id = attachment["id"]
+            else:
+                attachment_id = attachment.id
+
             await self.middleware.call(
-                'datastore.update', self.datastore_model, attachment['id'], {
-                    f'{self.datastore_prefix}{self.enabled_field}': enabled
-                }
+                "datastore.update",
+                self.datastore_model,
+                attachment_id,
+                {f"{self.datastore_prefix}{self.enabled_field}": enabled},
             )
             await self.remove_alert(attachment)
 
@@ -113,31 +316,68 @@ class LockableFSAttachmentDelegate(FSAttachmentDelegate):
         else:
             await self.stop(attachments)
 
-    async def delete(self, attachments):
+    async def delete(self, attachments: list[E]) -> None:
         for attachment in attachments:
-            await self.middleware.call('datastore.delete', self.datastore_model, attachment['id'])
+            if isinstance(attachment, dict):
+                # FIXME: This must be eventually removed
+                attachment_id = attachment["id"]
+            else:
+                attachment_id = attachment.id
+
+            await self.middleware.call("datastore.delete", self.datastore_model, attachment_id)
             await self.remove_alert(attachment)
         if attachments:
             await self.restart_reload_services(attachments)
 
-    async def restart_reload_services(self, attachments):
+    async def restart_reload_services(self, attachments: list[E]) -> None:
         """
         Common method for post delete/toggle which child classes can use to restart/reload services
         """
         raise NotImplementedError
 
-    async def remove_alert(self, attachment):
-        await self.middleware.call(f'{self.namespace}.remove_locked_alert', attachment['id'])
+    async def remove_alert(self, attachment: E) -> None:
+        if isinstance(attachment, dict):
+            # FIXME: This must be eventually removed
+            attachment_id = attachment["id"]
+        else:
+            attachment_id = attachment.id
 
-    async def is_child_of_path(self, resource, path):
-        return is_child(resource[self.path_field], path)
+        await self.middleware.call(f"{self.namespace}.remove_locked_alert", attachment_id)
 
-    async def start(self, attachments):
+    async def is_child_of_path(self, resource: E, path: str, check_parent: bool, exact_match: bool) -> bool:
+        # What this is essentially doing is testing if resource in question is a child of queried path
+        # and not vice versa. While this is desirable in most cases, there are cases we also want to see
+        # if path is a child of the resource in question. In that case we want the following:
+        # 1) When parent of configured path is specified we return true
+        # 2) When configured path itself is specified we return true
+        # 3) When path is child of configured path, we return true as the path
+        #    is being consumed by service in question
+        #
+        # In most cases we want to cater to above child cases with resource path and the path specified
+        # but there can also be cases when we just want to be sure if the resource path and the path to check
+        # are equal and for that case `exact_match` is used where we do not try to see if one is the child of
+        # another or vice versa. We just check if they are equal.
+        #
+        # `check_parent` flag when set can be used to check for the case when share path is the parent
+        # of the path to check.
+
+        share_path = await self._resource_path(resource)
+        if exact_match or share_path == path:
+            return share_path == path
+
+        is_child = await self.middleware.call("filesystem.is_child", share_path, path)
+        if not is_child and check_parent:
+            return await self.middleware.call("filesystem.is_child", path, share_path)  # type: ignore[no-any-return]
+        else:
+            return is_child  # type: ignore[no-any-return]
+
+    async def start(self, attachments: list[E]) -> None:
+        await self.start_service()
         for attachment in attachments:
             await self.remove_alert(attachment)
         if attachments:
             await self.restart_reload_services(attachments)
 
-    async def stop(self, attachments):
+    async def stop(self, attachments: list[E]) -> None:
         if attachments:
             await self.restart_reload_services(attachments)

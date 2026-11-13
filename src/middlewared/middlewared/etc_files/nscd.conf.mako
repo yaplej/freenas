@@ -33,13 +33,11 @@
 #	auto-propagate		<service> <yes|no>
 #
 # Currently supported cache names (services): passwd, group, hosts, services
+# TrueNAS modification: enable for 'hosts' only
 #
 <%
     import os
-    from contextlib import suppress
-
-    with suppress(FileExistsError):
-        os.mkdir("/var/run/nscd", mode=0o755)
+    os.makedirs('/var/run/nscd/cache', mode=0o755, exist_ok=True)
 %>\
 
 

@@ -1,0 +1,66 @@
+import asyncio
+
+from middlewared.plugins.docker.state_management import DOCKER_START_TIMEOUT
+from middlewared.plugins.docker.state_utils import Status
+
+from .base import SimpleService
+
+# Time to sleep between checks
+DOCKER_STATUS_CHECK_INTERVAL = 2
+
+
+class DockerService(SimpleService):
+    name = 'docker'
+    etc = ['app_registry', 'docker']
+    may_run_on_standby = False
+    systemd_unit = 'docker'
+
+    async def before_start(self) -> None:
+        await self.middleware.call2(self.s.docker.set_status, Status.INITIALIZING.value)
+        await self.middleware.call2(self.s.docker.before_start_check)
+        for key, value in (
+            ('vm.panic_on_oom', 0),
+            ('vm.overcommit_memory', 1),
+        ):
+            await self.middleware.call2(self.s.sysctl.set_value, key, value)
+
+    async def start(self) -> None:
+        try:
+            await super().start()
+            # We have a timeout for docker to start within 16 minutes of the above call, if that doesn't happen
+            # then we get into a failed start that docker failed to start. This has been necessary because
+            # HDDs have been notorious and can take quite some time for docker to start on boot.
+            timeout = DOCKER_START_TIMEOUT
+            while timeout > 0:
+                if not await self.call2(self.s.service.started, 'docker'):
+                    await asyncio.sleep(DOCKER_STATUS_CHECK_INTERVAL)
+                    timeout -= DOCKER_STATUS_CHECK_INTERVAL
+                else:
+                    break
+        finally:
+            asyncio.get_event_loop().call_later(
+                2,
+                lambda: self.middleware.create_task(self.middleware.call2(self.s.docker.after_start_check)),
+            )
+
+    async def stop(self) -> None:
+        # A pending stop job on docker.socket makes systemd refuse activation
+        # requests, so a client connecting during teardown cannot resurrect the
+        # service being stopped.
+        try:
+            await self._systemd_unit('docker.socket', 'stop')
+        finally:
+            await super().stop()
+        await self._systemd_unit('containerd.service', 'stop')
+
+    async def after_start(self) -> None:
+        await self.middleware.call2(self.s.docker.set_status, Status.RUNNING.value)
+        self.middleware.create_task(self.middleware.call2(self.s.docker.setup_docker_events))
+        if (await self.middleware.call2(self.s.docker.config)).enable_image_updates:
+            self.middleware.create_task(self.middleware.call2(self.s.app.image.check_update))
+
+    async def before_stop(self) -> None:
+        await self.middleware.call2(self.s.docker.set_status, Status.STOPPING.value)
+
+    async def after_stop(self) -> None:
+        await self.middleware.call2(self.s.docker.set_status, Status.STOPPED.value)

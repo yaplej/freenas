@@ -1,5 +1,9 @@
+# Copyright (c) - iXsystems Inc. dba TrueNAS
+#
+# Licensed under the terms of the TrueNAS Enterprise License Agreement
+# See the file LICENSE.IX for complete terms and conditions
+
 from middlewared.service import Service
-from middlewared.plugins.interface.netif import netif
 
 
 class DetectVirtualIpStates(Service):
@@ -9,72 +13,89 @@ class DetectVirtualIpStates(Service):
         namespace = 'failover.vip'
 
     async def check_failover_group(self, ifname, groups):
-
         """
         Check the other members (if any) in failover group for `ifname`
         """
+        failover_grp_ifaces = list()
+        for grp, names in groups.items():
+            if ifname in names:
+                # get the list of interfaces that are in the same
+                # failover group as `ifname`.
+                failover_grp_ifaces = names[:]
 
-        masters, backups = [], []
+                # we remove `ifname` since we only care about the other
+                # interfaces in this failover group
+                failover_grp_ifaces.remove(ifname)
 
-        # get failover group id for `iface`
-        group_id = [
-            group for group, names in groups.items() if ifname in names
-        ][0]
+                # An interface can only ever be in a single failover
+                # group so we can break the loop early here
+                break
 
-        # get all interfaces in `group_id`
-        ids = [
-            names for group, names in groups.items() if group == group_id
-        ][0]
+        masters, backups, offline = list(), list(), list()
+        filters = [['id', 'in', failover_grp_ifaces]]
+        for i in await self.middleware.call('interface.query', filters):
+            if i['state'].get('link_state') != 'LINK_STATE_UP':
+                # It's not common, but some users will configure interfaces
+                # for failover but they won't be online. In this scenario
+                # the interfaces will appear as "backup", but that's
+                # misleading since they technically are backup they're not
+                # actually participating in any VRRP negotiations. In this
+                # instance, we'll mark them as offline
+                offline.append(i['id'])
+                continue
 
-        # need to remove the passed in `ifname` from the list
-        ids.remove(ifname)
+            # We're checking any other interface that is in the same
+            # failover group as `ifname`. For example, customers often
+            # configure multiple physical interfaces for iSCSI MPIO.
+            # Since they are using MPIO, each interface serves as a
+            # discreet path to their data. However, if 1 of the 4
+            # interfaces go down then we don't need to failover since
+            # 3 other paths are up (That's the point of MPIO). In this
+            # scenario, the customer will have to put all 4 of the
+            # physical interfaces in the _same_ failover group.
+            for vrrp_info in (i['state'].get('vrrp_config') or []):
+                # `vrrp_config` can be NoneType when a bond interface
+                # has been configured that has no config on it. The
+                # reason why a bond will have no config is when it's
+                # used as a parent interface to host vlan interfaces.
+                # In this scenario, vrrp_config is expected to be None.
+                if vrrp_info['state'] == 'MASTER':
+                    masters.append(i['id'])
+                else:
+                    backups.append(i['id'])
 
-        # if the user provided VIP(s) is/are missing from the interface
-        # then it's considered "BACKUP" if the interface has the VIP(s)
-        # then it's considered "MASTER"
-        if len(ids):
-
-            # we can have more than one interface in the failover
-            # group so check the state of the interface
-            for i in ids:
-                iface = netif.get_interface(i)
-                for j in iface.vrrp_config:
-                    if j['state'] == 'MASTER':
-                        masters.append(i)
-                    else:
-                        backups.append(i)
-
-        return masters, backups
+        return masters, backups, offline
 
     async def get_states(self, interfaces=None):
-        masters, backups, inits = [], [], []
+        masters, backups, offline = [], [], []
 
         if interfaces is None:
             interfaces = await self.middleware.call('interface.query')
 
         int_ifaces = await self.middleware.call('interface.internal_interfaces')
+        for i in filter(lambda x: x['name'] not in int_ifaces and x['state']['vrrp_config'], interfaces):
+            if i['state']['link_state'] == 'LINK_STATE_UP':
+                vrrp_state = i['state']['vrrp_config'][0]['state']
+                if vrrp_state == 'MASTER':
+                    masters.append(i['name'])
+                elif vrrp_state == 'BACKUP':
+                    backups.append(i['name'])
+            else:
+                offline.append(i['name'])
 
-        for i in filter(lambda x: x['name'] not in int_ifaces, interfaces):
-            if not i.get('failover_critical', False) or not i['state']['vrrp_config']:
-                continue
-
-            vrrp_state = i['state']['vrrp_config'][0]['state']
-            if vrrp_state == 'MASTER':
-                masters.append(i['name'])
-            elif vrrp_state == 'BACKUP':
-                backups.append(i['name'])
-
-        return masters, backups, inits
+        return masters, backups, offline
 
     async def check_states(self, local, remote):
-
         errors = []
-
-        interfaces = set(local[0] + local[1] + remote[0] + remote[1])
+        interfaces = set(local[0] + local[1] + local[2] + remote[0] + remote[1] + remote[2])
         if not interfaces:
             errors.append('There are no failover interfaces')
 
         for name in interfaces:
+            if name in local[2]:
+                errors.append(f'Interface "{name}" is OFFLINE on local node')
+            if name in remote[2]:
+                errors.append(f'Interface "{name}" is OFFLINE on remote node')
             if name in local[1] and name in remote[1]:
                 errors.append(f'Interface "{name}" is BACKUP on both nodes')
             if name in local[0] and name in remote[0]:

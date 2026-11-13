@@ -1,153 +1,193 @@
+from __future__ import annotations
+
 import asyncio
-import contextlib
+import errno
+import os
+import typing
 
-from middlewared.schema import accepts, Bool, Dict
-from middlewared.service import CallError, private, Service
-from middlewared.utils.asyncio_ import asyncio_map
+from truenas_pylibvirt import Error as PyLibvirtError
+from truenas_pylibvirt import Time, VmBootloader, VmCpuMode, VmVideoModel
 
-from .utils import ACTIVE_STATES
-from .vm_supervisor import VMSupervisorMixin
+from middlewared.api.current import VMEntry, VMStartOptions, VMStopOptions
+from middlewared.service import CallError, ServiceContext
+from middlewared.utils.libvirt.utils import ACTIVE_STATES
+
+from .info import BOOT_LOADER_OPTIONS, license_active
+from .utils import SYSTEM_NVRAM_FOLDER_PATH, SYSTEM_TPM_FOLDER_PATH, get_vm_nvram_file_name, get_vm_tpm_state_dir_name
+from .vm_domain import VmDomain, VmDomainConfiguration
 
 
-SHUTDOWN_LOCK = asyncio.Lock()
+async def lifecycle_action_check(context: ServiceContext) -> None:
+    if not await license_active(context):
+        raise CallError('Requested action cannot be performed as system is not licensed to use VMs')
 
 
-class VMService(Service, VMSupervisorMixin):
+def start_vm(context: ServiceContext, id_: int, options: VMStartOptions) -> None:
+    context.run_coroutine(lifecycle_action_check(context))
 
-    @private
-    async def wait_for_libvirtd(self, timeout):
-        async def libvirtd_started(middleware):
-            await middleware.call('service.start', 'libvirtd')
-            while not await middleware.call('service.started', 'libvirtd'):
-                await asyncio.sleep(2)
+    vm = context.call_sync2(context.s.vm.get_instance, id_)
+    if vm.status.state in ACTIVE_STATES:
+        raise CallError(f'VM {vm.name!r} is already running')
 
-        try:
-            self._system_supports_virtualization()
-            if not await self.middleware.call('service.started', 'libvirtd'):
-                await asyncio.wait_for(libvirtd_started(self.middleware), timeout=timeout)
-            # We want to do this before initializing libvirt connection
-            await self.middleware.run_in_thread(self._open)
-            await self.middleware.run_in_thread(self._check_connection_alive)
-            await self.middleware.call('vm.setup_libvirt_events')
-        except (asyncio.TimeoutError, CallError):
-            self.middleware.logger.error('Failed to setup libvirt', exc_info=True)
+    if vm.bootloader not in BOOT_LOADER_OPTIONS:
+        raise CallError(f'"{vm.bootloader}" is not supported on this platform.')
 
-    @private
-    def setup_libvirt_connection(self, timeout=30):
-        self.middleware.call_sync('vm.wait_for_libvirtd', timeout)
+    # Check HA compatibility
+    if context.middleware.call_sync('system.is_ha_capable'):
+        for device in vm.devices:
+            if device.attributes.dtype in ('PCI', 'USB'):
+                raise CallError(
+                    'Please remove PCI/USB devices from VM before starting it in HA capable machines'
+                )
 
-    @private
-    async def check_setup_libvirt(self):
-        if not await self.middleware.call('service.started', 'libvirtd'):
-            await self.middleware.call('vm.setup_libvirt_connection')
-
-    @private
-    def initialize_vms(self, timeout=30):
-        vms = self.middleware.call_sync('vm.query')
-        if vms and self._is_kvm_supported():
-            self.setup_libvirt_connection(timeout)
-        else:
-            return
-
-        if self._is_connection_alive():
-            for vm_data in vms:
-                try:
-                    self._add_with_vm_data(vm_data)
-                except Exception as e:
-                    # Whatever happens, we don't want middlewared not booting
-                    self.middleware.logger.error(
-                        'Unable to setup %r VM object: %s', vm_data['name'], str(e), exc_info=True
-                    )
-            self.middleware.call_sync('service.reload', 'haproxy')
-        else:
-            self.middleware.logger.error('Failed to establish libvirt connection')
-
-    @private
-    async def start_on_boot(self):
-        for vm in await self.middleware.call('vm.query', [('autostart', '=', True)], {'force_sql_filters': True}):
-            try:
-                await self.middleware.call('vm.start', vm['id'])
-            except Exception as e:
-                self.middleware.logger.error(f'Failed to start VM {vm["name"]}: {e}')
-
-    @private
-    @accepts(
-        Dict(
-            'deinitialize_vms_options',
-            Bool('stop_libvirt', default=True),
+    # Start the VM using pylibvirt
+    try:
+        context.middleware.libvirt_domains_manager.vms.start(
+            pylibvirt_vm(context, vm, options)
         )
-    )
-    async def deinitialize_vms(self, options):
-        await self.middleware.call('vm.close_libvirt_connection')
-        await self.middleware.call('service.stop', 'haproxy')
-        if options['stop_libvirt']:
-            await self.middleware.call('service.stop', 'libvirtd')
+    except PyLibvirtError as e:
+        raise CallError(str(e))
 
-    @private
-    def close_libvirt_connection(self):
-        if self.LIBVIRT_CONNECTION:
-            with contextlib.suppress(CallError):
-                self._close()
-
-    @private
-    def setup_details(self):
-        return {
-            'connected': self._is_connection_alive(),
-            'connection_initialised': bool(self.LIBVIRT_CONNECTION),
-            'domains': list(self.vms.keys()),
-        }
-
-    @private
-    async def terminate(self):
-        async with SHUTDOWN_LOCK:
-            await self.middleware.call('vm.deinitialize_vms', {'stop_libvirt': False})
-
-    @private
-    async def terminate_timeout(self):
-        return max(map(lambda v: v['shutdown_timeout'], await self.middleware.call('vm.query')), default=10)
+    # Reload HTTP service for display device changes
+    context.call_sync2(context.s.service.control, 'RELOAD', 'http').wait_sync(raise_error=True)
 
 
-async def __event_system_ready(middleware, event_type, args):
-    """
-    Method called when system is ready, supposed to start VMs
-    flagged that way.
-    """
-    async def poweroff_stop_vm(vm):
-        if vm['status']['state'] == 'RUNNING':
-            stop_job = await middleware.call('vm.stop', vm['id'], {'force_after_timeout': True})
-            await stop_job.wait()
-            if stop_job.error:
-                middleware.logger.error('Stopping %r VM failed: %r', vm['name'], stop_job.error)
-        else:
-            try:
-                await middleware.call('vm.poweroff', vm['id'])
-            except Exception:
-                middleware.logger.error('Powering off %r VM failed', vm['name'], exc_info=True)
-
-    if args['id'] == 'ready':
-        await middleware.call('vm.initialize_vms')
-
-        # we ignore the 'ready' event on an HA system since the failover event plugin
-        # is responsible for starting this service, however, the VMs still need to be
-        # initialized (which is what the above callers are doing)
-        if await middleware.call('failover.licensed'):
+def stop_vm(context: ServiceContext, id_: int, options: VMStopOptions) -> None:
+    vm = context.call_sync2(context.s.vm.get_instance, id_)
+    libvirt_domain = pylibvirt_vm(context, vm)
+    vms = context.middleware.libvirt_domains_manager.vms
+    try:
+        if options.force:
+            vms.destroy(libvirt_domain)
             return
 
-        asyncio.ensure_future(middleware.call('vm.start_on_boot'))
-    elif args['id'] == 'shutdown':
-        async with SHUTDOWN_LOCK:
-            await asyncio_map(
-                poweroff_stop_vm,
-                (await middleware.call('vm.query', [('status.state', 'in', ACTIVE_STATES)])), 16
-            )
-            middleware.logger.debug('VM(s) stopped successfully')
-            # We do this in vm.terminate as well, reasoning for repeating this here is that we don't want to
-            # stop libvirt on middlewared restarts, we only want that to happen if a shutdown has been initiated
-            # and we have cleanly exited
-            await middleware.call('vm.deinitialize_vms')
+        if vm.status.state == 'SUSPENDED':
+            # A paused guest cannot act on the shutdown request.
+            vms.resume(libvirt_domain)
+
+        vms.shutdown(libvirt_domain, vm.shutdown_timeout)
+        if context.call_sync2(context.s.vm.get_instance, id_).status.state != 'STOPPED':
+            if options.force_after_timeout:
+                vms.destroy(libvirt_domain)
+            else:
+                raise CallError(
+                    f'VM {vm.name!r} did not stop within {vm.shutdown_timeout} seconds', errno.ETIMEDOUT,
+                )
+    except PyLibvirtError as e:
+        raise CallError(str(e))
 
 
-async def setup(middleware):
-    if await middleware.call('system.ready'):
-        asyncio.ensure_future(middleware.call('vm.initialize_vms', 5))  # We use a short timeout here deliberately
-    middleware.event_subscribe('system', __event_system_ready)
+def poweroff_vm(context: ServiceContext, id_: int) -> None:
+    vm = context.call_sync2(context.s.vm.get_instance, id_)
+    context.middleware.libvirt_domains_manager.vms.destroy(
+        pylibvirt_vm(context, vm)
+    )
+
+
+def reset_vm(context: ServiceContext, id_: int) -> None:
+    vm = context.call_sync2(context.s.vm.get_instance, id_)
+    context.middleware.libvirt_domains_manager.vms.reset(
+        pylibvirt_vm(context, vm)
+    )
+
+
+def suspend_vm(context: ServiceContext, id_: int) -> None:
+    vm = context.call_sync2(context.s.vm.get_instance, id_)
+    context.middleware.libvirt_domains_manager.vms.suspend(
+        pylibvirt_vm(context, vm)
+    )
+
+
+def resume_vm(context: ServiceContext, id_: int) -> None:
+    vm = context.call_sync2(context.s.vm.get_instance, id_)
+    context.middleware.libvirt_domains_manager.vms.resume(
+        pylibvirt_vm(context, vm)
+    )
+
+
+def restart_vm(context: ServiceContext, id_: int) -> None:
+    vm = context.call_sync2(context.s.vm.get_instance, id_)
+    stop_job = context.call_sync2(context.s.vm.stop, id_, VMStopOptions(force_after_timeout=True))
+    stop_job.wait_sync()
+    if stop_job.error:
+        raise CallError(f'Failed to stop {vm.name!r} vm: {stop_job.error}')
+
+    start_vm(context, id_, VMStartOptions(overcommit=True))
+
+
+def pylibvirt_vm(
+    context: ServiceContext, vm: VMEntry, start_config: VMStartOptions | None = None,
+) -> VmDomain:
+    data = vm.model_dump(expose_secrets=True)
+    data.pop('display_available', None)
+    data.pop('status', None)
+    data.pop('autostart', None)
+
+    device_factory = context.s.vm.device.device_factory
+    devices = []
+    for device in sorted(data.get('devices', []), key=lambda x: (x['order'], x['id'])):
+        devices.append(device_factory.get_device(device))
+
+    data.update({
+        'bootloader': VmBootloader(data['bootloader']),
+        'video_model': VmVideoModel(data['video_model']),
+        'cpu_mode': VmCpuMode(data['cpu_mode']),
+        'time': Time(data['time']),
+        'nvram_path': os.path.join(SYSTEM_NVRAM_FOLDER_PATH, get_vm_nvram_file_name(data['id'], data['name'])),
+        'tpm_path': os.path.join(SYSTEM_TPM_FOLDER_PATH, get_vm_tpm_state_dir_name(data['id'], data['name'])),
+        'devices': devices,
+    })
+
+    return VmDomain(
+        VmDomainConfiguration(**data),
+        context.middleware,
+        start_config.model_dump() if start_config is not None else None,
+    )
+
+
+def resume_suspended_vms(context: ServiceContext, vm_ids: list[int]) -> None:
+    vms = {vm.id: vm for vm in context.call_sync2(context.s.vm.query)}
+    for vm_id in vm_ids:
+        vm = vms.get(vm_id)
+        if vm is None or vm.status.state != 'SUSPENDED':
+            continue
+        try:
+            resume_vm(context, vm_id)
+        except Exception:
+            context.logger.error('Failed to resume %r vm', vms[vm_id].name, exc_info=True)
+
+
+def suspend_vms(context: ServiceContext, vm_ids: list[int]) -> None:
+    vms = {vm.id: vm for vm in context.call_sync2(context.s.vm.query)}
+    for vm_id in vm_ids:
+        vm = vms.get(vm_id)
+        if vm is None or vm.status.state != 'RUNNING' or not vm.suspend_on_snapshot:
+            continue
+        try:
+            suspend_vm(context, vm_id)
+        except Exception:
+            context.logger.error('Failed to suspend %r vm', vms[vm_id].name, exc_info=True)
+
+
+async def start_on_boot(context: ServiceContext) -> None:
+    for vm in await context.call2(context.s.vm.query, [('autostart', '=', True)]):
+        try:
+            await context.to_thread(start_vm, context, vm.id, VMStartOptions())
+        except Exception as e:
+            context.logger.error(f'Failed to start VM {vm.name}: {e}')
+
+
+async def _stop_one_vm(context: ServiceContext, vm: typing.Any) -> None:
+    try:
+        if vm.status.state == 'RUNNING':
+            job = await context.call2(context.s.vm.stop, vm.id, VMStopOptions(force_after_timeout=True))
+            await job.wait(raise_error=True)
+        else:
+            await context.to_thread(poweroff_vm, context, vm.id)
+    except Exception:
+        context.logger.error('Failed to stop %r VM', vm.name, exc_info=True)
+
+
+async def handle_shutdown(context: ServiceContext) -> None:
+    active = await context.call2(context.s.vm.query, [('status.state', 'in', ACTIVE_STATES)])
+    await asyncio.gather(*(_stop_one_vm(context, vm) for vm in active))

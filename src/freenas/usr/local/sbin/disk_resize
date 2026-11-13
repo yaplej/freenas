@@ -1,5 +1,6 @@
 #!/bin/sh
 
+udevd_timeout=10
 dev=$1
 osize=$2
 
@@ -7,6 +8,27 @@ osize=$2
 if [ "$#" -lt 1 -o "$#" -gt 2 -o -z "$1" ]; then
 	echo "usage: $0 <device> [<xGB>|<xTB>|<sectors>]"
 	exit 1
+fi
+
+# Strip leading path if absolute path provided (e.g. /dev/sda -> sda)
+case "${dev}" in
+/*)
+	dev=${dev##*/}
+	;;
+esac
+
+# If an NVMe controller is given (no namespace), resolve to its single namespace.
+if [ -e "/sys/class/nvme/${dev}" ] && ! echo "${dev}" | grep -q 'n[0-9]'; then
+	ns_devs=$(ls -d /sys/class/nvme/${dev}/${dev}n* 2>/dev/null)
+	ns_count=$(echo "${ns_devs}" | wc -w)
+	if [ ${ns_count} -eq 0 ]; then
+		echo "No namespaces found on ${dev}"
+		exit 1
+	elif [ ${ns_count} -gt 1 ]; then
+		echo "Multiple namespaces on ${dev}, specify a namespace device"
+		exit 1
+	fi
+	dev=$(basename ${ns_devs})
 fi
 
 # Make sure provided disk is valid
@@ -121,6 +143,11 @@ ata|sata)
 	if [ -z "${size}" ]; then
 		size=${maxsect}
 	fi
+	echo "Waiting up to ${udevd_timeout} seconds for udevd events to settle"
+	udevadm settle -t ${udevd_timeout}
+	if [ $? -ne 0 ]; then
+		echo "Resize may fail. Udevd events failed to settle within ${udevd_timeout} seconds."
+	fi
 	echo "Setting Max Sectors to ${size}"
 	hdparm --yes-i-know-what-i-am-doing -N p${size} /dev/${dev}	# NB: the p is for persistence
 	if [ $? -eq 0 ]; then
@@ -148,6 +175,9 @@ sas|scsi)
 		sg_format --format --quick /dev/${dev}
 	fi
 
+	# Tell the kernel to refresh the device properties.
+	echo 1 > /sys/block/${dev}/device/rescan
+
 	if [ ${err} -eq 0 ]; then
 		echo "Resize completed successfully."
 	else
@@ -158,11 +188,26 @@ sas|scsi)
 nvme)
 	# Get controller and current namespace ID.
 	ctrlr=/dev/${dev%n*}
-	nsid=${dev##nvme*n}
+	nsid=`nvme get-ns-id /dev/${dev} | awk -F 'namespace-id:' '{ print $2 }'`
+	if [ ${nsid} -le 0 ]; then
+		echo "Unable to get namespace ID"
+		exit 1
+	fi
+
+	# if nvme device provided is a "fabric" device
+	# (i.e. nvme over tcp/rdma) then gracefully exit
+	transport="$(cat /sys/class/nvme/${dev%n*}/transport)" 2>/dev/null
+	if [ -z ${transport} ]; then
+		echo "Unable to determine transport protocol for /dev/${dev}"
+		exit 1
+	elif [ ${transport} != "pcie" ]; then
+		echo "Transport protocol (${transport}) unsupported at this time"
+		exit 1
+	fi
 
 	# Identify controller properties.
 	idctrl=`nvme id-ctrl ${ctrlr}`
-	ctrls=`nvme list-ctrl ${ctrlr} | awk -F: '{ print $2 }' | xargs | tr ' ' ,`
+	ctrls=`nvme list-ctrl ${ctrlr} -n ${nsid} | awk -F: '/^\[\s*[0-9]+\]/ { print $2 }' | xargs | tr ' ' ,`
 
 	# Check Namespace Management is supported by the controller.
 	oacs=`echo "${idctrl}" | awk -F ' +: ' '$1 == "oacs" { print $2 }'`
@@ -201,8 +246,20 @@ nvme)
 		echo "Can't detach old namespace, but continuing anyway"
 	fi
 
+	# For certain drives, data written to namespace before delete can
+	# take more time than the default 60 second timeout. Worst case
+	# for the largest capacity drive from at least one vendor with
+	# worst case data layout needs 21 minutes. In practice this is
+	# unlikely to be hit — the middleware only calls disk_resize for
+	# SLOG overprovisioning during pool creation, and SLOGs typically
+	# use smaller capacity drives where delete times are much shorter.
+	# However even modest data on affected drives can exceed 60 seconds.
+	# NOTE: nvme-cli delete-ns has a bug where it does not pass the -t
+	# timeout to the kernel ioctl, so we use admin-passthru with
+	# opcode 0x0d (NS Management) and cdw10=1 (delete) which
+	# correctly honors the timeout.
 	echo "Deleting old namespace."
-	nvme delete-ns -n ${nsid} ${ctrlr}
+	nvme admin-passthru --opcode=0x0d --cdw10=1 --namespace-id=${nsid} -t 1260000 ${ctrlr}
 	if [ $? -ne 0 ]; then
 		echo "Can't delete old namespace, but continuing anyway"
 	fi
@@ -213,7 +270,11 @@ nvme)
 		ucap=`echo "${idctrl}" | awk -F ' +: ' '$1 == "unvmcap" { print $2 }'`
 		size=$((ucap / sector))
 	fi
-	created=`nvme create-ns -s ${size} -c ${size} -f ${lbaf} -m 1 -d 0 ${ctrlr}`
+	mic=`echo "${idctrl}" | awk -F ' +: ' '$1 == "cmic" { print $2 }'`
+	if [ "${mic}" != "0" ]; then
+		mic=1
+	fi
+	created=`nvme create-ns -s ${size} -c ${size} -f ${lbaf} -m ${mic} -d 0 ${ctrlr}`
 	echo "${created}"
 	nsid=`echo "${created}" | awk -F nsid: '{ print $2 }'`
 	if [ -z "${nsid}" ]; then

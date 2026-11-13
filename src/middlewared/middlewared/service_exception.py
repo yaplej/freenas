@@ -1,26 +1,28 @@
 import errno
 import subprocess
 
-from .client import ErrnoMixin
+from truenas_api_client import ErrnoMixin
 
 
-def get_errname(code):
+def get_errname(code: int) -> str:
     return errno.errorcode.get(code) or ErrnoMixin._get_errname(code) or 'EUNKNOWN'
 
 
 class CallException(ErrnoMixin, Exception):
-    pass
+    @property
+    def errname(self) -> str:
+        return get_errname(self.errno)
 
 
 class CallError(CallException):
-    def __init__(self, errmsg, errno=errno.EFAULT, extra=None):
+    def __init__(self, errmsg: str, errno: int = errno.EFAULT, extra=None):
         self.errmsg = errmsg
         self.errno = errno
         self.extra = extra
+        super().__init__(errmsg, errno, extra)
 
     def __str__(self):
-        errname = get_errname(self.errno)
-        return f'[{errname}] {self.errmsg}'
+        return f'[{self.errname}] {self.errmsg}'
 
 
 class ValidationError(CallException):
@@ -29,14 +31,14 @@ class ValidationError(CallException):
     attribute of a middleware method is invalid/not allowed.
     """
 
-    def __init__(self, attribute, errmsg, errno=errno.EFAULT):
+    def __init__(self, attribute, errmsg, errno: int = errno.EINVAL):
         self.attribute = attribute
         self.errmsg = errmsg
         self.errno = errno
+        super().__init__(attribute, errmsg, errno)
 
     def __str__(self):
-        errname = get_errname(self.errno)
-        return f'[{errname}] {self.attribute}: {self.errmsg}'
+        return f'[{self.errname}] {self.attribute}: {self.errmsg}'
 
     def __eq__(self, other):
         return (
@@ -52,24 +54,25 @@ class ValidationErrors(CallException):
     CallException with a collection of ValidationError
     """
 
-    def __init__(self, errors=None):
+    def __init__(self, errors: list[ValidationError] = None):
         self.errors = errors or []
+        super().__init__(self.errors)
 
-    def add(self, attribute, errmsg, errno=errno.EINVAL):
+    def add(self, attribute, errmsg: str, errno: int = errno.EINVAL):
         self.errors.append(ValidationError(attribute, errmsg, errno))
 
-    def add_validation_error(self, validation_error):
+    def add_validation_error(self, validation_error: ValidationError):
         self.errors.append(validation_error)
 
-    def add_child(self, attribute, child):
+    def add_child(self, attribute, child: 'ValidationErrors'):
         for e in child.errors:
             self.add(f"{attribute}.{e.attribute}", e.errmsg, e.errno)
 
-    def check(self):
+    def check(self) -> None:
         if self:
             raise self
 
-    def extend(self, errors):
+    def extend(self, errors: 'ValidationErrors'):
         for e in errors.errors:
             self.add(e.attribute, e.errmsg, e.errno)
 
@@ -91,7 +94,7 @@ class ValidationErrors(CallException):
         return item in [e.attribute for e in self.errors]
 
 
-def adapt_exception(e):
+def adapt_exception(e: Exception) -> CallError | None:
     from .utils.shell import join_commandline
 
     if isinstance(e, subprocess.CalledProcessError):
@@ -110,13 +113,23 @@ def adapt_exception(e):
 
         return CallError(f'Command {cmd} failed (code {e.returncode}):\n{output}')
 
+    return None
+
 
 class InstanceNotFound(ValidationError):
     """Raised when `get_instance` failed to locate specific object"""
-    def __init__(self, errmsg):
+    def __init__(self, errmsg: str) -> None:
         super().__init__(None, errmsg, errno.ENOENT)
+
+    def __reduce__(self):
+        return (type(self), (self.errmsg,))
 
 
 class MatchNotFound(IndexError):
     """Raised when there is no matching id eg: filter_utils/datastore.query"""
     pass
+
+
+class NetworkActivityDisabled(CallError):
+    def __init__(self, errmsg: str, errno: int = errno.ENONET, extra=None):
+        super().__init__(errmsg, errno, extra)

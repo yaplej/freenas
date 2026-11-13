@@ -7,10 +7,11 @@
             'Chassis position could not be determined.'
             ' Keepalived config not generated.'
         )
-	raise FileShouldNotExist()
+        raise FileShouldNotExist()
     elif not licensed:
-	return
+        return
 
+    prio = middleware.call_sync('failover.vrrp.get_priority')
     config = middleware.call_sync('failover.config')
 
     advert_int = .68 # default 2 second timeout
@@ -20,6 +21,16 @@
         # I round to the 100th decimal place since VRRP version 3
         # uses centisecond intervals by default
         advert_int = round(((128 * config['timeout']) / 385), 2)
+        if advert_int > 40.95:
+            # VRRPv3 carries the advertisement interval in a 12-bit
+            # centisecond field, so keepalived rejects anything above
+            # 40.95 seconds and fails to apply the config entirely
+            middleware.logger.warning(
+                'failover.timeout: %r produces a VRRP advertisement interval of %.2f seconds'
+                ' which exceeds the VRRPv3 maximum, clamping to 40.95 seconds',
+                config['timeout'], advert_int,
+            )
+            advert_int = 40.95
 
     info = middleware.call_sync('interface.query')
     info = [i for i in info if len(i['failover_virtual_aliases'])]
@@ -33,6 +44,7 @@
     # keepalived requires that ipv4 and ipv6 addresses for a given
     # interface be separated into their own vrrp_instance entry
     ips = []
+    both_ip_versions = []
     for i in info:
         ips.append({
             'name': i['id'] + '_v4',
@@ -46,24 +58,46 @@
             'failover_aliases': [j for j in i['failover_aliases'] if j['type'] == 'INET6'],
             'failover_virtual_aliases': [j for j in i['failover_virtual_aliases'] if j['type'] == 'INET6'],
         })
+        if ips[-1]['aliases'] and ips[-2]['aliases']:
+            both_ip_versions.append(i['id'])
 
     # ipv4 or ipv6 addresses might not exist so remove them from
     # here so we don't generate an empty entry in the config
     ips = [i for i in ips if i['aliases']]
 
+    # keepalived binds the unicast receive socket to the advert source address.
+    # Without unicast_src_ip it uses the first address it learns on the interface
+    # (the link-local for IPv6) while the peer sends to our configured address,
+    # so adverts are never received and both nodes become MASTER. Use the
+    # address the peer is configured to send to.
+    for i in ips:
+        if node == 'A':
+            i['unicast_src_ip'] = i['aliases'][0]['address']
+        else:
+            i['unicast_src_ip'] = i['failover_aliases'][0]['address']
+
 %>\
 global_defs {
     vrrp_notify_fifo /var/run/vrrpd.fifo
 }
+% for i in both_ip_versions:
+vrrp_sync_group ${i} {
+    group {
+        ${i}_v4
+        ${i}_v6
+    }
+}
+% endfor
 % for i in ips:
 vrrp_instance ${i['name']} {
     interface ${i['name'].split('_')[0]}
     state BACKUP
     advert_int ${advert_int}
-    nopreempt
+    preempt
     virtual_router_id 20
-    priority 254
+    priority ${prio}
     version 3
+    unicast_src_ip ${i['unicast_src_ip']}
     unicast_peer {
     % for j in i['failover_aliases'] if node == 'A' else i['aliases']:
         ${j['address']}

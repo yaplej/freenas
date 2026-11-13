@@ -1,0 +1,93 @@
+from __future__ import annotations
+
+from typing import TYPE_CHECKING
+
+from middlewared.api.current import AppEntry, AppRollbackOptions, QueryOptions, ZFSResourceSnapshotRollbackArgsData
+from middlewared.service import ServiceContext, ValidationErrors
+
+from .compose_utils import compose_action
+from .ix_apps.lifecycle import add_context_to_values, get_current_app_config, update_app_config
+from .ix_apps.metadata import update_app_metadata
+from .ix_apps.path import get_installed_app_path, get_installed_app_version_path
+from .ix_apps.rollback import clean_newer_versions, get_rollback_versions
+from .resources import get_app_volume_ds
+from .schema_normalization import normalize_and_validate_values
+from .utils import app_version, assert_app_usable
+
+if TYPE_CHECKING:
+    from middlewared.job import Job
+
+
+def rollback(context: ServiceContext, job: Job, app_name: str, options: AppRollbackOptions) -> AppEntry:
+    """
+    Rollback `app_name` app to previous version.
+    """
+    app = context.call_sync2(context.s.app.get_instance, app_name, QueryOptions(extra={'retrieve_config': True}))
+    assert_app_usable(app)
+    verrors = ValidationErrors()
+    if options.app_version == app.version:
+        verrors.add('options.app_version', 'Cannot rollback to same version')
+    elif options.app_version not in get_rollback_versions(app_name, app_version(app)):
+        verrors.add('options.app_version', 'Specified version is not available for rollback')
+
+    if app.state == 'STOPPED':
+        verrors.add('app_name', 'App must not be in stopped state to rollback')
+
+    verrors.check()
+
+    rollback_version = context.call_sync2(
+        context.s.catalog.app_version_details,
+        get_installed_app_version_path(app_name, options.app_version)
+    )
+    config = get_current_app_config(app_name, options.app_version)
+    new_values = context.run_coroutine(normalize_and_validate_values(
+        context, rollback_version, config, False, get_installed_app_path(app_name), app,
+    ))
+    new_values = add_context_to_values(app_name, new_values, rollback_version['app_metadata'], rollback=True)
+    update_app_config(app_name, options.app_version, new_values)
+
+    job.set_progress(
+        20, f'Completed validation for {app_name!r} app rollback to {options.app_version!r} version'
+    )
+
+    # Rollback steps would be
+    # 1) Config should be updated
+    # 2) Compose files should be rendered
+    # 3) Metadata should be updated to reflect new version
+    # 4) Docker should be notified to recreate resources and to let rollback commence
+    # 5) Roll back ix_volume dataset's snapshots if available
+    # 6) Finally update collective metadata config to reflect new version
+    update_app_metadata(app_name, rollback_version)
+    context.middleware.send_event(
+        'app.query', 'CHANGED', id=app_name,
+        fields=context.call_sync2(context.s.app.get_instance, app_name).model_dump()
+    )
+    context.call_sync2(context.s.app.stop, app_name).wait_sync()
+    try:
+        if options.rollback_snapshot and (app_volume_ds := get_app_volume_ds(context, app_name)):
+            snap_name = f'{app_volume_ds}@{options.app_version}'
+            if context.call_sync2(context.s.zfs.resource.snapshot.exists, snap_name):
+                job.set_progress(40, f'Rolling back {app_name!r} app to {options.app_version!r} version')
+                context.call_sync2(context.s.zfs.resource.snapshot.rollback_impl, ZFSResourceSnapshotRollbackArgsData(
+                    path=snap_name,
+                    force=True,
+                    recursive=True,
+                    recursive_clones=True,
+                    recursive_rollback=True,
+                    bypass=True,
+                ))
+
+        compose_action(app_name, options.app_version, 'up', force_recreate=True, remove_orphans=True)
+    finally:
+        context.call_sync2(context.s.app.metadata_generate).wait_sync(raise_error=True)
+        clean_newer_versions(app_name, options.app_version)
+
+    job.set_progress(100, f'Rollback completed for {app_name!r} app to {options.app_version!r} version')
+
+    return context.call_sync2(context.s.app.get_instance, app_name)
+
+
+def rollback_versions(context: ServiceContext, app_name: str) -> list[str]:
+    app = context.call_sync2(context.s.app.get_instance, app_name)
+    assert_app_usable(app)
+    return get_rollback_versions(app_name, app_version(app))

@@ -1,0 +1,476 @@
+import errno
+from types import MappingProxyType
+from typing import Any
+
+from middlewared.api import api_method
+from middlewared.api.base.handler.accept import validate_model
+from middlewared.api.current import (
+    PoolSnapshotCloneArgs,
+    PoolSnapshotCloneResult,
+    PoolSnapshotCreateArgs,
+    PoolSnapshotCreateResult,
+    PoolSnapshotDeleteArgs,
+    PoolSnapshotDeleteResult,
+    PoolSnapshotEntry,
+    PoolSnapshotHoldArgs,
+    PoolSnapshotHoldResult,
+    PoolSnapshotReleaseArgs,
+    PoolSnapshotReleaseResult,
+    PoolSnapshotRenameArgs,
+    PoolSnapshotRenameResult,
+    PoolSnapshotRollbackArgs,
+    PoolSnapshotRollbackResult,
+    PoolSnapshotUpdateArgs,
+    PoolSnapshotUpdateResult,
+    ZFSResourceSetArgsData,
+    ZFSResourceSnapshotCloneArgsData,
+    ZFSResourceSnapshotCreateArgsData,
+    ZFSResourceSnapshotDestroyArgsData,
+    ZFSResourceSnapshotHoldArgsData,
+    ZFSResourceSnapshotQuery,
+    ZFSResourceSnapshotReleaseArgsData,
+    ZFSResourceSnapshotRenameArgsData,
+    ZFSResourceSnapshotRollbackArgsData,
+)
+from middlewared.plugins.pool_.utils import rekey_validation_error, rekey_validation_errors
+from middlewared.plugins.zfs.exceptions import ZFSPathNotFoundException
+from middlewared.service import (
+    CRUDService,
+    InstanceNotFound,
+    ValidationError,
+    ValidationErrors,
+    filterable_api_method,
+)
+from middlewared.utils.filter_list import filter_list
+
+CREATE_FIELDS = MappingProxyType({'exclude': 'pool.snapshot.create.exclude'})
+RENAME_FIELDS = MappingProxyType({'force': 'pool.snapshot.rename.force'})
+CLONE_FIELDS = MappingProxyType({
+    'properties': 'pool.snapshot.clone.dataset_properties',
+    'user_properties': 'pool.snapshot.clone.dataset_properties',
+})
+
+
+class PoolSnapshotService(CRUDService):
+
+    class Config:
+        namespace = 'pool.snapshot'
+        cli_namespace = 'storage.snapshot'
+        role_prefix = 'SNAPSHOT'
+        role_separate_delete = True
+        event_send = False  # Don't send events implicitly.
+        entry = PoolSnapshotEntry
+
+    @api_method(PoolSnapshotCloneArgs, PoolSnapshotCloneResult, roles=['SNAPSHOT_WRITE', 'DATASET_WRITE'])
+    def clone(self, data):
+        """
+        Clone a given snapshot to a new dataset.
+
+        ``dataset_properties`` takes the native properties :method:`zfs.resource.snapshot.clone` accepts and user
+        properties, whose names contain a colon.
+        """
+        source = 'zfs.resource.snapshot.clone'
+        properties = data['dataset_properties']
+        try:
+            args = validate_model(ZFSResourceSnapshotCloneArgsData, {
+                'snapshot': data['snapshot'],
+                'dataset': data['dataset_dst'],
+                'properties': {k: v for k, v in properties.items() if ':' not in k},
+                'user_properties': {k: str(v) for k, v in properties.items() if ':' in k},
+            }, dump_models=False, allow_private=False)
+        except ValidationErrors as e:
+            raise rekey_validation_errors(e, source, 'pool.snapshot.clone', CLONE_FIELDS)
+        try:
+            self.call_sync2(self.s.zfs.resource.snapshot.clone, args)
+        except ValidationError as e:
+            raise rekey_validation_error(e, source, 'pool.snapshot.clone', CLONE_FIELDS)
+        return True
+
+    @api_method(
+        PoolSnapshotRollbackArgs,
+        PoolSnapshotRollbackResult,
+        roles=['SNAPSHOT_WRITE', 'POOL_WRITE']
+    )
+    def rollback(self, id_, options):
+        """
+        Roll the dataset of snapshot ``id`` back to the state captured by that snapshot.
+
+        .. warning::
+
+            This operation is destructive. Any data written to the dataset after the snapshot was taken is
+            permanently lost. Snapshots more recent than ``id`` must also be destroyed for the rollback to
+            proceed; use the ``recursive``, ``recursive_clones``, or ``recursive_rollback`` options to control
+            how newer snapshots and their clones are handled. A hold on a newer snapshot, or a clone that
+            cannot be destroyed, is reported as a JSON-RPC ``error`` response (code ``-32001``, *Method call
+            error*, errno ``EBUSY``); release a hold with :method:`pool.snapshot.release` first.
+        """
+        try:
+            self.call_sync2(self.s.zfs.resource.snapshot.rollback, ZFSResourceSnapshotRollbackArgsData(
+                path=id_,
+                **options,
+            ))
+        except ValidationError as e:
+            raise rekey_validation_error(e, 'zfs.resource.snapshot.rollback', 'pool.snapshot.rollback')
+
+    @api_method(PoolSnapshotHoldArgs, PoolSnapshotHoldResult, roles=['SNAPSHOT_WRITE'])
+    def hold(self, id_, options):
+        """Hold snapshot ``id``.
+
+        Add ``truenas`` tag to the snapshot's tag namespace.
+
+        """
+        try:
+            self.call_sync2(self.s.zfs.resource.snapshot.hold, ZFSResourceSnapshotHoldArgsData(
+                path=id_,
+                tag='truenas',
+                recursive=options['recursive'],
+            ))
+        except ValidationError as e:
+            raise rekey_validation_error(e, 'zfs.resource.snapshot.hold', 'pool.snapshot.hold')
+
+    @api_method(PoolSnapshotReleaseArgs, PoolSnapshotReleaseResult, roles=['SNAPSHOT_WRITE'])
+    def release(self, id_, options):
+        """Release hold on snapshot ``id``.
+
+        Remove all hold tags from the specified snapshot.
+
+        """
+        try:
+            self.call_sync2(self.s.zfs.resource.snapshot.release, ZFSResourceSnapshotReleaseArgsData(
+                path=id_,
+                tag=None,  # Release all hold tags
+                recursive=options['recursive'],
+            ))
+        except ValidationError as e:
+            raise rekey_validation_error(e, 'zfs.resource.snapshot.release', 'pool.snapshot.release')
+
+    def _transform_snapshot_entry(self, snap, *, include_holds=True, include_user_properties=False,
+                                  requested_props=None):
+        """Transform zfs.resource.snapshot.list_impl result to PoolSnapshotEntry format.
+
+        Args:
+            snap: Snapshot dict from zfs.resource.snapshot.list_impl
+            include_holds: Whether to include holds field (False for create/update results)
+            requested_props: Set of property names that were explicitly requested (for adding fast-path props)
+        """
+        # Transform properties from new format to old format
+        # New: {prop: {raw, source, value}}
+        # Old: {prop: {value, rawvalue, source, parsed}}
+        old_props = {}
+        if snap.get('properties'):
+            for prop_name, prop_data in snap['properties'].items():
+                if prop_data is None:
+                    continue
+                # Map source None -> "NONE"
+                source = prop_data.get('source')
+                if source is None:
+                    source = 'NONE'
+                old_props[prop_name] = {
+                    'value': str(prop_data.get('value', '')),
+                    'rawvalue': prop_data.get('raw', ''),
+                    'source': source,
+                    'parsed': prop_data.get('value'),
+                }
+
+        # Add fast-path properties to properties dict if they were explicitly requested
+        if requested_props:
+            if 'name' in requested_props and 'name' not in old_props:
+                old_props['name'] = {
+                    'value': snap['name'],
+                    'rawvalue': snap['name'],
+                    'source': 'NONE',
+                    'parsed': snap['name'],
+                }
+            if 'createtxg' in requested_props and 'createtxg' not in old_props:
+                old_props['createtxg'] = {
+                    'value': str(snap['createtxg']),
+                    'rawvalue': str(snap['createtxg']),
+                    'source': 'NONE',
+                    'parsed': snap['createtxg'],
+                }
+
+        entry = {
+            'id': snap['name'],  # id is same as name for snapshots
+            'name': snap['name'],
+            'pool': snap['pool'],
+            'type': 'SNAPSHOT',
+            'snapshot_name': snap['snapshot_name'],
+            'dataset': snap['dataset'],
+            'createtxg': str(snap['createtxg']),
+            'properties': old_props,  # Always include properties (required by API schema)
+        }
+
+        if include_holds:
+            if snap.get('holds') and 'truenas' in snap['holds']:
+                entry['holds'] = {'truenas': 1}
+            else:
+                entry['holds'] = {}
+
+        if include_user_properties:
+            entry['user_properties'] = snap.get('user_properties', {})
+
+        return entry
+
+    def _optimize_snap_query_filters(
+        self,
+        qry_filters: list,
+        paths: list,
+        remaining_filters: list
+    ) -> bool:
+        recursive = False
+        for f in qry_filters:
+            if len(f) == 3 and f[1] in ('=', 'in'):
+                if f[0] in ('id', 'name'):
+                    # Direct snapshot lookup
+                    if f[1] == '=':
+                        paths.append(f[2])
+                    else:
+                        paths.extend(f[2])
+                elif f[0] in ('pool', 'dataset'):
+                    # Dataset-based lookup (get all snapshots for dataset)
+                    if f[1] == '=':
+                        paths.append(f[2])
+                    else:
+                        paths.extend(f[2])
+                    # For dataset filters, we need recursive=True to get all snapshots
+                    if f[0] == 'pool':
+                        recursive = True
+                else:
+                    remaining_filters.append(f)
+            else:
+                remaining_filters.append(f)
+        return recursive
+
+    @filterable_api_method(item=PoolSnapshotEntry)
+    def query(self, filters, options):
+        """Query all ZFS snapshots with the standard ``query-filters`` and ``query-options``.
+
+        The following ``query-options.extra`` options are supported:
+
+        ``holds`` *(bool)*:
+            Include hold tags for snapshots in the query result (``false`` by default).
+
+        ``min_txg`` *(int)*:
+            Limit snapshot retrieval based on minimum transaction group.
+
+        ``max_txg`` *(int)*:
+            Limit snapshot retrieval based on maximum transaction group.
+
+        ``retention`` *(bool)*:
+            Include retention information in the query result (``false`` by default).
+
+        ``properties`` *(list)*:
+            List of ZFS property names to retrieve.
+        """
+        filters = filters or []
+        options = options or {}
+        extra = options.get('extra', {})
+
+        # Build query args for zfs.resource.snapshot.list_impl
+        query_args: dict[str, Any] = {
+            'min_txg': extra.get('min_txg', 0),
+            'max_txg': extra.get('max_txg', 0),
+        }
+
+        # Determine which properties were requested and filter out fast-path ones
+        # Fast-path properties (name, createtxg) don't need ZFS property lookup
+        requested_props = set(extra.get('properties', []))
+        non_fast_path_props = requested_props - frozenset({'name', 'createtxg'})
+
+        # Only pass non-fast-path properties to the backend
+        if non_fast_path_props:
+            query_args['properties'] = list(non_fast_path_props)
+
+        # Extract path-based filters for efficient querying
+        # Optimization: if filtering by id/name/pool/dataset, pass as paths
+        paths, remaining_filters = [], []
+        recursive = self._optimize_snap_query_filters(filters, paths, remaining_filters)
+        if paths:
+            query_args['paths'] = paths
+            query_args['recursive'] = recursive
+        else:
+            # legacy behavior would query all snapshots recursively
+            # when querying this endpoint with no arguments. That's
+            # bad design but we're stuck with it for awhile. If there
+            # are no paths that were requested, then set recursive
+            # to be true.
+            query_args['recursive'] = True
+
+        if extra.get("holds", False):
+            query_args["get_holds"] = True
+
+        retention = extra.get("retention", False)
+        include_user_properties = False
+        if retention:
+            # MISERABLE design choice here. "retention" is a confusing
+            # term to represent the fact that we actually want to query
+            # all custom user space properties for each snapshot. But
+            # then we pull out a singular user space property and then
+            # parse it in the zettarepl.annotate_snapshots function and
+            # then take the value and put it at a separate top-level key
+            # of the final response. sigh...
+            query_args["get_user_properties"] = True
+            include_user_properties = True
+
+        snapshots = []
+        try:
+            for i in self.call_sync2(self.s.zfs.resource.snapshot.list_impl, ZFSResourceSnapshotQuery(**query_args)):
+                # Transform to PoolSnapshotEntry format
+                # Pass requested_props so fast-path properties can be added when needed
+                snapshots.append(self._transform_snapshot_entry(
+                    i,
+                    include_user_properties=include_user_properties,
+                    requested_props=requested_props if requested_props else None,
+                ))
+        except ZFSPathNotFoundException:
+            # Path not found - return empty results (legacy behavior)
+            pass
+
+        # Apply remaining filters and options using filter_list
+        select = options.pop('select', None)
+        result = filter_list(snapshots, remaining_filters, options)
+
+        # Add retention info if requested
+        if retention:
+            if isinstance(result, list):
+                result = self.s.zettarepl.removal_date.annotate_snapshots(result)
+            elif isinstance(result, dict):
+                result = self.s.zettarepl.removal_date.annotate_snapshots([result])[0]
+
+        # Apply select if specified
+        if select:
+            if isinstance(result, list):
+                result = [{k: v for k, v in item.items() if k in select} for item in result]
+            elif isinstance(result, dict):
+                result = {k: v for k, v in result.items() if k in select}
+
+        return result
+
+    @api_method(PoolSnapshotCreateArgs, PoolSnapshotCreateResult)
+    def do_create(self, data):
+        """Take a snapshot from a given dataset."""
+        dataset = data['dataset']
+        recursive = data.get('recursive', False)
+        exclude = data.get('exclude', [])
+        properties = data.get('properties', {})
+        vmware_sync = data.get('vmware_sync', False)
+        suspend_vms = data.get('suspend_vms', False)
+
+        # Resolve snapshot name
+        name = data.get('name')
+        if not name:
+            naming_schema = data.get('naming_schema')
+            if naming_schema:
+                name = self.call_sync2(self.s.replication.new_snapshot_name, naming_schema)
+
+        if exclude:
+            for k in ('vmware_sync', 'properties'):
+                if data.get(k):
+                    raise ValidationError(
+                        f'snapshot_create.{k}',
+                        'This option is not supported when excluding datasets'
+                    )
+
+        # VMware sync setup
+        vmware_context = None
+        if vmware_sync:
+            vmware_context = self.middleware.call_sync('vmware.snapshot_begin', dataset, recursive)
+
+        # VM suspend setup
+        affected_vms = {}
+        if suspend_vms:
+            if affected_vms := self.call_sync2(self.s.vm.query_snapshot_begin, dataset, recursive):
+                self.call_sync2(self.s.vm.suspend_vms, list(affected_vms))
+
+        try:
+            result = self.call_sync2(self.s.zfs.resource.snapshot.create, ZFSResourceSnapshotCreateArgsData(
+                dataset=dataset,
+                name=name,
+                recursive=recursive,
+                exclude=exclude,
+                user_properties=properties,
+            ))
+
+            # Set vmsynced property if applicable
+            if vmware_context and vmware_context['vmsynced']:
+                self.call_sync2(
+                    self.s.zfs.resource.set_impl,
+                    ZFSResourceSetArgsData(path=dataset, user_properties={'freenas:vmsynced': 'Y'}),
+                )
+
+            self.logger.info(f"Snapshot taken: {dataset}@{name}")
+        except ValidationError as e:
+            raise rekey_validation_error(e, 'zfs.resource.snapshot.create', 'pool.snapshot.create', CREATE_FIELDS)
+        finally:
+            if affected_vms:
+                self.call_sync2(self.s.vm.resume_suspended_vms, list(affected_vms))
+            if vmware_context:
+                self.middleware.call_sync('vmware.snapshot_end', vmware_context)
+
+        entry = self._transform_snapshot_entry(result.model_dump(), include_holds=False)
+        if result.guid:
+            self.middleware.send_event(
+                f'{self._config.namespace}.query', 'ADDED', id=entry['id'], fields=entry
+            )
+        return entry
+
+    @api_method(PoolSnapshotUpdateArgs, PoolSnapshotUpdateResult)
+    def do_update(self, snap_id, data):
+        """Changing the user properties of a snapshot is not supported; the call always fails with ``EOPNOTSUPP``."""
+        raise ValidationError(
+            'pool.snapshot.update', 'Changing snapshot user properties is not supported.', errno.EOPNOTSUPP
+        )
+
+    @api_method(PoolSnapshotDeleteArgs, PoolSnapshotDeleteResult)
+    def do_delete(self, id_, options):
+        """
+        Delete the snapshot identified by ``id``.
+
+        Set ``recursive`` to also delete identically named snapshots of child datasets. Set ``defer`` to request a
+        deferred (asynchronous) destroy, which lets the snapshot be removed even while it still has holds or clones.
+        """
+        if '@' not in id_:
+            raise ValidationError('pool.snapshot.delete', f'Invalid snapshot name: {id_!r}')
+
+        try:
+            self.call_sync2(self.s.zfs.resource.snapshot.destroy, ZFSResourceSnapshotDestroyArgsData(
+                path=id_,
+                recursive=options['recursive'],
+                defer=options['defer'],
+            ))
+        except ValidationError as ve:
+            if ve.errno == errno.ENOENT:
+                raise InstanceNotFound(ve.errmsg)
+            raise rekey_validation_error(ve, 'zfs.resource.snapshot.destroy', 'pool.snapshot.delete')
+
+        return True
+
+    @api_method(
+        PoolSnapshotRenameArgs,
+        PoolSnapshotRenameResult,
+        audit='Pool snapshot rename from',
+        audit_extended=lambda id_, options: f'{id_!r} to {options["new_name"]!r}',
+        roles=['SNAPSHOT_WRITE']
+    )
+    async def rename(self, id_, options):
+        """
+        Rename a snapshot ``id`` to ``new_name``.
+
+        No safety checks are performed when renaming ZFS resources. If the dataset is in use by services such
+        as SMB, iSCSI, snapshot tasks, replication, or cloud sync, renaming may cause disruptions or service failures.
+
+        Proceed only if you are certain the ZFS resource is not in use and fully understand the risks.
+        Set ``force`` to continue.
+        """
+        try:
+            await self.call2(
+                self.s.zfs.resource.snapshot.rename,
+                ZFSResourceSnapshotRenameArgsData(
+                    current_name=id_, new_name=options['new_name'], recursive=options['recursive'],
+                    force=options['force'],
+                ),
+            )
+        except ValidationError as e:
+            raise rekey_validation_error(
+                e, 'zfs.resource.snapshot.rename', 'pool.snapshot.rename.new_name', RENAME_FIELDS,
+            )

@@ -1,0 +1,31 @@
+from middlewared.api.current import ServiceOptions
+from middlewared.plugins.service.services.base import SimpleService
+
+
+class LibvirtdService(SimpleService):
+    name = "libvirtd"
+    systemd_unit = "libvirtd"
+    etc = ["libvirt"]
+    may_run_on_standby = False
+
+    async def after_start(self) -> None:
+        job = await self.call2(
+            self.s.service.control, "START", "libvirt-guests", ServiceOptions(ha_propagate=False)
+        )
+        await job.wait(raise_error=True)
+
+    async def before_stop(self) -> None:
+        job = await self.call2(self.s.service.control, "STOP", "libvirt-guests")
+        await job.wait(raise_error=True)
+
+    async def after_stop(self) -> None:
+        for service in ('virtlogd.service', 'virtlogd.socket'):
+            await self._systemd_unit(service, 'stop')
+
+
+class LibvirtGuestService(SimpleService):
+    name = "libvirt-guests"
+    systemd_unit = "libvirt-guests"
+    systemd_async_start = True
+    etc = ["libvirt_guests"]
+    may_run_on_standby = False

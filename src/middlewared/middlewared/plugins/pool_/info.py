@@ -1,10 +1,35 @@
-from middlewared.service import private, Service
+import errno
+
+from truenas_pylibzfs import ZFSError, ZFSException
+
+from middlewared.api import api_method
+from middlewared.api.current import (
+    PoolAttachmentsArgs,
+    PoolAttachmentsResult,
+    PoolFilesystemChoicesArgs,
+    PoolFilesystemChoicesResult,
+    PoolGetDisksArgs,
+    PoolGetDisksResult,
+    PoolIsUpgradedArgs,
+    PoolIsUpgradedResult,
+    PoolProcessesArgs,
+    PoolProcessesResult,
+    ZFSResourceQuery,
+)
+from middlewared.plugins.zfs import resource_attachments
+from middlewared.plugins.zfs.resource_processes_utils import processes_using_dataset_tree
+from middlewared.plugins.zpool import get_zpool_disks_impl, get_zpool_features_impl, is_upgraded_impl
+from middlewared.service import Service, ValidationError, private
 
 
 class PoolService(Service):
 
     @private
-    def find_disk_from_topology(self, label, pool, include_top_level_vdev=False):
+    def find_disk_from_topology(self, label, pool, options=None):
+        options = options or {}
+        include_top_level_vdev = options.get('include_top_level_vdev', False)
+        include_siblings = options.get('include_siblings', False)
+
         check = []
         found = None
         for root, children in pool['topology'].items():
@@ -14,7 +39,9 @@ class PoolService(Service):
             root, children = check.pop()
             for c in children:
                 if c['type'] == 'DISK':
-                    if label in (c['path'].replace('/dev/', ''), c['guid']):
+                    # `path` is None when the disk was missing at pool import time
+                    # and libzfs only reports the vdev guid as its name.
+                    if label == c['guid'] or (c['path'] and label == c['path'].replace('/dev/', '')):
                         found = (root, c)
                         break
                 elif include_top_level_vdev and c['guid'] == label:
@@ -23,4 +50,111 @@ class PoolService(Service):
 
                 if c['children']:
                     check.append((root, c['children']))
+
+            if found is not None and include_siblings:
+                found = (found[0], found[1], children)
+
         return found
+
+    @api_method(PoolAttachmentsArgs, PoolAttachmentsResult, roles=['POOL_READ'])
+    async def attachments(self, oid):
+        """
+        Return a list of services dependent of this pool.
+
+        Responsible for telling the user whether there is a related
+        share, asking for confirmation.
+        """
+        pool = await self.middleware.call('pool.get_instance', oid)
+        return await resource_attachments.query_all(self.context, pool['path'])
+
+    @api_method(PoolProcessesArgs, PoolProcessesResult, roles=['POOL_READ'])
+    async def processes(self, oid):
+        """
+        Returns a list of running processes using this pool.
+        """
+        pool = await self.middleware.call('pool.get_instance', oid)
+        return await self.context.to_thread(processes_using_dataset_tree, self.context, pool['name'])
+
+    @api_method(
+        PoolGetDisksArgs,
+        PoolGetDisksResult,
+        pass_thread_local_storage=True,
+        roles=['POOL_READ']
+    )
+    def get_disks(self, tls, oid):
+        """
+        Return the device names of all disks belonging to a pool.
+
+        Queries the database for the pool matching the given ``id`` and
+        resolves each vdev, cache, log, special, dedup, and spare device
+        to its whole-disk device name (e.g. sda, nvme0n1). If ``id`` is
+        not provided, disks for all imported pools in the database are
+        returned. Pools that are not currently imported are skipped.
+
+        Raises a ``ValidationError`` if ``id`` is provided but does not
+        match any pool in the database.
+        """
+        filters = list() if not oid else [['id', '=', oid]]
+        pools = self.middleware.call_sync(
+            'datastore.query', 'storage.volume', filters
+        )
+        if not pools and oid:
+            raise ValidationError(
+                'pool.get_disks',
+                f'pool with database id {oid!r} does not exist',
+                errno.ENOENT
+            )
+
+        disks = list()
+        for i in pools:
+            try:
+                disks.extend(get_zpool_disks_impl(tls.lzh, i['vol_name']))
+            except ZFSException as e:
+                if e.code == ZFSError.EZFS_NOENT:
+                    continue
+                raise
+        return disks
+
+    @api_method(PoolFilesystemChoicesArgs, PoolFilesystemChoicesResult, roles=['DATASET_READ'])
+    async def filesystem_choices(self, types):
+        """Returns all available zfs resources based on ``types``."""
+        info = []
+        for i in await self.call2(
+            self.s.zfs.resource.list_impl,
+            ZFSResourceQuery(get_children=True, properties=None)
+        ):
+            if i['type'] in types:
+                info.append(i['name'])
+        return info
+
+    @api_method(
+        PoolIsUpgradedArgs,
+        PoolIsUpgradedResult,
+        pass_thread_local_storage=True,
+        roles=['POOL_READ'],
+        removed_in="v27",
+    )
+    def is_upgraded(self, tls, oid):
+        """
+        Returns whether the pool of ``id`` is on the latest version
+        and with all feature flags enabled.
+
+        Queries the database for the pool matching the given ``id``, then
+        checks each ZFS feature flag on the pool. Returns ``true`` only
+        when every feature flag is in the ENABLED or ACTIVE state.
+
+        Raises a ``ValidationError`` if ``id`` does not match any pool in
+        the database.
+        """
+        pool = self.middleware.call_sync(
+            'datastore.query', 'storage.volume', [['id', '=', oid]]
+        )
+        if not pool:
+            raise ValidationError(
+                'pool.is_upgraded',
+                f'pool with database id {oid!r} does not exist',
+                errno.ENOENT
+            )
+
+        pname = pool[0]['vol_name']
+        return is_upgraded_impl(get_zpool_features_impl(tls.lzh, pname))

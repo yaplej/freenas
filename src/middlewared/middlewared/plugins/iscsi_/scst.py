@@ -1,0 +1,504 @@
+import asyncio
+from contextlib import suppress
+import glob
+import itertools
+import os
+import pathlib
+import signal
+
+from scstadmin import SCSTAdmin
+
+from middlewared.service import Service, private
+from middlewared.utils import run
+
+from .utils import ISCSI_TARGET_PARAMETERS, sanitize_extent
+
+SCST_BASE = '/sys/kernel/scst_tgt'
+ISCSI_SCSTD_PIDFILE = '/run/iscsi-scstd.pid'
+SCST_TARGETS_ISCSI_ENABLED_PATH = '/sys/kernel/scst_tgt/targets/iscsi/enabled'
+COPY_MANAGER_LUNS_PATH = (
+    '/sys/kernel/scst_tgt/targets/copy_manager/copy_manager_tgt/luns'
+)
+SCST_DEVICES = '/sys/kernel/scst_tgt/devices'
+SCST_SUSPEND = '/sys/kernel/scst_tgt/suspend'
+SCST_CONTROLLER_A_TARGET_GROUPS_STATE = (
+    '/sys/kernel/scst_tgt/device_groups/targets/target_groups/controller_A/state'
+)
+SCST_CONTROLLER_B_TARGET_GROUPS_STATE = (
+    '/sys/kernel/scst_tgt/device_groups/targets/target_groups/controller_B/state'
+)
+SCST_ASYNC_LUN_REPLACE = '/sys/kernel/scst_tgt/async_lun_replace'
+
+
+class iSCSITargetService(Service):
+    class Config:
+        namespace = 'iscsi.scst'
+        private = True
+
+    def path_write(self, path, text):
+        p = pathlib.Path(path)
+        realpath = str(p.resolve())
+        if realpath.startswith(SCST_BASE) and p.exists():
+            p.write_text(text)
+        else:
+            raise ValueError(f'Unexpected path "{realpath}"')
+
+    def path_write_if_needed(self, path, text):
+        """Like path_write, but read first and skip if first line already matches."""
+        p = pathlib.Path(path)
+        realpath = str(p.resolve())
+        if not (realpath.startswith(SCST_BASE) and p.exists()):
+            raise ValueError(f'Unexpected path "{realpath}"')
+        want = text.split('\n', 1)[0]
+        try:
+            have = p.read_text().split('\n', 1)[0]
+        except Exception:
+            have = None
+        if have == want:
+            return
+        p.write_text(text)
+
+    async def set_all_cluster_mode(self, value):
+        text = f'{int(value)}\n'
+        paths = await self.middleware.call('iscsi.scst.cluster_mode_paths')
+        if paths:
+            for chunk in itertools.batched(paths, 10):
+                await asyncio.gather(
+                    *[
+                        self.middleware.call('iscsi.scst.path_write_if_needed', path, text)
+                        for path in chunk
+                    ]
+                )
+
+    def cluster_mode_paths(self):
+        scst_tgt_devices = pathlib.Path(SCST_DEVICES)
+        if scst_tgt_devices.exists():
+            return [str(p) for p in scst_tgt_devices.glob('*/cluster_mode')]
+        else:
+            return []
+
+    def cluster_mode_devices_set(self):
+        devices = []
+        scst_tgt_devices = pathlib.Path(SCST_DEVICES)
+        if scst_tgt_devices.exists():
+            for p in scst_tgt_devices.glob('*/cluster_mode'):
+                if p.read_text().splitlines()[0] == '1':
+                    devices.append(p.parent.name)
+        return devices
+
+    def check_cluster_modes_clear(self):
+        scst_tgt_devices = pathlib.Path(SCST_DEVICES)
+        if scst_tgt_devices.exists():
+            for p in scst_tgt_devices.glob('*/cluster_mode'):
+                if p.read_text().splitlines()[0] == '1':
+                    return False
+        return True
+
+    def check_cluster_mode_paths_present(self, devices):
+        for device in devices:
+            if not pathlib.Path(
+                f'{SCST_DEVICES}/{sanitize_extent(device)}/cluster_mode'
+            ).exists():
+                return False
+        return True
+
+    def get_cluster_mode(self, device):
+        try:
+            return (
+                pathlib.Path(f'{SCST_DEVICES}/{sanitize_extent(device)}/cluster_mode')
+                .read_text()
+                .splitlines()[0]
+            )
+        except Exception:
+            return 'UNKNOWN'
+
+    async def set_device_cluster_mode(self, device, value):
+        await self.middleware.call(
+            'iscsi.scst.path_write_if_needed',
+            f'{SCST_DEVICES}/{sanitize_extent(device)}/cluster_mode',
+            f'{int(value)}\n',
+        )
+
+    async def set_devices_cluster_mode(self, devices, value):
+        text = f'{int(value)}\n'
+        paths = [
+            f'{SCST_DEVICES}/{sanitize_extent(device)}/cluster_mode'
+            for device in devices
+        ]
+        if paths:
+            await asyncio.gather(
+                *[
+                    self.middleware.call('iscsi.scst.path_write_if_needed', path, text)
+                    for path in paths
+                ]
+            )
+
+    def disable(self):
+        pathlib.Path(SCST_TARGETS_ISCSI_ENABLED_PATH).write_text('0\n')
+
+    def enable(self):
+        pathlib.Path(SCST_TARGETS_ISCSI_ENABLED_PATH).write_text('1\n')
+
+    def suspend(self, value=10):
+        pathlib.Path(SCST_SUSPEND).write_text(f'{value}\n')
+
+    def suspend_logins(self):
+        """Send SIGUSR1 to iscsi-scstd to reject new logins with a retriable error."""
+        self._signal_scstd(signal.SIGUSR1)
+
+    def resume_logins(self):
+        """Send SIGUSR2 to iscsi-scstd to resume accepting new logins."""
+        self._signal_scstd(signal.SIGUSR2)
+
+    def _signal_scstd(self, sig):
+        try:
+            pid = int(pathlib.Path(ISCSI_SCSTD_PIDFILE).read_text().strip())
+            os.kill(pid, sig)
+        except FileNotFoundError:
+            self.logger.warning(
+                'iscsi-scstd pidfile not found, daemon may not be running'
+            )
+        except ProcessLookupError:
+            self.logger.warning('iscsi-scstd process not found (stale pidfile?)')
+        except ValueError:
+            self.logger.warning('iscsi-scstd pidfile contains invalid PID')
+
+    def clear_suspend(self):
+        """suspend could have been called several times, and will need to be decremented
+        several times to clean"""
+        try:
+            p = pathlib.Path(SCST_SUSPEND)
+            for i in range(30):
+                if p.read_text().strip() == '0':
+                    return True
+                else:
+                    p.write_text('-1\n')
+        except FileNotFoundError:
+            pass
+
+        return False
+
+    def enabled(self):
+        try:
+            return (
+                pathlib.Path(SCST_TARGETS_ISCSI_ENABLED_PATH).read_text().strip() == '1'
+            )
+        except FileNotFoundError:
+            return False
+
+    def is_kernel_module_loaded(self):
+        return pathlib.Path(SCST_BASE).exists()
+
+    def activate_extent(self, extent_name, extenttype, path):
+        if pathlib.Path(path).exists():
+            if extenttype == 'DISK':
+                p = pathlib.Path(
+                    f'{SCST_BASE}/handlers/vdisk_blockio/{sanitize_extent(extent_name)}/active'
+                )
+            else:
+                p = pathlib.Path(
+                    f'{SCST_BASE}/handlers/vdisk_fileio/{sanitize_extent(extent_name)}/active'
+                )
+            try:
+                p.write_text('1\n')
+                return True
+            except Exception:
+                # Return False on ANY exception
+                return False
+        else:
+            return False
+
+    @private
+    async def remove_target_lun(self, target_name: str, lun_id: int):
+        # TBD: consider switching to sysfs mgmt write (del {lun_id}) instead of scstadmin
+        driver = 'iscsi' if target_name.startswith('iqn.') else 'qla2x00t'
+        cp = await run(
+            [
+                'scstadmin',
+                '-noprompt',
+                '-preserve_cluster_mode',
+                '-rem_lun',
+                str(lun_id),
+                '-driver',
+                driver,
+                '-target',
+                target_name,
+                '-group',
+                'security_group',
+            ],
+            check=False,
+        )
+        if cp.returncode:
+            self.logger.error(
+                'Failed to remove LUN %d from target %r: %s',
+                lun_id,
+                target_name,
+                cp.stderr.decode(),
+            )
+
+    def delete_iscsi_lun(self, iqn, lun):
+        pathlib.Path(
+            f'{SCST_BASE}/targets/iscsi/{iqn}/ini_groups/security_group/luns/mgmt'
+        ).write_text(f'del {lun}\n')
+
+    def _xfer_prstate(self, luns_path, extent, lun):
+        try:
+            srcpath = pathlib.Path(luns_path, str(lun), 'device/pr_state')
+            dstpath = pathlib.Path(f'{SCST_DEVICES}/{sanitize_extent(extent)}/pr_state')
+            dstpath.write_text(srcpath.read_text())
+            return 'replace_no_ua'
+        except OSError:
+            pass
+        return 'replace'
+
+    def replace_iscsi_lun(self, iqn, extent, lun, prstate_save):
+        luns_path = f'{SCST_BASE}/targets/iscsi/{iqn}/ini_groups/security_group/luns'
+        if prstate_save:
+            op = self._xfer_prstate(luns_path, extent, lun)
+        else:
+            op = 'replace'
+        pathlib.Path(luns_path, 'mgmt').write_text(
+            f'{op} {sanitize_extent(extent)} {lun}\n'
+        )
+
+    def delete_fc_lun(self, wwpn, lun):
+        pathlib.Path(
+            f'{SCST_BASE}/targets/qla2x00t/{wwpn}/ini_groups/security_group/luns/mgmt'
+        ).write_text(
+            f'del {lun}\n'
+        )
+
+    def replace_fc_lun(self, wwpn, extent, lun, prstate_save):
+        luns_path = pathlib.Path(f'{SCST_BASE}/targets/qla2x00t/{wwpn}/ini_groups/security_group/luns')
+        if prstate_save:
+            op = self._xfer_prstate(luns_path, extent, lun)
+        else:
+            op = 'replace'
+        pathlib.Path(luns_path, 'mgmt').write_text(
+            f'{op} {sanitize_extent(extent)} {lun}\n'
+        )
+
+    def set_node_optimized(self, node):
+        """Update which node is reported as being the active/optimized path."""
+        if node == 'A':
+            pathlib.Path(SCST_CONTROLLER_B_TARGET_GROUPS_STATE).write_text(
+                'nonoptimized\n'
+            )
+            pathlib.Path(SCST_CONTROLLER_A_TARGET_GROUPS_STATE).write_text('active\n')
+        else:
+            pathlib.Path(SCST_CONTROLLER_A_TARGET_GROUPS_STATE).write_text(
+                'nonoptimized\n'
+            )
+            pathlib.Path(SCST_CONTROLLER_B_TARGET_GROUPS_STATE).write_text('active\n')
+
+    def reset_target_parameters(self, iqn, parameter_names):
+        """Reset the specified parameters to their default values."""
+        # Do some sanity checking
+        for param in parameter_names:
+            if param not in ISCSI_TARGET_PARAMETERS:
+                raise ValueError('Invalid parameter name supplied', param)
+        iqndir = pathlib.Path(f'{SCST_BASE}/targets/iscsi/{iqn}')
+        for param in parameter_names:
+            try:
+                (iqndir / pathlib.Path(param)).write_text(':default:\n')
+            except (FileNotFoundError, PermissionError):
+                # If we're not running, that's OK
+                pass
+
+    def apply_config_file(self):
+        try:
+            SCSTAdmin.apply_config_file('/etc/scst.conf')
+        except Exception:
+            self.logger.debug('Failed to apply SCST configuration', exc_info=True)
+            return False
+        return True
+
+    def set_alua_transitioning(self):
+        """Set the local controller's ALUA target group state to transitioning."""
+        node = self.middleware.call_sync('failover.node')
+        path = (
+            SCST_CONTROLLER_A_TARGET_GROUPS_STATE
+            if node == 'A'
+            else SCST_CONTROLLER_B_TARGET_GROUPS_STATE
+        )
+        try:
+            pathlib.Path(path).write_text('transitioning\n')
+        except Exception:
+            self.logger.warning('Failed to set ALUA transitioning state')
+
+    def set_alua_active(self):
+        """Set the local controller's ALUA target group state to active."""
+        node = self.middleware.call_sync('failover.node')
+        path = (
+            SCST_CONTROLLER_A_TARGET_GROUPS_STATE
+            if node == 'A'
+            else SCST_CONTROLLER_B_TARGET_GROUPS_STATE
+        )
+        try:
+            pathlib.Path(path).write_text('active\n')
+        except Exception:
+            self.logger.warning('Failed to set ALUA active state')
+
+    def enable_async_lun_replace(self):
+        """Enable async LUN replace to avoid blocking failover on tgt_dev drain.
+
+        While enabled, the kernel parks the deferred cleanup of old tgt_devs
+        from each LUN replace instead of running it on a workqueue
+        immediately. The orchestrating layer must call
+        disable_async_lun_replace once any cluster coordination the cleanup
+        depends on (e.g. DLM peer eviction) has completed, to release the
+        parked work."""
+        try:
+            pathlib.Path(SCST_ASYNC_LUN_REPLACE).write_text('1\n')
+        except Exception:
+            self.logger.warning('Failed to enable async_lun_replace')
+
+    def disable_async_lun_replace(self):
+        """Disable async LUN replace and release any parked LUN-replace cleanup.
+
+        Should be called after the cluster coordination that the parked
+        cleanup depends on (e.g. DLM peer eviction via dlm.reset_active) has
+        completed, so that scst_free_tgt_dev -> scst_clear_reservation ->
+        scst_dlm_res_lock will not stall."""
+        try:
+            pathlib.Path(SCST_ASYNC_LUN_REPLACE).write_text('0\n')
+        except Exception:
+            self.logger.warning('Failed to disable async_lun_replace')
+
+    def copy_manager_devices(self):
+        result = []
+        try:
+            copy_manager_luns = pathlib.Path(COPY_MANAGER_LUNS_PATH)
+            for p in copy_manager_luns.glob('*/device'):
+                try:
+                    result.append(p.resolve().name)
+                except (FileNotFoundError, PermissionError):
+                    pass
+        except (FileNotFoundError, PermissionError):
+            pass
+        return result
+
+    async def remove_target(self, iqn: str, retries: int = 5):
+        """Remove an iSCSI target from SCST via scstadmin."""
+        # Retries several times with a short sleep to handle the race where
+        # initiator sessions are still being torn down (NEXUS_LOSS_SESS
+        # in-flight) when the call is made.
+        cp = None
+        for attempt in range(retries):
+            cp = await run(
+                [
+                    'scstadmin',
+                    '-force',
+                    '-noprompt',
+                    '-preserve_cluster_mode',
+                    '-rem_target',
+                    iqn,
+                    '-driver',
+                    'iscsi',
+                ],
+                check=False,
+            )
+            if cp.returncode == 0:
+                return
+            if attempt < retries - 1:
+                await asyncio.sleep(1)
+
+        # scstadmin writes errors to stdout, not stderr
+        self.logger.error(
+            'Failed to remove target %r after %d attempts: %s',
+            iqn,
+            retries,
+            cp.stdout.decode() or cp.stderr.decode(),
+        )
+
+    @private
+    def resync_lun_size_for_zvol(self, name):
+        with open(f'{SCST_DEVICES}/{sanitize_extent(name)}/resync_size', 'w') as f:
+            f.write('1')
+
+    @private
+    def resync_lun_size_for_file(self, name):
+        with open(f'{SCST_DEVICES}/{sanitize_extent(name)}/resync_size', 'w') as f:
+            f.write('1')
+
+    @private
+    def sessions(self, global_info):
+        """Enumerate active iSCSI sessions from the SCST sysfs tree."""
+        sessions = []
+        base_path = '/sys/kernel/scst_tgt/targets/iscsi'
+        for target_dir in glob.glob(f'{base_path}/{global_info["basename"]}*'):
+            target = target_dir.rsplit('/', 1)[-1]
+            if target.startswith(f'{global_info["basename"]}:HA:'):
+                continue
+            for session in os.listdir(os.path.join(target_dir, 'sessions')):
+                session_dir = os.path.join(target_dir, 'sessions', session)
+                ip_file = glob.glob(f'{session_dir}/*/ip')
+                if not ip_file:
+                    continue
+
+                # Initiator alias is another name sent by initiator but we are unable to retrieve it in scst
+                session_dict = {
+                    'initiator': session.rsplit('#', 1)[0],
+                    'initiator_alias': None,
+                    'target': target,
+                    'target_alias': target.rsplit(':', 1)[-1],
+                    'header_digest': None,
+                    'data_digest': None,
+                    'max_data_segment_length': None,
+                    'max_receive_data_segment_length': None,
+                    'max_xmit_data_segment_length': None,
+                    'max_burst_length': None,
+                    'first_burst_length': None,
+                    'immediate_data': False,
+                    'iser': False,
+                    'offload': False,  # It is a chelsio NIC driver to offload iscsi, we are not using it so far
+                }
+                with open(ip_file[0], 'r') as f:
+                    session_dict['initiator_addr'] = f.read().strip()
+                transport = os.path.join(os.path.dirname(ip_file[0]), 'transport')
+                with suppress(FileNotFoundError):
+                    with open(transport, 'r') as f:
+                        session_dict['iser'] = 'iSER' == f.read().strip()
+                for k, f, op in (
+                    ('header_digest', 'HeaderDigest', None),
+                    ('data_digest', 'DataDigest', None),
+                    ('max_burst_length', 'MaxBurstLength', lambda i: int(i)),
+                    (
+                        'max_receive_data_segment_length',
+                        'MaxRecvDataSegmentLength',
+                        lambda i: int(i),
+                    ),
+                    (
+                        'max_xmit_data_segment_length',
+                        'MaxXmitDataSegmentLength',
+                        lambda i: int(i),
+                    ),
+                    ('first_burst_length', 'FirstBurstLength', lambda i: int(i)),
+                    (
+                        'immediate_data',
+                        'ImmediateData',
+                        lambda i: True if i == 'Yes' else False,
+                    ),
+                ):
+                    f_path = os.path.join(session_dir, f)
+                    if os.path.exists(f_path):
+                        with open(f_path, 'r') as fd:
+                            data = fd.read().strip()
+                            if data != 'None':
+                                if op:
+                                    data = op(data)
+                                session_dict[k] = data
+
+                # We get recv/emit data segment length, keeping consistent with freebsd, we can
+                # take the maximum of two and show it for max_data_segment_length
+                if (
+                    session_dict['max_xmit_data_segment_length']
+                    and session_dict['max_receive_data_segment_length']
+                ):
+                    session_dict['max_data_segment_length'] = max(
+                        session_dict['max_receive_data_segment_length'],
+                        session_dict['max_xmit_data_segment_length'],
+                    )
+
+                sessions.append(session_dict)
+        return sessions

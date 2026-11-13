@@ -1,122 +1,62 @@
+from dataclasses import dataclass
 from datetime import timedelta
-import os
-import json
-import logging
+from typing import Any
 
-try:
-    from freenasOS import Update
-    from freenasOS.Update import PendingUpdates
-except ImportError:
-    Update = PendingUpdates = None
-
-from middlewared.alert.base import AlertClass, AlertCategory, AlertLevel, Alert, FilePresenceAlertSource, ThreadedAlertSource
+from middlewared.alert.base import Alert, AlertCategory, AlertClass, AlertClassConfig, AlertLevel, AlertSource
 from middlewared.alert.schedule import IntervalSchedule
-
-UPDATE_APPLIED_SENTINEL = "/tmp/.updateapplied"
-
-log = logging.getLogger("update_check_alertmod")
+from middlewared.plugins.update_.profile_ import UpdateProfiles
 
 
-# FIXME: use update plugin
-def is_update_applied(update_version):
-    if Update is None:
-        return False
-    active_be_msg = 'Please reboot the system to activate this update.'
-    # TODO: The below boot env name should really be obtained from the update code
-    # for now we just duplicate that code here
-    if update_version.startswith(Update.Avatar() + "-"):
-        update_boot_env = update_version[len(Update.Avatar() + "-"):]
-    else:
-        update_boot_env = "%s-%s" % (Update.Avatar(), update_version)
+@dataclass(kw_only=True)
+class CurrentlyRunningVersionDoesNotMatchProfileAlert(AlertClass):
+    config = AlertClassConfig(
+        category=AlertCategory.SYSTEM,
+        level=AlertLevel.WARNING,
+        title="Currently Running System Version Does Not Match Selected Update Profile",
+        text=(
+            "Currently running system version profile %(running)s does not match selected update profile %(selected)s."
+        ),
+    )
 
-    found = False
-    msg = ''
-    for clone in Update.ListClones():
-        if clone['realname'] == update_boot_env:
-            if clone['active'] != 'R':
-                active_be_msg = 'Please activate {0} via'.format(update_boot_env) + \
-                                ' the Boot Environment Tab and Reboot to use this updated version.'
-            msg = 'Update: {0} has already been applied. {1}'.format(update_version, active_be_msg)
-            found = True
-            break
-
-    return (found, msg)
+    running: str
+    selected: str
 
 
-class HasUpdateAlertClass(AlertClass):
-    category = AlertCategory.SYSTEM
-    level = AlertLevel.INFO
-    title = "Update Available"
-    text = "A system update is available. Go to System -> Update to download and apply the update."
+class HasUpdateAlert(AlertClass):
+    config = AlertClassConfig(
+        category=AlertCategory.SYSTEM,
+        level=AlertLevel.INFO,
+        title="Update Available",
+        text="A system update is available. Go to System → Update to download and apply the update.",
+    )
 
 
-class HasUpdateAlertSource(ThreadedAlertSource):
+def _profile_display_name(name: str) -> str:
+    try:
+        return UpdateProfiles[name].display_name
+    except KeyError:
+        return "<Unknown>"
+
+
+class HasUpdateAlertSource(AlertSource):
     schedule = IntervalSchedule(timedelta(hours=1))
-
     run_on_backup_node = False
 
-    def check_sync(self):
+    async def check(self) -> list[Alert[Any]] | Alert[Any] | None:
         try:
-            self.middleware.call_sync("datastore.query", "system.update", [], {"get": True})
-        except IndexError:
-            self.middleware.call_sync("datastore.insert", "system.update", {
-                "upd_autocheck": True,
-                "upd_train": "",
-            })
+            update_status = await self.call2(self.s.update.status)
+            if update_status.status:
+                if not update_status.status.current_version.matches_profile:
+                    config = await self.call2(self.s.update.config)
 
-        path = self.middleware.call_sync("update.get_update_location")
-        if not path:
-            return
+                    return Alert(CurrentlyRunningVersionDoesNotMatchProfileAlert(
+                        running=_profile_display_name(update_status.status.current_version.profile),
+                        selected=_profile_display_name(config.profile),
+                    ))
 
-
-        updates = None
-        try:
-            if PendingUpdates:
-                updates = PendingUpdates(path)
+                if update_status.status.new_version:
+                    return Alert(HasUpdateAlert())
         except Exception:
             pass
 
-        if updates:
-            return Alert(HasUpdateAlertClass)
-
-
-class UpdateNotAppliedAlertClass(AlertClass):
-    category = AlertCategory.SYSTEM
-    level = AlertLevel.WARNING
-    title = "Update Not Applied"
-    text = "%s"
-
-
-class UpdateNotAppliedAlertSource(ThreadedAlertSource):
-    schedule = IntervalSchedule(timedelta(minutes=10))
-
-    def check_sync(self):
-        if os.path.exists(UPDATE_APPLIED_SENTINEL):
-            try:
-                with open(UPDATE_APPLIED_SENTINEL, "rb") as f:
-                    data = json.loads(f.read().decode("utf8"))
-            except Exception:
-                log.error(
-                    "Could not load UPDATE APPLIED SENTINEL located at {0}".format(
-                        UPDATE_APPLIED_SENTINEL
-                    ),
-                    exc_info=True
-                )
-                return
-
-            if is_update_applied:
-                update_applied, msg = is_update_applied(data["update_version"], create_alert=False)
-                if update_applied:
-                    return Alert(UpdateNotAppliedAlertClass, msg)
-
-
-class UpdateFailedAlertClass(AlertClass):
-    category = AlertCategory.SYSTEM
-    level = AlertLevel.CRITICAL
-    title = "Update Failed"
-    text = "Update failed. See /data/update.failed for details."
-
-
-class UpdateFailedAlertSource(FilePresenceAlertSource):
-    path = "/data/update.failed"
-    klass = UpdateFailedAlertClass
+        return None

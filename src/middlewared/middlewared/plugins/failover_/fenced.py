@@ -1,14 +1,21 @@
-import subprocess
-import psutil
+# Copyright (c) - iXsystems Inc. dba TrueNAS
+#
+# Licensed under the terms of the TrueNAS Enterprise License Agreement
+# See the file LICENSE.IX for complete terms and conditions
+
 import contextlib
 import os
 import signal
+import subprocess
 
-from middlewared.service import Service, CallError
 from fenced.fence import ExitCode as FencedExitCodes
 
+from middlewared.service import CallError, Service
+from middlewared.utils import MIDDLEWARE_RUN_DIR
+from middlewared.utils.cgroups import move_to_root_cgroups
+from middlewared.utils.os import get_pids
 
-PID_FILE = '/tmp/.fenced-pid'
+PID_FILE = os.path.join(MIDDLEWARE_RUN_DIR, 'fenced.pid')
 IS_ALIVE_SIGNAL = 0
 
 
@@ -22,7 +29,7 @@ class FencedService(Service):
         # get the boot disks so fenced doesn't try to
         # place reservations on the boot drives
         try:
-            boot_disks = ','.join(self.middleware.call_sync('boot.get_disks'))
+            boot_disks = ','.join(self.call_sync2(self.s.boot.get_disks))
         except Exception:
             self.logger.warning('Failed to get boot disks', exc_info=True)
             # just because we can't grab the boot disks from middleware
@@ -46,6 +53,13 @@ class FencedService(Service):
         )
         out, err = proc.communicate()
 
+        if proc.returncode == 0:
+            # move out from underneath middlewared (parent) cgroup so
+            # that when middlewared is restarted via the cli, the signal
+            # doesn't get sent to fenced causing fenced process to also
+            # receive the same signal....so gross
+            move_to_root_cgroups(self.run_info()['pid'])
+
         return proc.returncode
 
     def stop(self, banhammer=True):
@@ -57,7 +71,10 @@ class FencedService(Service):
         else:
             res = self.middleware.call_sync('failover.fenced.run_info')
             if res['running'] and res['pid']:
-                os.kill(res['pid'], signal.SIGKILL)
+                try:
+                    os.kill(res['pid'], signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
 
     def run_info(self):
         res = {'running': False, 'pid': ''}
@@ -78,10 +95,11 @@ class FencedService(Service):
 
         if check_running_procs:
             # either 1. no pid in file or 2. pid in file is wrong/stale
-            _iter = psutil.process_iter
-            proc = 'fenced'
-            res['pid'] = next((p.pid for p in _iter() if p.name() == proc), '')
-            res['running'] = bool(res['pid'])
+            for proc in filter(lambda x: x and b'fenced' in x.name, get_pids()):
+                args = proc.cmdline.split(b' ')
+                if len(args) >= 2 and args[1] == b'/usr/bin/fenced':
+                    res['pid'] = proc.pid
+                    res['running'] = True
 
         return res
 
@@ -98,10 +116,6 @@ class FencedService(Service):
 
 
 async def hook_pool_event(middleware, *args, **kwargs):
-    # only run this on SCALE Enterprise
-    if await middleware.call('system.product_type') != 'SCALE_ENTERPRISE':
-        return
-
     # HA licensed systems call fenced on their own
     if await middleware.call('failover.licensed'):
         return

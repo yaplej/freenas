@@ -1,0 +1,148 @@
+from __future__ import annotations
+
+from typing import TYPE_CHECKING, Any
+
+from middlewared.api import api_method
+from middlewared.api.current import (
+    CatalogAppDetails,
+    CatalogApps,
+    CatalogAppsArgs,
+    CatalogAppsResponse,
+    CatalogAppsResult,
+    CatalogAppVersionDetails,
+    CatalogEntry,
+    CatalogGetAppDetailsArgs,
+    CatalogGetAppDetailsResult,
+    CatalogSyncArgs,
+    CatalogSyncedArgs,
+    CatalogSyncedResult,
+    CatalogSyncResult,
+    CatalogTrainsArgs,
+    CatalogTrainsResponse,
+    CatalogTrainsResult,
+    CatalogUpdate,
+    CatalogUpdateArgs,
+    CatalogUpdateResult,
+)
+from middlewared.service import GenericConfigService, job, private
+
+from .app_version import get_app_details
+from .apps_details import (
+    NormalizedQuestions,
+)
+from .apps_details import (
+    app_version_details as app_version_details_impl,
+)
+from .apps_details import (
+    apps as apps_impl,
+)
+from .apps_details import (
+    get_normalized_questions_context as get_nqc_impl,
+)
+from .apps_details import (
+    train_data_available as train_data_available_impl,
+)
+from .apps_details import (
+    train_to_apps_version_mapping as train_to_apps_version_mapping_impl,
+)
+from .config import CatalogConfigPart
+from .features import version_supported_error_check as version_supported_error_check_impl
+from .sync import get_synced_state
+from .sync import sync as sync_impl
+
+__all__ = ('CatalogService',)
+
+
+if TYPE_CHECKING:
+    from middlewared.job import Job
+    from middlewared.main import Middleware
+
+
+class CatalogService(GenericConfigService[CatalogEntry]):
+    class Config:
+        cli_namespace = 'app.catalog'
+        role_prefix = 'CATALOG'
+        entry = CatalogEntry
+        generic = True
+
+    def __init__(self, middleware: Middleware) -> None:
+        super().__init__(middleware)
+        self._svc_part = CatalogConfigPart(self.context)
+
+    @api_method(CatalogUpdateArgs, CatalogUpdateResult, check_annotations=True)
+    async def do_update(self, data: CatalogUpdate) -> CatalogEntry:
+        """
+        Update catalog preferences.
+        """
+        return await self._svc_part.do_update(data)
+
+    @api_method(
+        CatalogGetAppDetailsArgs, CatalogGetAppDetailsResult,
+        roles=['CATALOG_READ'], check_annotations=True,
+    )
+    def get_app_details(self, app_name: str, options: CatalogAppVersionDetails) -> CatalogAppDetails:
+        """
+        Retrieve information of ``app_name`` ``app_version_details.catalog`` catalog app.
+        """
+        return get_app_details(self.context, app_name, options)
+
+    @api_method(CatalogSyncArgs, CatalogSyncResult, roles=['CATALOG_WRITE'], check_annotations=True)
+    @job(lock='official_catalog_sync', lock_queue_size=0)
+    async def sync(self, job: Job) -> None:
+        """
+        Sync truenas catalog to retrieve latest changes from upstream.
+        """
+        return await sync_impl(self.context, job)
+
+    @api_method(CatalogSyncedArgs, CatalogSyncedResult, check_annotations=True, roles=['CATALOG_READ'])
+    def synced(self) -> bool:
+        """
+        Return whether the catalog has been synced at least once.
+        """
+        return get_synced_state()
+
+    @api_method(CatalogAppsArgs, CatalogAppsResult, check_annotations=True, roles=['CATALOG_READ'])
+    def apps(self, options: CatalogApps) -> CatalogAppsResponse:
+        """
+        Retrieve apps details for ``label`` catalog.
+        """
+        return apps_impl(self.context, options)
+
+    @api_method(CatalogTrainsArgs, CatalogTrainsResult, check_annotations=True, roles=['CATALOG_READ'])
+    def trains(self) -> CatalogTrainsResponse:
+        """
+        Retrieve available trains.
+        """
+        return CatalogTrainsResponse.model_validate(
+            list(apps_impl(self.context, CatalogApps(cache=True, cache_only=True)).root)
+        )
+
+    @private
+    async def train_data_available(self) -> bool:
+        return await train_data_available_impl(self.context)
+
+    @private
+    def train_to_apps_version_mapping(self) -> dict[str, dict[str, dict[str, str | None]]]:
+        return train_to_apps_version_mapping_impl(self.context)
+
+    @private
+    async def get_normalized_questions_context(self) -> NormalizedQuestions:
+        return await get_nqc_impl(self.context)
+
+    @private
+    def app_version_details(
+        self, version_path: str, questions_context: NormalizedQuestions | None = None
+    ) -> dict[str, Any]:
+        return app_version_details_impl(self.context, version_path, questions_context)
+
+    @private
+    async def version_supported_error_check(self, version_details: dict[str, Any]) -> None:
+        await version_supported_error_check_impl(self.context, version_details)
+
+    @private
+    async def update_train_for_enterprise(self) -> None:
+        return await self._svc_part.update_train_for_enterprise()
+
+
+async def setup(middleware: Middleware) -> None:
+    await middleware.call('network.general.register_activity', 'catalog', 'Catalog(s) information')

@@ -1,20 +1,32 @@
-#!/usr/bin/env python3
-
-import sys
 import os
-apifolder = os.getcwd()
-sys.path.append(apifolder)
-from functions import POST
-from auto_config import ha
+import time
 
-if 'license_file' in os.environ:
-    license_file = os.environ["license_file"]
-else:
-    license_file = '/root/license.txt'
+from auto_config import ha_license
+from middlewared.test.integration.utils import call, ha_test
 
-# Only read the test on HA
-if ha:
-    def test_01_send_license():
-        with open(license_file, 'r') as f:
-            results = POST('/system/license_update', str(f.read()), controller_a=ha)
-            assert results.status_code == 200, results.text
+
+@ha_test
+def test_apply_and_verify_license():
+    if ha_license:
+        _license_string = ha_license
+    else:
+        with open(os.environ.get('license_file', '/root/license.txt')) as f:
+            _license_string = f.read()
+
+    # apply license
+    call('truenas.license.upload', _license_string)
+
+    # verify license is applied
+    assert call('failover.licensed') is True
+
+    retries = 30
+    sleep_time = 1
+    for i in range(retries):
+        if call('failover.call_remote', 'failover.licensed') is False:
+            # we call a hook that runs in a background task
+            # so give it a bit to propagate to other controller
+            time.sleep(sleep_time)
+        else:
+            break
+    else:
+        assert False, f'Timed out after {sleep_time * retries}s waiting on license to sync to standby'

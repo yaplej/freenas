@@ -7,6 +7,7 @@ Create Date: 2022-03-01 14:40:25.351989+00:00
 """
 from alembic import op
 import sqlalchemy as sa
+from sqlalchemy import text
 
 
 # revision identifiers, used by Alembic.
@@ -30,9 +31,9 @@ def create_new_entries(old_entry):
 
         # we'll write the ipv6 address to the network_alias table
         alias_entry['alias_interface_id'] = old_entry['id']
-        alias_entry['alias_address'] = old_entry['int_ipv6address'],
+        alias_entry['alias_address'] = old_entry['int_ipv6address']
         alias_entry['alias_address_b'] = old_entry['int_ipv6address_b']
-        alias_entry['alias_vip'] = old_entry['int_vipv6address']
+        alias_entry['alias_vip'] = old_entry['int_vipv6address'] or ''
         alias_entry['alias_version'] = 6
         alias_entry['alias_netmask'] = int(old_entry['int_v6netmaskbit']) if old_entry['int_v6netmaskbit'] else 128
     elif old_entry['int_ipv4address']:
@@ -54,7 +55,7 @@ def create_new_entries(old_entry):
 def upgrade():
     con = op.get_bind()
     new_entries = []
-    for old_entry in map(dict, con.execute('SELECT * FROM network_interfaces').fetchall()):
+    for old_entry in con.execute(text('SELECT * FROM network_interfaces')).mappings().all():
         new_entries.append(create_new_entries(old_entry))
 
     # add new columns
@@ -69,11 +70,11 @@ def upgrade():
         if new_entry:
             _id = new_entry.pop('id')
             for column, value in new_entry.items():
-                con.execute(f'UPDATE network_interfaces SET {column} = "{value}" WHERE id = "{_id}"')
+                con.execute(text(f'UPDATE network_interfaces SET {column} = :value WHERE id = :id'), {'value': value, 'id': _id})
         if alias_entry:
-            columns = tuple(alias_entry.keys())
-            values = tuple(alias_entry.values())
-            con.execute(f'INSERT INTO network_alias {columns} VALUES {values}')
+            columns = ','.join(alias_entry.keys())
+            placeholders = ','.join([f":{key}" for key in alias_entry.keys()])
+            con.execute(text(f'INSERT INTO network_alias ({columns}) VALUES ({placeholders})'), alias_entry)
 
     # remove old columns
     with op.batch_alter_table('network_interfaces', schema=None) as batch_op:

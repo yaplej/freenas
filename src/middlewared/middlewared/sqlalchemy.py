@@ -1,19 +1,23 @@
+from __future__ import annotations
+
 import datetime
-import json
+from typing import Any
 
-import isodate
-from sqlalchemy import (
-    Table, Column as _Column, ForeignKey, Index,
-    Boolean, CHAR, DateTime, Integer, SmallInteger, String, Text,
-)  # noqa
-from sqlalchemy.ext.declarative import declarative_base
-from sqlalchemy.orm import relationship  # noqa
-from sqlalchemy.types import UserDefinedType
+from sqlalchemy import CHAR, Boolean, ForeignKey, Index, Integer, SmallInteger, String, Table, Text, UniqueConstraint
+from sqlalchemy import JSON as NativeJSON
+from sqlalchemy import Column as _Column
+from sqlalchemy import DateTime as _DateTime
+from sqlalchemy.orm import Mapped, declarative_base, relationship
+from sqlalchemy.types import TypeDecorator, UserDefinedType
+from truenas_api_client import json
 
-from middlewared.plugins.pwenc import encrypt, decrypt
+from middlewared.utils.pwenc import decrypt, encrypt
+
+__all__ = ["CHAR", "Model", "Column", "Boolean", "ForeignKey", "Index", "Integer", "NativeJSON", "Mapped",
+           "SmallInteger", "String", "Table", "Text", "UniqueConstraint", "relationship"]
 
 
-class Base(object):
+class Base:
     __table_args__ = {"sqlite_autoincrement": True}
 
 
@@ -27,44 +31,51 @@ Model.metadata.naming_convention = {
 }
 
 
-class Column(_Column):
-    def __init__(self, *args, **kwargs):
+# We deliberately not make this Generic as to avoid mypy checking our database models.
+# We don't need type hints there, we're not using these models directly.
+class Column(_Column):  # type: ignore[type-arg]
+    inherit_cache = True
+
+    def __init__(self, *args: Any, **kwargs: Any):
         kwargs.setdefault("nullable", False)
         super().__init__(*args, **kwargs)
 
 
-class EncryptedText(UserDefinedType):
-    def get_col_spec(self, **kw):
+class EncryptedText(UserDefinedType[str]):
+    cache_ok = True
+
+    def get_col_spec(self, **kw: Any) -> str:
         return "TEXT"
 
-    def _bind_processor(self, value):
+    def _bind_processor(self, value: str | None) -> str | None:
         if value is None:
             return None
 
         return encrypt(value) if value else ''
 
-    def bind_processor(self, dialect):
+    def bind_processor(self, dialect: Any) -> Any:
         return self._bind_processor
 
-    def _result_processor(self, value):
+    def _result_processor(self, value: str | None) -> str | None:
         if value is None:
             return None
 
         return decrypt(value) if value else ''
 
-    def result_processor(self, dialect, coltype):
+    def result_processor(self, dialect: Any, coltype: Any) -> Any:
         return self._result_processor
 
 
-class JSON(UserDefinedType):
-    def __init__(self, type=dict, encrypted=False):
-        self.type = type
+class JSON[T](TypeDecorator[T]):
+    impl = Text
+    cache_ok = True
+
+    def __init__(self, type_: type[T] | None, encrypted: bool = False) -> None:
+        super().__init__()
+        self.type = type_
         self.encrypted = encrypted
 
-    def get_col_spec(self, **kw):
-        return "TEXT"
-
-    def _bind_processor(self, value):
+    def process_bind_param(self, value: T | None, dialect: Any) -> str:
         if value is None:
             if self.type is not None:
                 value = self.type()
@@ -73,38 +84,37 @@ class JSON(UserDefinedType):
             result = encrypt(result)
         return result
 
-    def bind_processor(self, dialect):
-        return self._bind_processor
+    def process_result_value(self, value: Any, dialect: Any) -> T:
+        if value is None:
+            if self.type is not None:
+                return self.type()
 
-    def _result_processor(self, value):
+        assert isinstance(value, str)
         try:
             if self.encrypted:
                 value = decrypt(value, _raise=True)
-            return json.loads(value)
+            return json.loads(value)  # type: ignore[no-any-return]
         except Exception:
             if self.type is not None:
                 return self.type()
-            else:
-                return None
-
-    def result_processor(self, dialect, coltype):
-        return self._result_processor
 
 
-class MultiSelectField(UserDefinedType):
-    def get_col_spec(self, **kw):
+class MultiSelectField(UserDefinedType[str]):
+    cache_ok = True
+
+    def get_col_spec(self, **kw: Any) -> str:
         return "TEXT"
 
-    def _bind_processor(self, value):
+    def _bind_processor(self, value: list[str] | None) -> str | None:
         if value is None:
             return None
 
         return ",".join(value)
 
-    def bind_processor(self, dialect):
+    def bind_processor(self, dialect: Any) -> Any:
         return self._bind_processor
 
-    def _result_processor(self, value):
+    def _result_processor(self, value: str) -> list[str]:
         if value:
             try:
                 return value.split(",")
@@ -113,31 +123,52 @@ class MultiSelectField(UserDefinedType):
 
         return []
 
-    def result_processor(self, dialect, coltype):
+    def result_processor(self, dialect: Any, coltype: Any) -> Any:
         return self._result_processor
 
 
-class Time(UserDefinedType):
-    def get_col_spec(self, **kw):
+class DateTime(TypeDecorator[datetime.datetime]):
+    impl = _DateTime
+    cache_ok = True
+
+    def process_bind_param(self, value: datetime.datetime | None, dialect: Any) -> datetime.datetime | None:
+        if value is not None and getattr(value, "tzinfo", None):
+            return value.replace(tzinfo=None)
+
+        return value
+
+    def process_result_value(self, value: datetime.datetime | None, dialect: Any) -> datetime.datetime | None:
+        if value is not None and getattr(value, "tzinfo", None):
+            return value.replace(tzinfo=None)
+
+        return value
+
+
+class Time(UserDefinedType[datetime.time]):
+    cache_ok = True
+
+    def get_col_spec(self, **kw: Any) -> str:
         return "TIME"
 
-    def _bind_processor(self, value):
+    def _bind_processor(self, value: datetime.time | str | None) -> str | None:
         if value is None:
             return None
 
         if isinstance(value, str):
-            value = isodate.parse_time(value)
+            parsed = datetime.time.fromisoformat(value)
+        else:
+            parsed = value
 
-        return value.isoformat()
+        return parsed.isoformat()
 
-    def bind_processor(self, dialect):
+    def bind_processor(self, dialect: Any) -> Any:
         return self._bind_processor
 
-    def _result_processor(self, value):
+    def _result_processor(self, value: str) -> datetime.time:
         try:
-            return isodate.parse_time(value)
+            return datetime.time.fromisoformat(value)
         except Exception:
             return datetime.time()
 
-    def result_processor(self, dialect, coltype):
+    def result_processor(self, dialect: Any, coltype: Any) -> Any:
         return self._result_processor

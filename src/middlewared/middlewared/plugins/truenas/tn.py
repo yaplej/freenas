@@ -1,0 +1,84 @@
+from __future__ import annotations
+
+import errno
+import os
+from typing import TYPE_CHECKING, cast
+
+from truenas_pydmi.models import TRUENAS_UNKNOWN
+
+from middlewared.api.current import SupportNewTicket, SupportNewTicketEnterprise, TruecommandStatus
+from middlewared.service import ServiceContext
+from middlewared.utils.dmi import cached_dmi
+
+if TYPE_CHECKING:
+    from middlewared.job import Job
+
+
+EULA_FILE = '/usr/local/share/truenas/eula.html'
+EULA_PENDING_PATH = '/data/truenas-eula-pending'
+
+
+async def managed_by_truecommand(context: ServiceContext) -> bool:
+    return TruecommandStatus(
+        (await context.call2(context.s.truecommand.config)).status
+    ) == TruecommandStatus.CONNECTED
+
+
+async def is_ix_hardware(context: ServiceContext) -> bool:
+    dmi = await context.to_thread(cached_dmi)
+    return dmi.tn_model != TRUENAS_UNKNOWN
+
+
+def get_eula() -> str | None:
+    try:
+        with open(EULA_FILE, 'r', encoding='utf8') as f:
+            return f.read()
+    except FileNotFoundError:
+        return None
+
+
+def is_eula_accepted() -> bool:
+    return not os.path.exists(EULA_PENDING_PATH)
+
+
+def accept_eula() -> None:
+    try:
+        os.unlink(EULA_PENDING_PATH)
+    except OSError as e:
+        if e.errno != errno.ENOENT:
+            raise
+
+
+def unaccept_eula() -> None:
+    with open(EULA_PENDING_PATH, 'w') as f:
+        os.fchmod(f.fileno(), 0o600)
+
+
+async def is_production(context: ServiceContext) -> bool:
+    return cast(bool, await context.call2(context.s.keyvalue.get, 'truenas:production', False))
+
+
+async def set_production(
+    context: ServiceContext, job: Job, production: bool, attach_debug: bool,
+) -> SupportNewTicket | None:
+    was_production = await is_production(context)
+    await context.call2(context.s.keyvalue.set, 'truenas:production', production)
+
+    if not was_production and production:
+        serial = (await context.middleware.call('system.dmidecode_info'))['system-serial-number']
+        result: SupportNewTicket = await job.wrap(await context.call2(
+            context.s.support.new_ticket,
+            SupportNewTicketEnterprise(
+                title=f'System has been just put into production ({serial})',
+                body='This system has been just put into production',
+                attach_debug=attach_debug,
+                category='Installation/Setup',
+                criticality='Inquiry',
+                environment='Production',
+                name='Automatic Alert',
+                email='auto-support@truenas.com',
+                phone='-',
+            ),
+        ))
+        return result
+    return None

@@ -1,4 +1,6 @@
-from middlewared.service import accepts, Service
+from middlewared.api import api_method
+from middlewared.api.current import ISCSIGlobalClientCountArgs, ISCSIGlobalClientCountResult
+from middlewared.service import Service
 
 
 class ISCSIGlobalService(Service):
@@ -7,9 +9,14 @@ class ISCSIGlobalService(Service):
         namespace = 'iscsi.global'
         cli_namespace = 'sharing.iscsi.global'
 
-    @accepts()
+    @api_method(
+        ISCSIGlobalClientCountArgs,
+        ISCSIGlobalClientCountResult,
+        roles=['SHARING_ISCSI_GLOBAL_READ']
+    )
     async def client_count(self):
         """
         Return currently connected clients count.
         """
-        return len({host.ip for host in await self.middleware.call("iscsi.host.injection.collect")})
+        addrs = await self.middleware.call('iscsi.global.sessions', [], {'select': ['initiator_addr']})
+        return len({addr['initiator_addr'] for addr in addrs})

@@ -3,15 +3,56 @@ from datetime import datetime
 import errno
 import socket
 import ssl
+from typing import Any
 import uuid
 
-from middlewared.async_validators import resolve_hostname
-from middlewared.schema import accepts, Any, Bool, Dict, Int, Str, Patch
-from middlewared.service import CallError, CRUDService, job, private, ValidationErrors
-import middlewared.sqlalchemy as sa
-
-from pyVim import connect, task as VimTask
+from pydantic import Secret
+from pyVim import connect
+from pyVim import task as VimTask
 from pyVmomi import vim, vmodl
+
+from middlewared.alert.source.vmware_login import VMWareLoginFailedAlert
+from middlewared.alert.source.vmware_snapshot import VMWareSnapshotCreateFailedAlert, VMWareSnapshotDeleteFailedAlert
+from middlewared.api import api_method
+from middlewared.api.base import BaseModel
+from middlewared.api.current import (
+    VMWareCreateArgs,
+    VMWareCreateResult,
+    VMWareDatasetHasVmsArgs,
+    VMWareDatasetHasVmsResult,
+    VMWareDeleteArgs,
+    VMWareDeleteResult,
+    VMWareEntry,
+    VMWareGetDatastoresArgs,
+    VMWareGetDatastoresResult,
+    VMWareMatchDatastoresWithDatasetsArgs,
+    VMWareMatchDatastoresWithDatasetsResult,
+    VMWareUpdateArgs,
+    VMWareUpdateResult,
+    ZFSResourceQuery,
+)
+from middlewared.async_validators import resolve_hostname
+from middlewared.service import CallError, CRUDService, ValidationErrors, job, private
+import middlewared.sqlalchemy as sa
+from middlewared.utils.time_utils import utc_now
+
+NFS_VOLUME_TYPES = ('NFS', 'NFS41')
+
+
+class VMWarePeriodicSnapshotTaskProceedArgs(BaseModel):
+    context: Secret[Any]
+
+
+class VMWarePeriodicSnapshotTaskProceedResult(BaseModel):
+    result: Any
+
+
+class VMWarePeriodicSnapshotTaskEndArgs(BaseModel):
+    context: Secret[Any]
+
+
+class VMWarePeriodicSnapshotTaskEndResult(BaseModel):
+    result: Any
 
 
 class VMWareModel(sa.Model):
@@ -23,6 +64,7 @@ class VMWareModel(sa.Model):
     password = sa.Column(sa.EncryptedText())
     filesystem = sa.Column(sa.String(200))
     datastore = sa.Column(sa.String(200))
+    state = sa.Column(sa.JSON(dict))
 
 
 class VMWareService(CRUDService):
@@ -30,6 +72,8 @@ class VMWareService(CRUDService):
     class Config:
         datastore = 'storage.vmwareplugin'
         cli_namespace = 'storage.vmware'
+        entry = VMWareEntry
+        role_prefix = 'SNAPSHOT_TASK'
 
     @private
     async def validate_data(self, data, schema_name):
@@ -65,153 +109,87 @@ class VMWareService(CRUDService):
                 'Failed to connect: ' + str(e)
             )
 
-        if verrors:
-            raise verrors
+        verrors.check()
 
-    @accepts(
-        Dict(
-            'vmware_create',
-            Str('datastore', required=True),
-            Str('filesystem', required=True),
-            Str('hostname', required=True),
-            Str('password', private=True, required=True),
-            Str('username', required=True),
-            register=True
-        )
-    )
+    @api_method(VMWareCreateArgs, VMWareCreateResult)
     async def do_create(self, data):
         """
         Create VMWare snapshot.
-
-        `hostname` is a valid IP address / hostname of a VMWare host. When clustering, this is the vCenter server for
-        the cluster.
-
-        `username` and `password` are the credentials used to authorize access to the VMWare host.
-
-        `datastore` is a valid datastore name which exists on the VMWare host.
         """
-        await self.validate_data(data, 'vmware_create')
+        await self.middleware.call('vmware.validate_data', data, 'vmware_create')
 
         data['id'] = await self.middleware.call(
             'datastore.insert',
             self._config.datastore,
-            data
+            {**data, 'state': {'state': 'PENDING'}},
         )
 
         return await self.get_instance(data['id'])
 
-    @accepts(
-        Int('id', required=True),
-        Patch('vmware_create', 'vmware_update', ('attr', {'update': True}))
-    )
-    async def do_update(self, id, data):
+    @api_method(VMWareUpdateArgs, VMWareUpdateResult)
+    async def do_update(self, id_, data):
         """
-        Update VMWare snapshot of `id`.
+        Update VMWare snapshot of ``id``.
         """
-        old = await self.get_instance(id)
+        old = await self.get_instance(id_)
+        old.pop('state')
         new = old.copy()
 
         new.update(data)
 
-        await self.validate_data(new, 'vmware_update')
+        await self.middleware.call('vmware.validate_data', new, 'vmware_update')
 
         await self.middleware.call(
             'datastore.update',
             self._config.datastore,
-            id,
-            new,
+            id_,
+            {**new, 'state': {'state': 'PENDING'}},
         )
 
-        return await self.get_instance(id)
+        await self.call2(self.s.alert.oneshot_delete, "VMWareLoginFailed", old["hostname"])
 
-    @accepts(
-        Int('id')
-    )
-    async def do_delete(self, id):
+        return await self.get_instance(id_)
+
+    @api_method(VMWareDeleteArgs, VMWareDeleteResult)
+    async def do_delete(self, id_):
         """
-        Delete VMWare snapshot of `id`.
+        Delete VMWare snapshot of ``id``.
         """
+
+        vmsnapobj = await self.get_instance(id_)
 
         response = await self.middleware.call(
             'datastore.delete',
             self._config.datastore,
-            id
+            id_
         )
+
+        await self.call2(self.s.alert.oneshot_delete, "VMWareLoginFailed", vmsnapobj["hostname"])
 
         return response
 
-    @accepts(Dict(
-        'vmware-creds',
-        Str('hostname', required=True),
-        Str('username', required=True),
-        Str('password', private=True, required=True),
-    ))
+    @api_method(VMWareGetDatastoresArgs, VMWareGetDatastoresResult, roles=['READONLY_ADMIN'])
     def get_datastores(self, data):
         """
         Get datastores from VMWare.
         """
         return sorted(list(self.__get_datastores(data).keys()))
 
-    @accepts(Dict(
-        'vmware-creds',
-        Str('hostname', required=True),
-        Str('username', required=True),
-        Str('password', private=True, required=True),
-    ))
+    @api_method(
+        VMWareMatchDatastoresWithDatasetsArgs,
+        VMWareMatchDatastoresWithDatasetsResult,
+        roles=['READONLY_ADMIN'],
+    )
     def match_datastores_with_datasets(self, data):
         """
         Requests datastores from vCenter server and tries to match them with local filesystems.
 
         Returns a list of datastores, a list of local filesystems and guessed relationship between them.
-
-        .. examples(websocket)::
-
-            :::javascript
-            {
-              "id": "d51da71b-bb48-4b8b-a8f7-6046fcc892b4",
-              "msg": "method",
-              "method": "vmware.match_datastores_with_datasets",
-              "params": [{"hostname": "10.215.7.104", "username": "root", "password": "password"}]
-            }
-
-            returns
-
-            {
-              "datastores": [
-                {
-                  "name": "10.215.7.102",
-                  "description": "NFS mount '/mnt/tank' on 10.215.7.102",
-                  "filesystems": ["tank"]
-                },
-                {
-                  "name": "datastore1",
-                  "description": "mpx.vmhba0:C0:T0:L0",
-                  "filesystems": []
-                },
-                {
-                  "name": "zvol",
-                  "description": "iSCSI extent naa.6589cfc000000b3f0a891a2c4e187594",
-                  "filesystems": ["tank/vol"]
-                }
-              ],
-              "filesystems": [
-                {
-                  "type": "FILESYSTEM",
-                  "name": "tank",
-                  "description": "NFS mount '/mnt/tank' on 10.215.7.102"
-                },
-                {
-                  "type": "VOLUME",
-                  "name": "tank/vol",
-                  "description": "iSCSI extent naa.6589cfc000000b3f0a891a2c4e187594"
-                }
-              ]
-            }
         """
 
         datastores = []
         for k, v in self.__get_datastores(data).items():
-            if v["type"] == "NFS":
+            if v["type"] in NFS_VOLUME_TYPES:
                 description = f"NFS mount {v['remote_path']!r} on {' or '.join(v['remote_hostnames'])}"
                 matches = [f"{hostname}:{v['remote_path']}" for hostname in v["remote_hostnames"]]
             elif v["type"] == "VMFS":
@@ -222,6 +200,7 @@ class VMWareService(CRUDService):
                 )
                 matches = v["extent"]
             else:
+                self.logger.debug("Unknown volume type %r", v["type"])
                 continue
 
             datastores.append({
@@ -235,20 +214,21 @@ class VMWareService(CRUDService):
             for interface in self.middleware.call_sync("interface.query")
         ], [])
         iscsi_extents = defaultdict(list)
-        for extent in self.middleware.call_sync("iscsi.extent.query"):
+        for extent in self.middleware.call_sync("iscsi.extent.query", [], {"select": ["path", "naa"]}):
             if extent["path"].startswith("zvol/"):
                 zvol = extent["path"][len("zvol/"):]
                 iscsi_extents[zvol].append(f"naa.{extent['naa'][2:]}")
         filesystems = []
-        for fs in self.middleware.call_sync("pool.dataset.query", [
-            ("pool", "in", [vol["name"] for vol in self.middleware.call_sync("pool.query")]),
-        ]):
+        for fs in self.call_sync2(
+            self.s.zfs.resource.list_impl, ZFSResourceQuery(properties=['mountpoint'], get_children=True)
+        ):
             if fs["type"] == "FILESYSTEM":
+                mountpoint = fs['properties']['mountpoint']['raw']
                 filesystems.append({
                     "type": "FILESYSTEM",
                     "name": fs["name"],
-                    "description": f"NFS mount {fs['mountpoint']!r} on {' or '.join(ip_addresses)}",
-                    "matches": [f"{ip_address}:{fs['mountpoint']}" for ip_address in ip_addresses],
+                    "description": f"NFS mount {mountpoint!r} on {' or '.join(ip_addresses)}",
+                    "matches": [f"{ip_address}:{mountpoint}" for ip_address in ip_addresses],
                 })
 
             if fs["type"] == "VOLUME":
@@ -280,14 +260,7 @@ class VMWareService(CRUDService):
         self.middleware.call_sync('network.general.will_perform_activity', 'vmware')
 
         try:
-            ssl_context = ssl.SSLContext(ssl.PROTOCOL_SSLv23)
-            ssl_context.verify_mode = ssl.CERT_NONE
-            server_instance = connect.SmartConnect(
-                host=data['hostname'],
-                user=data['username'],
-                pwd=data['password'],
-                sslContext=ssl_context,
-            )
+            server_instance = self.connect(data)
         except (vim.fault.InvalidLogin, vim.fault.NoPermission, vim.fault.RestrictedVersion) as e:
             raise CallError(e.msg, errno.EPERM)
         except vmodl.RuntimeFault as e:
@@ -324,7 +297,7 @@ class VMWareService(CRUDService):
                         'local': host_mount_info.volume.local,
                         'ssd': host_mount_info.volume.ssd
                     }
-                elif host_mount_info.volume.type in ('NFS', 'NFS41'):
+                elif host_mount_info.volume.type in NFS_VOLUME_TYPES:
                     datastores[host_mount_info.volume.name] = {
                         'type': host_mount_info.volume.type,
                         'capacity': host_mount_info.volume.capacity,
@@ -345,43 +318,10 @@ class VMWareService(CRUDService):
 
         return datastores
 
-    @accepts(Int('pk'))
-    async def get_virtual_machines(self, pk):
-        """
-        Returns Virtual Machines on the VMWare host identified by `pk`.
-        """
-        await self.middleware.call('network.general.will_perform_activity', 'vmware')
-
-        item = await self.query([('id', '=', pk)], {'get': True})
-
-        ssl_context = ssl.SSLContext(ssl.PROTOCOL_SSLv23)
-        ssl_context.verify_mode = ssl.CERT_NONE
-        server_instance = connect.SmartConnect(
-            host=item['hostname'],
-            user=item['username'],
-            pwd=item['password'],
-            sslContext=ssl_context,
-        )
-
-        content = server_instance.RetrieveContent()
-        objview = content.viewManager.CreateContainerView(content.rootFolder, [vim.VirtualMachine], True)
-        vm_view = objview.view
-        objview.Destroy()
-
-        vms = {}
-        for vm in vm_view:
-            data = {
-                'uuid': vm.config.uuid,
-                'name': vm.name,
-                'power_state': vm.summary.runtime.powerState,
-            }
-            vms[vm.config.uuid] = data
-        return vms
-
-    @accepts(Str('dataset'), Bool('recursive'))
+    @api_method(VMWareDatasetHasVmsArgs, VMWareDatasetHasVmsResult, roles=['READONLY_ADMIN'])
     def dataset_has_vms(self, dataset, recursive):
         """
-        Returns "true" if `dataset` is configured with a VMWare snapshot
+        Returns "true" if ``dataset`` is configured with a VMWare snapshot.
         """
         return len(self._dataset_get_vms(dataset, recursive)) > 0
 
@@ -403,8 +343,6 @@ class VMWareService(CRUDService):
 
     @private
     def snapshot_proceed(self, dataset, qs):
-        self.middleware.call_sync('network.general.will_perform_activity', 'vmware')
-
         # Generate a unique snapshot name that won't collide with anything that exists on the VMWare side.
         vmsnapname = str(uuid.uuid4())
 
@@ -419,6 +357,12 @@ class VMWareService(CRUDService):
         # all the snaps we created in the first place.
         vmsnapobjs = []
         for vmsnapobj in qs:
+            if not self.middleware.call_sync('network.general.can_perform_activity', 'vmware'):
+                self.set_vmsnapobj_state(vmsnapobj, {
+                    "state": "BLOCKED",
+                })
+                continue
+
             # Data structures that will be used to keep track of VMs that are snapped,
             # as wel as VMs we tried to snap and failed, and VMs we realized we couldn't
             # snapshot.
@@ -427,14 +371,11 @@ class VMWareService(CRUDService):
             snapvmskips = []
 
             try:
-                ssl_context = ssl.SSLContext(ssl.PROTOCOL_SSLv23)
-                ssl_context.verify_mode = ssl.CERT_NONE
-                si = connect.SmartConnect(host=vmsnapobj["hostname"], user=vmsnapobj["username"],
-                                          pwd=vmsnapobj["password"], sslContext=ssl_context)
+                si = self.connect(vmsnapobj)
                 content = si.RetrieveContent()
             except Exception as e:
-                self.logger.warn("VMware login to %s failed", vmsnapobj["hostname"], exc_info=True)
-                self._alert_vmware_login_failed(vmsnapobj, e)
+                self.logger.warning("VMware login to %s failed", vmsnapobj["hostname"], exc_info=True)
+                self.alert_vmware_login_failed(vmsnapobj, e)
                 continue
 
             # There's no point to even consider VMs that are paused or powered off.
@@ -472,17 +413,17 @@ class VMWareService(CRUDService):
                             snapvmskips.append([vm.config.uuid, vm.name])
                     except Exception as e:
                         self.logger.warning("Snapshot of VM %s failed", vm.name, exc_info=True)
-                        self.middleware.call_sync("alert.oneshot_create", "VMWareSnapshotCreateFailed", {
-                            "hostname": vmsnapobj["hostname"],
-                            "vm": vm.name,
-                            "snapshot": vmsnapname,
-                            "error": self._vmware_exception_message(e),
-                        })
+                        self.call_sync2(self.s.alert.oneshot_create, VMWareSnapshotCreateFailedAlert(
+                            hostname=vmsnapobj["hostname"],
+                            vm=vm.name,
+                            snapshot=vmsnapname,
+                            error=self._vmware_exception_message(e),
+                        ))
                         snapvmfails.append([vm.config.uuid, vm.name])
 
                     snapvms.append(vm.config.uuid)
 
-            connect.Disconnect(si)
+            self.disconnect(si)
 
             vmsnapobjs.append({
                 "vmsnapobj": vmsnapobj,
@@ -513,40 +454,35 @@ class VMWareService(CRUDService):
             vmsnapobj = elem["vmsnapobj"]
 
             try:
-                ssl_context = ssl.SSLContext(ssl.PROTOCOL_SSLv23)
-                ssl_context.verify_mode = ssl.CERT_NONE
-                si = connect.SmartConnect(host=vmsnapobj["hostname"], user=vmsnapobj["username"],
-                                          pwd=vmsnapobj["password"], sslContext=ssl_context)
-                self._delete_vmware_login_failed_alert(vmsnapobj)
+                si = self.connect(vmsnapobj)
+                self.delete_vmware_login_failed_alert(vmsnapobj)
             except Exception as e:
                 self.logger.warning("VMware login failed to %s", vmsnapobj["hostname"])
-                self._alert_vmware_login_failed(vmsnapobj, e)
+                self.alert_vmware_login_failed(vmsnapobj, e)
                 continue
 
             # vm is an object, so we'll dereference that object anywhere it's user facing.
             for vm_uuid in elem["snapvms"]:
-                for vm in si.content.searchIndex.FindAllByUuid(None, vm_uuid, True):
+                for vm in self.find_vms_by_uuid(si, vm_uuid):
                     if [vm_uuid, vm.name] not in elem["snapvmfails"] and [vm_uuid, vm.name] not in elem["snapvmskips"]:
-                        snap = self._findVMSnapshotByName(vm, vmsnapname)
                         try:
-                            if snap:
-                                VimTask.WaitForTask(snap.RemoveSnapshot_Task(True))
+                            self.delete_snapshot(vm, vmsnapname)
                         except Exception as e:
-                            self.logger.debug("Exception removing snapshot %s on %s", vmsnapname, vm.name, exc_info=True)
-                            self.middleware.call_sync("alert.oneshot_create", "VMWareSnapshotDeleteFailed", {
-                                "hostname": vmsnapobj["hostname"],
-                                "vm": vm.name,
-                                "snapshot": vmsnapname,
-                                "error": self._vmware_exception_message(e),
-                            })
+                            self.logger.debug(
+                                "Exception removing snapshot %s on %s", vmsnapname, vm.name, exc_info=True
+                            )
+                            self.call_sync2(self.s.alert.oneshot_create, VMWareSnapshotDeleteFailedAlert(
+                                hostname=vmsnapobj["hostname"],
+                                vm=vm.name,
+                                snapshot=vmsnapname,
+                                error=self._vmware_exception_message(e),
+                            ))
 
-            connect.Disconnect(si)
+            self.disconnect(si)
 
     @private
     def periodic_snapshot_task_begin(self, task_id):
-        task = self.middleware.call_sync("pool.snapshottask.query",
-                                         [["id", "=", task_id]],
-                                         {"get": True})
+        task = self.call_sync2(self.s.pool.snapshottask.get_instance, task_id)
 
         # If there's a VMWare Plugin object for this filesystem
         # snapshot the VMs before taking the ZFS snapshot.
@@ -554,24 +490,44 @@ class VMWareService(CRUDService):
         # to VMWare and destroy all the VMWare snapshots we created.
         # We do this because having VMWare snapshots in existence impacts
         # the performance of your VMs.
-        qs = self._dataset_get_vms(task["dataset"], task["recursive"])
+        qs = self._dataset_get_vms(task.dataset, task.recursive)
         if qs:
             return {
-                "dataset": task["dataset"],
+                "dataset": task.dataset,
                 "qs": qs,
             }
 
-    @private
-    @accepts(Any("context", private=True))
+    @api_method(VMWarePeriodicSnapshotTaskProceedArgs, VMWarePeriodicSnapshotTaskProceedResult, private=True)
     @job()
     def periodic_snapshot_task_proceed(self, job, context):
         return self.snapshot_proceed(context["dataset"], context["qs"])
 
-    @private
-    @accepts(Any("context", private=True))
+    @api_method(VMWarePeriodicSnapshotTaskEndArgs, VMWarePeriodicSnapshotTaskEndResult, private=True)
     @job()
     def periodic_snapshot_task_end(self, job, context):
         return self.snapshot_end(context)
+
+    @private
+    def connect(self, vmsnapobj):
+        ssl_context = ssl.SSLContext(ssl.PROTOCOL_SSLv23)
+        ssl_context.verify_mode = ssl.CERT_NONE
+        si = connect.SmartConnect(host=vmsnapobj["hostname"], user=vmsnapobj["username"],
+                                  pwd=vmsnapobj["password"], sslContext=ssl_context)
+        return si
+
+    @private
+    def disconnect(self, si):
+        connect.Disconnect(si)
+
+    @private
+    def find_vms_by_uuid(self, si, vm_uuid):
+        return si.content.searchIndex.FindAllByUuid(None, vm_uuid, True)
+
+    @private
+    def delete_snapshot(self, vm, vmsnapname):
+        snap = self._findVMSnapshotByName(vm, vmsnapname)
+        if snap:
+            VimTask.WaitForTask(snap.RemoveSnapshot_Task(True))
 
     # Check if a VM is using a certain datastore
     def _doesVMDependOnDataStore(self, vm, dataStore):
@@ -587,6 +543,8 @@ class VMWareService(CRUDService):
                 if device.backing is None:
                     continue
                 if hasattr(device.backing, 'fileName'):
+                    if device.backing.datastore is None:
+                        continue
                     if device.backing.datastore.info.name == dataStore:
                         return True
         except Exception:
@@ -643,14 +601,44 @@ class VMWareService(CRUDService):
         else:
             return str(e)
 
-    def _alert_vmware_login_failed(self, vmsnapobj, e):
-        self.middleware.call_sync("alert.oneshot_create", "VMWareLoginFailed", {
-            "hostname": vmsnapobj["hostname"],
-            "error": self._vmware_exception_message(e),
+    @private
+    def alert_vmware_login_failed(self, vmsnapobj, e):
+        error = self._vmware_exception_message(e)
+        self.call_sync2(self.s.alert.oneshot_create, VMWareLoginFailedAlert(
+            hostname=vmsnapobj["hostname"],
+            error=error,
+        ))
+        self.set_vmsnapobj_state(vmsnapobj, {
+            "state": "ERROR",
+            "error": error,
         })
 
-    def _delete_vmware_login_failed_alert(self, vmsnapobj):
-        self.middleware.call_sync("alert.oneshot_delete", "VMWareLoginFailed", vmsnapobj["hostname"])
+    @private
+    def delete_vmware_login_failed_alert(self, vmsnapobj):
+        self.call_sync2(self.s.alert.oneshot_delete, "VMWareLoginFailed", vmsnapobj["hostname"])
+        self.set_vmsnapobj_state(vmsnapobj, {
+            "state": "SUCCESS",
+        })
+
+    @private
+    def set_vmsnapobj_state(self, vmsnapobj, state):
+        for vmware in self.middleware.call_sync(
+            "datastore.query",
+            "storage.vmwareplugin",
+            [["hostname", "=", vmsnapobj["hostname"]],
+             ["username", "=", vmsnapobj["username"]]],
+        ):
+            if vmware["password"] == vmsnapobj["password"]:  # These need to be decoded to be compared
+                self.set_vmsnapobj_state_by_id(vmware["id"], state)
+
+    @private
+    def set_vmsnapobj_state_by_id(self, id_, state):
+        self.middleware.call_sync("datastore.update", "storage.vmwareplugin", id_, {
+            "state": {
+                **state,
+                "datetime": utc_now(),
+            },
+        })
 
 
 async def setup(middleware):

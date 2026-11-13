@@ -1,0 +1,141 @@
+import os
+import subprocess
+
+from truenas_verify import mtree_verify
+
+from middlewared.utils.jsonpath import query_filters_json_path_parse, query_select_json_path_parse
+from middlewared.utils.rootfs_protection import rootfs_protection_lock
+
+AUDIT_DATASET_PATH = '/audit'
+AUDIT_LIFETIME = 7
+AUDIT_DEFAULT_RESERVATION = 0
+AUDIT_DEFAULT_QUOTA = 0
+AUDIT_DEFAULT_FILL_CRITICAL = 95
+AUDIT_DEFAULT_FILL_WARNING = 75
+AUDIT_REPORTS_DIR = os.path.join(AUDIT_DATASET_PATH, 'reports')
+AUDITED_SERVICES = (('MIDDLEWARE', 0.1), ('S3', 0.1), ('SMB', 0.1), ('SUDO', 0.1), ('SYSTEM', 0.1))
+SQL_SAFE_FIELDS = frozenset([
+    'audit_id',
+    'message_timestamp',
+    'address',
+    'username',
+    'session',
+    'service',
+    'event',
+    'success',
+])
+AUDIT_LOG_PATH_NAME = mtree_verify.LOG_PATH_NAME
+# Number of entries yielded by our batched iterator. This should match
+# the max limit for audit pagination so that we only ever have to deal
+# with one batch
+AUDIT_CHUNK_SZ = 10000  # number of audit entries yielded by iterator
+
+
+def audit_program(svc: str) -> str:
+    if svc == 'SUDO':
+        return 'sudo'
+    else:
+        return f'TNAUDIT_{svc}'
+
+
+def audit_custom_section(svc: str, section: str) -> bool:
+    """
+    Can be used to control whether generic SVC mako rendering applies for this section/service.
+    """
+    if svc == 'SUDO' and section == 'log':
+        return True
+    return False
+
+
+def audit_file_path(svc: str) -> str:
+    return f'{AUDIT_DATASET_PATH}/{svc}.db'
+
+
+def parse_filter(filter_in, filters_out):
+    # handle OR
+    if len(filter_in) == 2:
+        if filter_in[0] != 'OR':
+            raise ValueError(f'{filter_in}: invalid filter')
+
+        or_filters = []
+        for f in filter_in[1]:
+            parse_filter(f, or_filters)
+
+        filters_out.append(['OR', or_filters])
+
+        return
+
+    if len(filter_in) != 3:
+        raise ValueError(f'{filter_in}: invalid filter')
+
+    # check operation field
+    if filter_in[0] == 'service':
+        # Since we are now limiting to a single service we'll
+        # just ignore filters that try to change what service
+        # we're querying. The filter would either have no effect at
+        # all or change the query to have no results. Neither option
+        # is particularly useful
+        return
+
+    if filter_in[0] not in SQL_SAFE_FIELDS:
+        if not filter_in[0].startswith(('service_data', 'event_data')):
+            raise ValueError(
+                f'{filter_in[0]}: specified filter field may not be '
+                'specified for filtering on audit queries'
+            )
+
+    filters_out.append(filter_in)
+
+
+def parse_query_filters(filters: list) -> list:
+    """
+    NOTE: this method should only be called by audit.query
+
+    This method parses the user-provided query-filters and determines
+    whether they're safe to pass directly to the SQL backend. Non-safe
+    query-fiters will raise a ValueError that call site will change to
+    ValidationError. Filters containing nested JSON fields will be converted
+    into JSONPath notation and passed to sqlalchemy for optimized query.
+    """
+    filters_out = []
+
+    for f in filters:
+        parse_filter(f, filters_out)
+
+    return query_filters_json_path_parse(filters_out)
+
+
+def parse_query_options(options: dict) -> dict:
+    out = options.copy()
+    out['select'] = query_select_json_path_parse(options.get('select', []))
+    if out.get('get'):
+        # If we're only getting a single result then we can place an SQL
+        # LIMIT for a single result in the statement we generate
+        out['limit'] = 1
+    return out
+
+
+def setup_truenas_verify(sysver: str) -> int:
+    """
+    Called by audit setup to generate the initial truenas_verify
+    file for an updated or initial TrueNAS version.
+    """
+    if os.path.exists('/data/skip-truenas-verify'):
+        # Takes too much time on developer middleware restart
+        return 0
+
+    # do_verify reads the whole rootfs to build the as-installed baseline. It
+    # runs as a first-boot system.ready handler alongside boot.update_initramfs,
+    # which overlays a read-only functioning-dpkg sysext on /usr for the duration
+    # of its rebuild. Reading /usr while that overlay is mounted captures the
+    # overlay's dpkg files instead of the installed ones (spurious discrepancies),
+    # so take the same lock boot.update_initramfs holds across the rebuild.
+    #
+    # Run it as a separate program instead of calling mtree_verify.do_verify()
+    # in this process. It uses multiprocessing.Pool, whose forked workers
+    # inherit middlewared's SIGTERM handler and cannot be terminated by the
+    # pool. This thread then deadlocks with a worker while holding the lock.
+    with rootfs_protection_lock():
+        verify_rc = subprocess.run(['truenas_verify', 'init', sysver]).returncode
+
+    return verify_rc

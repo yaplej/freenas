@@ -1,7 +1,8 @@
 from collections import defaultdict
 
+from middlewared.api import api_method
+from middlewared.api.current import NetworkGeneralSummaryArgs, NetworkGeneralSummaryResult
 from middlewared.service import Service
-from middlewared.schema import Dict, List, IPAddr, returns, accepts
 
 
 class NetworkGeneralService(Service):
@@ -10,24 +11,13 @@ class NetworkGeneralService(Service):
         namespace = 'network.general'
         cli_namespace = 'network.general'
 
-    @accepts()
-    @returns(
-        Dict(
-            'network_summary',
-            Dict('ips', additional_attrs=True, required=True),
-            List('default_routes', items=[IPAddr('default_route')], required=True),
-            List('nameservers', items=[IPAddr('nameserver')], required=True),
-        )
-    )
+    @api_method(NetworkGeneralSummaryArgs, NetworkGeneralSummaryResult, roles=['NETWORK_GENERAL_READ'])
     async def summary(self):
         """
         Retrieve general information for current Network.
 
-        Returns a dictionary. For example:
+        Returns a dictionary. For example::
 
-        .. examples(websocket)::
-
-            :::javascript
             {
                 "ips": {
                     "vtnet0": {
@@ -56,11 +46,11 @@ class NetworkGeneralService(Service):
                 ips[iface['name']][key].append(f'{alias["address"]}/{alias["netmask"]}')
 
         default_routes = dict()
-        for route in await self.middleware.call('route.system_routes', [('netmask', 'in', ['0.0.0.0', '::'])]):
+        for route in await self.call2(self.s.route.system_routes, [('netmask', 'in', ['0.0.0.0', '::'])]):
             # IPv6 have local addresses that don't have gateways. Make sure we only return a gateway
             # if there is one.
-            if route['gateway']:
-                default_routes[route['gateway']] = None
+            if route.gateway:
+                default_routes[str(route.gateway)] = None
 
         nameservers = dict()
         for ns in await self.middleware.call('dns.query'):

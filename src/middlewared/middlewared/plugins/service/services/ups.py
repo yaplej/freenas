@@ -1,0 +1,60 @@
+from middlewared.api.current import ServiceOptions
+from middlewared.service_exception import CallError
+
+from .base import SimpleService
+
+
+class UPSService(SimpleService):
+    name = "ups"
+    etc = ["ups"]
+    systemd_unit = "nut-monitor"
+
+    async def check_configuration(self) -> None:
+        config = await self.middleware.call("ups.config")
+        prefix = "UPS service cannot start:"
+        if config.mode == "MASTER":
+            if not config.driver:
+                raise CallError(f"{prefix} driver is required for MASTER mode")
+            if not config.port:
+                raise CallError(f"{prefix} port is required for MASTER mode")
+        else:
+            if not config.remotehost:
+                raise CallError(f"{prefix} remote host is required for SLAVE mode")
+
+    async def systemd_extra_units(self) -> list[str]:
+        if (await self.middleware.call("ups.config")).mode == "MASTER":
+            return ["nut-driver-enumerator", "nut-server", "nut.target"]
+        else:
+            return ["nut.target"]
+
+    async def before_start(self) -> None:
+        await self.middleware.call("ups.dismiss_alerts")
+
+    async def start(self) -> None:
+        if (await self.middleware.call("ups.config")).mode == "MASTER":
+            await self._systemd_unit("nut-server", "start")
+            await self._systemd_unit("nut-driver-enumerator", "start")
+        await self._unit_action("Start")
+
+    async def after_start(self) -> None:
+        # Restart netdata to pick up UPS config changes
+        await (await self.call2(self.s.service.control, 'RESTART', 'netdata')).wait(raise_error=True)
+        # Reconfigure discovery (add nut service)
+        await (
+            await self.call2(self.s.service.control, 'RELOAD', 'discovery', ServiceOptions(ha_propagate=False))
+        ).wait(raise_error=True)
+
+    async def before_stop(self) -> None:
+        await self.middleware.call("ups.dismiss_alerts")
+
+    async def stop(self) -> None:
+        await self._unit_action("Stop")
+        await self._systemd_unit("nut-driver-enumerator", "stop")
+        await self._systemd_unit("nut-server", "stop")
+        await self._systemd_unit("nut-driver.target", "stop")
+
+    async def after_stop(self) -> None:
+        # Reconfigure discovery (remove nut service)
+        await (
+            await self.call2(self.s.service.control, 'RELOAD', 'discovery', ServiceOptions(ha_propagate=False))
+        ).wait(raise_error=True)

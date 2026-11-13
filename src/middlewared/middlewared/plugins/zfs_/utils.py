@@ -1,17 +1,63 @@
-# -*- coding=utf-8 -*-
 import enum
-import logging
 import os
 
-logger = logging.getLogger(__name__)
+from truenas_os_pyutils.mount import statmount
 
-__all__ = ["zvol_name_to_path", "zvol_path_to_name"]
+from middlewared.plugins.audit.utils import AUDIT_DEFAULT_FILL_CRITICAL, AUDIT_DEFAULT_FILL_WARNING
+from middlewared.service_exception import CallError
+from middlewared.utils.boot.pool import BOOT_POOL_NAME_VALID
+from middlewared.utils.path import is_child
+
+__all__ = [
+    "path_to_dataset_impl",
+    "paths_to_datasets_impl",
+    "zvol_name_to_path",
+    "zvol_path_to_name",
+]
+
+LEGACY_USERPROP_PREFIX = 'org.freenas'
+USERPROP_PREFIX = 'org.truenas'
 
 
-class ZFSCTL(enum.IntEnum):
-    # from include/os/linux/zfs/sys/zfs_ctldir.h in ZFS repo
-    INO_ROOT = 0x0000FFFFFFFFFFFF
-    INO_SNAPDIR = 0x0000FFFFFFFFFFFD
+class TNUserProp(enum.Enum):
+    DESCRIPTION = f'{LEGACY_USERPROP_PREFIX}:description'
+    QUOTA_WARN = f'{LEGACY_USERPROP_PREFIX}:quota_warning'
+    QUOTA_CRIT = f'{LEGACY_USERPROP_PREFIX}:quota_critical'
+    REFQUOTA_WARN = f'{LEGACY_USERPROP_PREFIX}:refquota_warning'
+    REFQUOTA_CRIT = f'{LEGACY_USERPROP_PREFIX}:refquota_critical'
+    MANAGED_BY = f'{USERPROP_PREFIX}:managedby'
+
+    def default(self) -> int:
+        # NOTE: DONT CHANGE THESE VALUES WITHOUT CHANGING
+        # THE UX! The UX has hard-coded these values on
+        # a form and so changing them here will cause
+        # confusion for end-user.
+        match self:
+            case TNUserProp.QUOTA_WARN:
+                return 80
+            case TNUserProp.QUOTA_CRIT:
+                return 95
+            case TNUserProp.REFQUOTA_WARN:
+                return 80
+            case TNUserProp.REFQUOTA_CRIT:
+                return 95
+            case _:
+                raise ValueError(f'{self.value}: no default value is set')
+
+    def audit_quotas():
+        # The audit dataset defaults to its own warning/critical
+        # thresholds rather than the general-purpose values
+        # from default(). Only a default: the on-disk user properties (which
+        # can be changed by the user) take precedence when present.
+        return [
+            (TNUserProp.QUOTA_WARN.value, AUDIT_DEFAULT_FILL_WARNING),
+            (TNUserProp.QUOTA_CRIT.value, AUDIT_DEFAULT_FILL_CRITICAL),
+            (TNUserProp.REFQUOTA_WARN.value, AUDIT_DEFAULT_FILL_WARNING),
+            (TNUserProp.REFQUOTA_CRIT.value, AUDIT_DEFAULT_FILL_CRITICAL),
+        ]
+
+    def values():
+        return [a.value for a in TNUserProp]
 
 
 def zvol_name_to_path(name):
@@ -25,88 +71,49 @@ def zvol_path_to_name(path):
     return path[len("/dev/zvol/"):].replace("+", " ")
 
 
-def unlocked_zvols_fast(options=None, data=None):
+def paths_to_datasets_impl(
+    paths: list[str],
+) -> dict[str, str | None]:
     """
-    Get zvol information from /sys/block and /dev/zvol.
-    This is quite a bit faster than using py-libzfs.
+    Convert `paths` to a dictionary of ZFS dataset names. This
+    performs lookup through mountinfo.
 
-    supported options:
-    `SIZE` - size of zvol
-    `DEVID` - the device id of the zvol
-    `RO` - whether zvol is flagged as ro (snapshot)
-    `ATTACHMENT` - where zvol is currently being used
-
-    If 'ATTACHMENT' is used, then dict of attachemnts
-    should be provided under `data` key `attachments`
+    Anticipated error conditions are that paths are not
+    on ZFS or if the boot pool underlies the path. In
+    addition to this, all the normal exceptions that
+    can be raised by a failed call to os.stat() are
+    possible. If any exception occurs, the dataset name
+    will be set to None in the dictionary.
     """
-    def get_size(zvol_dev):
-        with open(f'/sys/block/{zvol_dev}/size', 'r') as f:
-            nblocks = f.readline()
+    rv = dict()
 
-        return int(nblocks[:-1]) * 512
+    for path in paths:
+        try:
+            rv[path] = path_to_dataset_impl(path)
+        except Exception:
+            rv[path] = None
 
-    def get_devid(zvol_dev):
-        with open(f'/sys/block/{zvol_dev}/dev', 'r') as f:
-            devid = f.readline()
-        return devid[:-1]
+    return rv
 
-    def get_ro(zvol_dev):
-        with open(f'/sys/block/{zvol_dev}/ro', 'r') as f:
-            ro = f.readline()
-        return ro[:-1] == '1'
 
-    def get_attachment(zvol_vdev, data):
-        out = None
-        for method, attachment in data.items():
-            val = attachment.pop(zvol_vdev, None)
-            if val is not None:
-                out = {
-                    'method': method,
-                    'data': val
-                }
-                break
+def path_to_dataset_impl(path: str) -> str:
+    """
+    Convert `path` to a ZFS dataset name. This
+    performs lookup through mountinfo.
 
-        return out
+    Anticipated error conditions are that path is not
+    on ZFS or if the boot pool underlies the path. In
+    addition to this, all the normal exceptions that
+    can be raised by a failed call to os.stat() are
+    possible.
+    """
+    sm = statmount(path=path, as_dict=False)
+    if sm.fs_type != 'zfs':
+        raise CallError(f'{path}: path is not a ZFS filesystem')
 
-    def get_zvols(info_level, data):
-        out = {}
-        zvol_path = '/dev/zvol/'
-        do_get_size = 'SIZE' in info_level
-        do_get_dev = 'DEVID' in info_level
-        do_get_ro = 'RO' in info_level
-        do_get_attachment = 'ATTACHMENT' in info_level
+    ds_name = sm.sb_source
+    for bp_name in BOOT_POOL_NAME_VALID:
+        if is_child(ds_name, bp_name):
+            raise CallError(f'{path}: path is on boot pool')
 
-        for root, dirs, files in os.walk(zvol_path):
-            if not files:
-                continue
-
-            for file in files:
-                path = root + '/' + file
-                zvol_name = zvol_path_to_name(path)
-                dev_name = os.readlink(path).split('/')[-1]
-
-                out.update({
-                    zvol_name: {
-                        'path': path,
-                        'name': zvol_name,
-                        'dev': dev_name,
-                    }
-                })
-
-                if do_get_size is True:
-                    out[zvol_name]['size'] = get_size(dev_name)
-
-                if do_get_dev is True:
-                    out[zvol_name]['devid'] = get_devid(dev_name)
-
-                if do_get_ro is True:
-                    out[zvol_name]['ro'] = get_ro(dev_name)
-
-                if do_get_attachment:
-                    out[zvol_name]['attachment'] = get_attachment(zvol_name, data.get('attachments', {}))
-
-        return out
-
-    info_level = options or []
-    zvols = get_zvols(info_level, data or {})
-    return zvols
+    return ds_name

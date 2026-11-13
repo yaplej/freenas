@@ -1,108 +1,184 @@
-import re
+# Copyright (c) - iXsystems Inc. dba TrueNAS
+#
+# Licensed under the terms of the TrueNAS Enterprise License Agreement
+# See the file LICENSE.IX for complete terms and conditions
+from __future__ import annotations
 
-from middlewared.alert.base import AlertClass, AlertCategory, AlertLevel, AlertSource, Alert
+from dataclasses import dataclass
+import time
+from typing import TYPE_CHECKING, Any
 
-RE_CPUTEMP = re.compile(r'^cpu.*temp$', re.I)
-RE_SYSFAN = re.compile(r'^sys_fan\d+$', re.I)
+from middlewared.alert.applicability import TRUENAS_HARDWARE
+from middlewared.alert.base import (
+    Alert,
+    AlertCategory,
+    AlertClass,
+    AlertClassConfig,
+    AlertLevel,
+    AlertSource,
+    UnavailableException,
+)
+from middlewared.utils.crypto import generate_token
 
-PS_FAILURES = [
-    (0x2, "Failure detected"),
-    (0x4, "Predictive failure"),
-    (0x8, "Power Supply AC lost"),
-    (0x10, "AC lost or out-of-range"),
-    (0x20, "AC out-of-range, but present"),
-]
-
-
-class SensorAlertClass(AlertClass):
-    category = AlertCategory.HARDWARE
-    level = AlertLevel.CRITICAL
-    title = "Sensor Value Is Outside of Working Range"
-    text = "Sensor %(name)s is %(relative)s %(level)s value: %(value)d %(description)s"
-    products = ("SCALE_ENTERPRISE",)
+if TYPE_CHECKING:
+    from middlewared.main import Middleware
 
 
-class PowerSupplyAlertClass(AlertClass):
-    category = AlertCategory.HARDWARE
-    level = AlertLevel.CRITICAL
-    title = "Power Supply Failed"
-    text = "Power supply %(number)s failed: %(errors)s."
-    products = ("SCALE_ENTERPRISE",)
+@dataclass(kw_only=True)
+class SensorAlert(AlertClass):
+    config = AlertClassConfig(
+        category=AlertCategory.HARDWARE,
+        level=AlertLevel.CRITICAL,
+        title="Sensor Value Is Outside of Working Range",
+        text="Sensor %(name)s is %(relative)s %(level)s value: %(value)s %(event)s",
+        applies_to=TRUENAS_HARDWARE,
+    )
+
+    name: str
+    relative: str
+    level: str
+    value: object
+    event: str
+
+
+@dataclass(kw_only=True)
+class PowerSupplyAlert(AlertClass):
+    config = AlertClassConfig(
+        category=AlertCategory.HARDWARE,
+        level=AlertLevel.CRITICAL,
+        title="Power Supply Error",
+        text=(
+            "%(psu)s is %(state)s showing: %(errors)s. Contact support. Incident ID: %(id)s"
+        ),
+        applies_to=TRUENAS_HARDWARE,
+        proactive_support=True,
+        proactive_support_notify_gone=True,
+    )
+
+    id: str
+    psu: str
+    state: str
+    errors: str
+
+
+class PsuAlertSource(AlertSource):
+    applies_to = TRUENAS_HARDWARE
+
+    def __init__(self, middleware: Middleware) -> None:
+        super().__init__(middleware)
+        self.last_failure = time.monotonic()
+        self.incident_id: str | None = None
+        self._30mins = 30 * 60
+
+    async def should_alert(self) -> bool:
+        if (await self.middleware.call("system.dmidecode_info"))[
+            "system-product-name"
+        ].startswith("TRUENAS-R"):
+            # r-series
+            return True
+        elif await self.middleware.call("failover.hardware") == "ECHOWARP":
+            # m-series
+            return True
+
+        return False
+
+    async def check(self) -> list[Alert[Any]]:
+        alerts: list[Alert[Any]] = []
+        if not await self.should_alert():
+            return alerts
+
+        for i in await self.middleware.call("ipmi.sensors.query"):
+            if (
+                i["type"] == "Power Supply" and
+                i["state"] != "Nominal" and
+                i["reading"] != "N/A" and
+                i["event"]
+            ):
+                if time.monotonic() - self.last_failure > self._30mins:
+                    # we assume a PSU alert that has been around longer than
+                    # 30mins is justification for opening up a proactive ticket
+                    if self.incident_id is None:
+                        self.incident_id = generate_token(16, url_safe=True)
+                    alerts.append(
+                        Alert(
+                            PowerSupplyAlert(
+                                id=self.incident_id,
+                                psu=i["name"],
+                                state=i["state"],
+                                errors=", ".join(i["event"]),
+                            ),
+                        )
+                    )
+                else:
+                    raise UnavailableException()
+        return alerts
 
 
 class SensorsAlertSource(AlertSource):
-    async def check(self):
-        dmidecode_info = await self.middleware.call('system.dmidecode_info')
-        baseboard_manufacturer = dmidecode_info['baseboard-manufacturer']
-        system_product_name = dmidecode_info['system-product-name']
+    applies_to = TRUENAS_HARDWARE
 
-        failover_hardware = await self.middleware.call("failover.hardware")
+    async def should_alert(self) -> bool:
+        if (await self.middleware.call("system.dmidecode_info"))[
+            "system-product-name"
+        ].startswith("TRUENAS-R"):
+            # r-series
+            return True
+        elif await self.middleware.call("failover.hardware") == "ECHOWARP":
+            # m-series
+            return True
 
-        is_ix_hardware = await self.middleware.call("system.is_ix_hardware")
-        is_gigabyte = baseboard_manufacturer == "GIGABYTE"
-        is_m_series = baseboard_manufacturer == "Supermicro" and failover_hardware == "ECHOWARP"
-        is_r_series = system_product_name.startswith("TRUENAS-R")
-        is_freenas_certified = (
-            baseboard_manufacturer == "Supermicro" and system_product_name.startswith("FREENAS-CERTIFIED")
-        )
+        return False
 
-        alerts = []
-        for sensor in await self.middleware.call("sensor.query"):
-            if is_ix_hardware:
-                if sensor["name"] == "BAT":
-                    if alert := self._produce_sensor_alert(sensor):
-                        alerts.append(alert)
+    async def check(self) -> list[Alert[Any]] | Alert[Any]:
+        alerts: list[Alert[Any]] = []
+        if not await self.should_alert():
+            return alerts
 
-            if is_gigabyte:
-                if sensor["value"] is None:
-                    continue
+        for sensor in await self.middleware.call("ipmi.sensors.query"):
+            if (
+                sensor["type"] != "Power Supply" and
+                sensor["state"] != "Nominal" and
+                sensor["reading"] != "N/A" and
+                sensor["event"]
+            ):
+                reading = sensor["reading"]
+                for key in (
+                    "lower-non-recoverable",
+                    "lower-critical",
+                    "lower-non-critical",
+                ):
+                    if sensor[key] != "N/A" and reading < sensor[key]:
+                        relative = "below"
+                        level = (
+                            "recommended" if key == "lower-non-critical" else "critical"
+                        )
+                        return Alert(
+                            SensorAlert(
+                                name=sensor["name"],
+                                relative=relative,
+                                level=level,
+                                value=reading,
+                                event=", ".join(sensor["event"]),
+                            ),
+                        )
 
-                if not (RE_CPUTEMP.match(sensor["name"]) or RE_SYSFAN.match(sensor["name"])):
-                    continue
-
-                if alert := self._produce_sensor_alert(sensor):
-                    alerts.append(alert)
-
-            if is_m_series or is_r_series or is_freenas_certified:
-                ps_match = re.match("(PS[0-9]+) Status", sensor["name"])
-                if ps_match:
-                    ps = ps_match.group(1)
-
-                    if sensor["notes"]:
-                        alerts.append(Alert(
-                            PowerSupplyAlertClass,
-                            {
-                                "number": ps,
-                                "errors": ", ".join(sensor["notes"]),
-                            }
-                        ))
-
+                for key in (
+                    "upper-non-recoverable",
+                    "upper-critical",
+                    "upper-non-critical",
+                ):
+                    if sensor[key] != "N/A" and reading > sensor[key]:
+                        relative = "above"
+                        level = (
+                            "recommended" if key == "upper-non-critical" else "critical"
+                        )
+                        return Alert(
+                            SensorAlert(
+                                name=sensor["name"],
+                                relative=relative,
+                                level=level,
+                                value=reading,
+                                event=", ".join(sensor["event"]),
+                            ),
+                        )
         return alerts
-
-    def _produce_sensor_alert(self, sensor):
-        if sensor["lowarn"] and sensor["value"] < sensor["lowarn"]:
-            relative = "below"
-            if sensor["value"] < sensor["locrit"]:
-                level = "critical"
-            else:
-                level = "recommended"
-        elif sensor["hiwarn"] and sensor["value"] > sensor["hiwarn"]:
-            relative = "above"
-            if sensor["value"] > sensor["hicrit"]:
-                level = "critical"
-            else:
-                level = "recommended"
-        else:
-            return
-
-        return Alert(
-            SensorAlertClass,
-            {
-                "name": sensor["name"],
-                "relative": relative,
-                "level": level,
-                "value": sensor["value"],
-                "desc": sensor["desc"],
-            },
-            key=[sensor["name"], relative, level],
-        )

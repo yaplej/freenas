@@ -1,258 +1,240 @@
+# Copyright (c) - iXsystems Inc. dba TrueNAS
+#
+# Licensed under the terms of the TrueNAS Enterprise License Agreement
+# See the file LICENSE.IX for complete terms and conditions
+
 from collections import defaultdict
 from datetime import date, timedelta
 import textwrap
+from typing import Any
 
-from middlewared.alert.base import AlertClass, AlertCategory, AlertLevel, Alert, ThreadedAlertSource
-from middlewared.utils.license import LICENSE_ADDHW_MAPPING
+from truenas_pylicensed import LicenseType
 
-
-HW_MODELS = (
-    'X10', 'X20',
-    'M30', 'M40', 'M50', 'M60',
-    'R10', 'R20', 'R20A', 'R20B', 'R40', 'R50',
-    'Z20', 'Z30', 'Z35', 'Z50',
+from middlewared.alert.applicability import EXPECTED_TO_BE_LICENSED
+from middlewared.alert.base import (
+    Alert,
+    AlertCategory,
+    AlertClass,
+    AlertClassConfig,
+    AlertLevel,
+    NonDataclassAlertClass,
+    ThreadedAlertSource,
 )
+from middlewared.alert.schedule import IntervalSchedule
+from middlewared.api.current import MailSendMessage
+from middlewared.utils.license import LicenseOrigin
 
 
-class LicenseAlertClass(AlertClass):
-    category = AlertCategory.SYSTEM
-    level = AlertLevel.CRITICAL
-    title = "TrueNAS License Issue"
-    text = "%s"
-    products = ("SCALE_ENTERPRISE",)
+class LicenseAlert(NonDataclassAlertClass[str], AlertClass):
+    config = AlertClassConfig(
+        category=AlertCategory.SYSTEM,
+        level=AlertLevel.CRITICAL,
+        title="TrueNAS License Issue",
+        text="%s",
+        applies_to=EXPECTED_TO_BE_LICENSED,
+    )
 
 
-class LicenseIsExpiringAlertClass(AlertClass):
-    category = AlertCategory.SYSTEM
-    level = AlertLevel.WARNING
-    title = "TrueNAS License Is Expiring"
-    text = "%s"
-    products = ("SCALE_ENTERPRISE",)
+class LicenseIsExpiringAlert(NonDataclassAlertClass[str], AlertClass):
+    config = AlertClassConfig(
+        category=AlertCategory.SYSTEM,
+        level=AlertLevel.WARNING,
+        title="Support Contract Is Expiring",
+        text="%s",
+        applies_to=EXPECTED_TO_BE_LICENSED,
+    )
 
 
-class LicenseHasExpiredAlertClass(AlertClass):
-    category = AlertCategory.SYSTEM
-    level = AlertLevel.CRITICAL
-    title = "TrueNAS License Has Expired"
-    text = "%s"
-    products = ("SCALE_ENTERPRISE",)
+class LicenseHasExpiredAlert(NonDataclassAlertClass[str], AlertClass):
+    config = AlertClassConfig(
+        category=AlertCategory.SYSTEM,
+        level=AlertLevel.CRITICAL,
+        title="Support Contract Has Expired",
+        text="%s",
+        applies_to=EXPECTED_TO_BE_LICENSED,
+    )
 
 
 class LicenseStatusAlertSource(ThreadedAlertSource):
-    products = ("SCALE_ENTERPRISE",)
+    applies_to = EXPECTED_TO_BE_LICENSED
     run_on_backup_node = False
+    schedule = IntervalSchedule(timedelta(hours=24))
 
-    def check_sync(self):
-        alerts = []
+    def check_sync(self) -> list[Alert[Any]] | Alert[Any]:
+        alerts: list[Alert[Any]] = []
 
-        local_license = self.middleware.call_sync('system.license')
-        if local_license is None:
-            return Alert(LicenseAlertClass, "Your TrueNAS has no license, contact support.")
+        local_license = self.call_sync2(self.s.truenas.license.info_private)
+        # A system-generated record licenses no shelves, so the shelf check below would fire on it
+        # permanently.
+        if local_license is None or local_license.origin is LicenseOrigin.SYSTEM_GENERATED:
+            if not self.middleware.call_sync('system.is_ha_capable'):
+                return []
 
-        # check if this node's system serial matches the serial in the license
-        local_serial = self.middleware.call_sync('system.dmidecode_info')['system-serial-number']
-        if local_serial not in (local_license['system_serial'], local_license['system_serial_ha']):
-            alerts.append(Alert(LicenseAlertClass, 'System serial does not match license.'))
+            return Alert(LicenseAlert("Your TrueNAS has no license, contact support."))
 
-        standby_license = standby_serial = None
-        try:
-            if local_license['system_serial_ha']:
-                standby_license = self.middleware.call_sync('failover.call_remote', 'system.license')
-                standby_serial = self.middleware.call_sync(
-                    'failover.call_remote', 'system.dmidecode_info')['system-serial-number']
-        except Exception:
-            pass
+        model = self.middleware.call_sync('truenas.get_chassis_hardware').removeprefix('TRUENAS-').split('-')[0]
+        if local_license.type == LicenseType.ENTERPRISE:
+            # check if this node's system serial matches the serial in the license
+            local_serial = self.middleware.call_sync('system.dmidecode_info')['system-serial-number']
+            if local_serial not in local_license.serials:
+                alerts.append(Alert(LicenseAlert('System serial does not match license.')))
 
-        if standby_license and standby_serial is not None:
-            # check if the remote node's system serial matches the serial in the license
-            if standby_serial not in (standby_license['system_serial'], standby_license['system_serial_ha']):
-                alerts.append(Alert(LicenseAlertClass, 'System serial of standby node does not match license.',))
+            standby_license = standby_serial = None
+            try:
+                if self.middleware.call_sync('failover.licensed'):
+                    standby_license = self.middleware.call_sync('failover.call_remote', 'truenas.license.info')
+                    standby_serial = self.middleware.call_sync(
+                        'failover.call_remote', 'system.dmidecode_info')['system-serial-number']
+            except Exception:
+                pass
 
-        chassis_hardware = self.middleware.call_sync('truenas.get_chassis_hardware')
-        hardware = chassis_hardware.replace('TRUENAS-', '').split('-')
+            if standby_license and standby_serial is not None:
+                # check if the remote node's system serial matches the serial in the license
+                if standby_serial not in standby_license['serials']:
+                    alerts.append(Alert(LicenseAlert('System serial of standby node does not match license.')))
 
-        if hardware[0] == 'UNKNOWN':
-            alerts.append(Alert(LicenseAlertClass, 'TrueNAS is running on unsupported hardware.'))
-        else:
-            if hardware[0] == 'M':
-                if not local_license['model'].startswith('M'):
-                    alerts.append(Alert(
-                        LicenseAlertClass,
-                        (
-                            'Your license was issued for model "%s" but it was '
-                            ' detected as M series.'
-                        ) % local_license['model']
-                    ))
-            elif hardware[0] == 'X':
-                if not local_license['model'].startswith('X'):
-                    alerts.append(Alert(
-                        LicenseAlertClass,
-                        (
-                            'Your license was issued for model "%s" but it was '
-                            ' detected as X series.'
-                        ) % local_license['model']
-                    ))
-            elif hardware[0] == 'Z':
-                if not local_license['model'].startswith('Z'):
-                    alerts.append(Alert(
-                        LicenseAlertClass,
-                        (
-                            'Your license was issued for model "%s" but it was '
-                            ' detected as Z series.'
-                        ) % local_license['model']
-                    ))
-            else:
-                if hardware[0] in HW_MODELS:
-                    if hardware[0] != local_license['model']:
+            if model == 'UNKNOWN':
+                alerts.append(Alert(LicenseAlert('TrueNAS is running on unsupported hardware.')))
+            elif model != local_license.model:
+                alerts.append(Alert(
+                    LicenseAlert(
+                        f'Your license was issued for model {local_license.model!r} '
+                        f'but the system was detected as model {model!r}'
+                    )
+                ))
+
+            enc_nums: defaultdict[str, int] = defaultdict(lambda: 0)
+            for enc in filter(lambda x: not x['controller'], self.middleware.call_sync('enclosure2.query')):
+                enc_nums[enc['model']] += 1
+
+            if local_license.enclosures:
+                for name, quantity in local_license.enclosures.items():
+                    if name == 'ES60':
+                        continue
+
+                    if enc_nums[name] != quantity:
                         alerts.append(Alert(
-                            LicenseAlertClass,
-                            (
-                                'Your license was issued for model "%(license)s" '
-                                'but it was detected as "%(model)s".'
-                            ) % {
-                                'model': hardware[0],
-                                'license': local_license['model'],
-                            }
+                            LicenseAlert(
+                                'License expects %(license)s units of %(name)s Expansion shelf but found %(found)s.' % {
+                                    'license': quantity,
+                                    'name': name,
+                                    'found': enc_nums[name]
+                                }
+                            )
                         ))
+            elif enc_nums:
+                alerts.append(Alert(
+                    LicenseAlert(
+                        'Unlicensed Expansion shelf detected. '
+                        'This system is not licensed for additional expansion shelves.'
+                    )
+                ))
 
-        enc_nums = defaultdict(lambda: 0)
-        seen_ids = []
-        for enc in self.middleware.call_sync('enclosure.query'):
-            if enc['id'] in seen_ids:
-                continue
-            seen_ids.append(enc['id'])
-
-            if enc['controller']:
-                continue
-
-            enc_nums[enc['model']] += 1
-
-        if local_license['addhw']:
-            for quantity, code in local_license['addhw']:
-                if code not in LICENSE_ADDHW_MAPPING:
-                    self.middleware.logger.warning('Unknown additional hardware code %d', code)
-                    continue
-
-                name = LICENSE_ADDHW_MAPPING[code]
-
-                if name == 'ES60':
-                    continue
-
-                if enc_nums[name] != quantity:
-                    alerts.append(Alert(
-                        LicenseAlertClass,
-                        (
-                            'License expects %(license)s units of %(name)s Expansion shelf but found %(found)s.' % {
-                                'license': quantity,
-                                'name': name,
-                                'found': enc_nums[name]
-                            }
-                        )
-                    ))
-        elif enc_nums:
-            alerts.append(Alert(
-                LicenseAlertClass,
-                'Unlicensed Expansion shelf detected. This system is not licensed for additional expansion shelves.'
-            ))
-
-        if self.middleware.call_sync("failover.status") == "BACKUP":
+        if local_license.support_expires_at is None:
             return alerts
 
+        today = date.today()
         for days in [0, 14, 30, 90, 180]:
-            if local_license['contract_end'] <= date.today() + timedelta(days=days):
-                serial_numbers = ", ".join(list(filter(None, [local_license['system_serial'],
-                                                              local_license['system_serial_ha']])))
-                contract_start = local_license['contract_start'].strftime("%B %-d, %Y")
-                contract_expiration = local_license['contract_end'].strftime("%B %-d, %Y")
-                contract_type = local_license['contract_type'].lower()
-                customer_name = local_license['customer_name']
+            # `days == 0` is the lapsed bucket, and a contract is in force through its end date,
+            # so it asks the license rather than comparing against today inclusively.
+            if days == 0:
+                reached = local_license.support_lapsed(today)
+            else:
+                reached = local_license.support_expires_at <= today + timedelta(days=days)
 
+            if reached:
+                serial_numbers = ", ".join(list(filter(None, local_license.serials)))
+                contract_expiration = local_license.support_expires_at.strftime("%B %-d, %Y")
+
+                alert_klass: type[LicenseHasExpiredAlert] | type[LicenseIsExpiringAlert]
                 if days == 0:
-                    alert_klass = LicenseHasExpiredAlertClass
+                    alert_klass = LicenseHasExpiredAlert
                     alert_text = textwrap.dedent("""\
-                        SUPPORT CONTRACT EXPIRATION. To reactivate and continue to receive technical support and
-                        assistance, contact iXsystems @ telephone: 1-855-473-7449
+                        SUPPORT CONTRACT EXPIRED: Your support contract has ended. Renewal options may be
+                        available — contact sales@TrueNAS.com or 1-855-473-7449 to find out.
                     """)
                     subject = "Your TrueNAS support contract has expired"
                     opening = textwrap.dedent("""\
-                        As of today, your support contract has ended. You will no longer be eligible for technical
-                        support and assistance for your TrueNAS system.
+                        Your support contract has ended. Renewal options may be available depending on your
+                        situation. Please contact your authorized reseller or TrueNAS (sales@TrueNAS.com)
+                        to find out what may be possible.
                     """)
                     encouraging = textwrap.dedent("""\
-                        It is still not too late to renew your contract but you must do so as soon as possible by
-                        contacting your authorized TrueNAS Reseller or iXsystems (sales@iXsystems.com) today to avoid
-                        additional costs and lapsed-contract fees.
+                        Contact your authorized reseller or TrueNAS (email: sales@TrueNAS.com,
+                        phone: 1-855-473-7449) to find out what renewal options may be available to you.
                     """)
                 else:
-                    alert_klass = LicenseIsExpiringAlertClass
+                    alert_klass = LicenseIsExpiringAlert
                     alert_text = textwrap.dedent(f"""\
-                        RENEW YOUR SUPPORT contract. To continue to receive technical support and assistance without
-                        any service interruptions, please renew your support contract by {contract_expiration}.
+                        SUPPORT CONTRACT EXPIRING SOON: The support contract for this product expires
+                        on {contract_expiration}. Renewal options may be available — contact your authorized
+                        reseller or TrueNAS: sales@TrueNAS.com, 1-855-473-7449.
                     """)
-                    subject = f"Your TrueNAS support contract will expire in {days} days"
+                    days_left = (local_license.support_expires_at - today).days
+                    if days_left == 0:
+                        subject = "Your TrueNAS support contract expires today"
+                    elif days_left == 1:
+                        subject = "Your TrueNAS support contract will expire in 1 day"
+                    else:
+                        subject = f"Your TrueNAS support contract will expire in {days_left} days"
+
                     if days == 14:
-                        opening = textwrap.dedent(f"""\
-                            This is the final reminder regarding the impending expiration of your TrueNAS
-                            {contract_type} support contract. As of today, it is set to expire in 2 weeks.
+                        opening = textwrap.dedent("""\
+                            Your TrueNAS support contract is approaching its expiration date.
+                            Renewal options may be available — we suggest contacting us before expiration.
                         """)
                         encouraging = textwrap.dedent("""\
-                            We encourage you to urgently contact your authorized TrueNAS Reseller or iXsystems
-                            (sales@iXsystems.com) directly to renew your contract before expiration so that you continue
-                            to enjoy the peace of mind and benefits that come with our support contracts.
+                            Contact your authorized reseller or TrueNAS (email: sales@TrueNAS.com,
+                            telephone: 1-855-473-7449) to find out what renewal options may be available
+                            for your contract.
                         """)
                     else:
                         opening = textwrap.dedent(f"""\
-                            Your TrueNAS {contract_type} support contract will expire in {days} days.
-                            When that happens, technical support and assistance for this particular TrueNAS storage
-                            array will no longer be available. Please review the wide array of services that are
-                            available to you as an active support contract customer at:
-                            https://www.ixsystems.com/support/ and click on the “TrueNAS Arrays” tab.
+                            Your TrueNAS support contract will expire in {days_left} days.
+                            Renewal options may be available — contact your authorized reseller or TrueNAS
+                            (email: sales@TrueNAS.com, telephone: 1-855-473-7449) to find out more.
                         """)
                         encouraging = textwrap.dedent("""\
-                            We encourage you to contact your authorized TrueNAS Reseller or iXsystems directly
-                            (sales@iXsystems.com) to renew your contract before expiration. Doing so ensures that
-                            you continue to enjoy the peace of mind and benefits that come with support coverage.
+                            Contact your authorized reseller or TrueNAS (email: sales@TrueNAS.com,
+                            telephone: 1-855-473-7449) to find out what renewal options may be available
+                            before your contract expires.
                         """)
 
                 alerts.append(Alert(
-                    alert_klass,
-                    alert_text,
-                    mail={
-                        "cc": ["support-renewal@ixsystems.com"],
-                        "subject": subject,
-                        "text": textwrap.dedent("""\
-                            Hello, {customer_name}
+                    alert_klass(alert_text),
+                    mail=MailSendMessage(
+                        cc=["support-renewal@truenas.com"],
+                        subject=subject,
+                        text=textwrap.dedent("""\
+                            Hello,
 
                             {opening}
 
                             Product: {chassis_hardware}
                             Serial Numbers: {serial_numbers}
-                            Support Contract Start Date: {contract_start}
                             Support Contract Expiration Date: {contract_expiration}
 
                             {encouraging}
 
-                            If the contract expires, you will still be able to access your TrueNAS systems. However,
-                            you will no longer be eligible for support from iXsystems. If you choose to renew your
-                            support contract after it has expired, there are additional costs associated with
-                            contract reactivation and lapsed-contract fees.
+                            Your TrueNAS system will remain accessible after the support contract expires.
+                            However, after expiration it will no longer be eligible for support from TrueNAS.
+                            Renewal options may be available depending on your circumstances, though additional
+                            costs such as reactivation or lapsed-contract fees may apply.
 
                             Sincerely,
 
-                            iXsystems
-                            Web: support.iXsystems.com
-                            Email: support@iXsystems.com
+                            TrueNAS
+                            Web: support.TrueNAS.com
+                            Email: support@TrueNAS.com
                             Telephone: 1-855-473-7449
                         """).format(**{
-                            "customer_name": customer_name,
                             "opening": opening,
-                            "chassis_hardware": chassis_hardware,
+                            "chassis_hardware": model,
                             "serial_numbers": serial_numbers,
-                            "contract_start": contract_start,
                             "contract_expiration": contract_expiration,
                             "encouraging": encouraging,
-                        })
-                    },
+                        }),
+                    ),
                 ))
                 break
 

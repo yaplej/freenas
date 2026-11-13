@@ -1,11 +1,34 @@
-import errno
 import enum
+import errno
 import json
 import subprocess
+from typing import Literal
 
-from middlewared.schema import Bool, Dict, Str, accepts
-from middlewared.service import private, CallError, Service
+from pydantic import Field, Secret
+
+from middlewared.api import api_method
+from middlewared.api.base import BaseModel, NonEmptyString, single_argument_args
 from middlewared.plugins.smb import SMBCmd
+from middlewared.service import CallError, Service, private
+
+
+class GetRemoteAclOpts(BaseModel):
+    use_kerberos: bool = False
+    output_format: Literal['SMB', 'LOCAL'] = 'SMB'
+
+
+@single_argument_args('get_remote_acl')
+class GetRemoteAclArgs(BaseModel):
+    server: NonEmptyString
+    share: NonEmptyString
+    username: NonEmptyString
+    password: Secret[NonEmptyString]
+    path: NonEmptyString = '\\'
+    options: GetRemoteAclOpts = Field(default_factory=GetRemoteAclOpts)
+
+
+class GetRemoteAclResult(BaseModel):
+    result: dict
 
 
 class ACLType(enum.Enum):
@@ -58,7 +81,7 @@ class ACLFlags(enum.Enum):
     DI = ("DIRECTORY_INHERIT", "CONTAINER_INHERIT")
     NI = ("NO_PROPAGATE_INHERIT", "NO_PROPAGATE_INHERIT")
     IO = ("INHERIT_ONLY", "INHERIT_ONLY")
-    ID = ("INHERITED", "INHERITED")
+    id_ = ("INHERITED", "INHERITED")
 
     def convert(aclt, in_flags):
         acl = ACLType[aclt]
@@ -91,7 +114,8 @@ class ACLPerms(enum.Enum):
     RC = (("READ_ACL", 0x00001000), ("READ_CONTROL", 0x00020000))
     SY = (("SYNCHRONIZE", 0x00008000), ("SYNCHRONIZE", 0x00100000))
 
-    def convert(aclt, in_perms):
+    @classmethod
+    def convert(cls, aclt, in_perms):
         acl = ACLType[aclt]
         rv = {}
         if acl == ACLType.SMB:
@@ -105,7 +129,8 @@ class ACLPerms(enum.Enum):
 
         return rv
 
-    def to_standard(in_perms):
+    @classmethod
+    def to_standard(cls, in_perms):
         defaults = {x.value[1][0]: False for x in ACLPerms}
         std_perms = {
             "READ": defaults.copy(),
@@ -128,7 +153,8 @@ class ACLPerms(enum.Enum):
 
         return ""
 
-    def to_hex(aclt, in_perms):
+    @classmethod
+    def to_hex(cls, aclt, in_perms):
         acl = ACLType[aclt]
         rv = 0
         if acl == ACLType.SMB:
@@ -145,21 +171,7 @@ class SMBService(Service):
         service = 'cifs'
         service_verb = 'restart'
 
-    @accepts(
-        Dict(
-            'get_remote_acl',
-            Str('server', required=True),
-            Str('share', required=True),
-            Str('path', default='\\'),
-            Str('username', required=True),
-            Str('password', required=True),
-            Dict(
-                'options',
-                Bool('use_kerberos', default=False),
-                Str('output_format', enum=['SMB', 'LOCAL'], default='SMB'),
-            )
-        )
-    )
+    @api_method(GetRemoteAclArgs, GetRemoteAclResult, private=True)
     def get_remote_acl(self, data):
         """
         Retrieves an ACL from a remote SMB server.
@@ -183,13 +195,14 @@ class SMBService(Service):
         """
         if data['options']['use_kerberos']:
             raise CallError("kerberos authentication for this function is not "
-                            "currently supported.", errno.EOPNOTSUP)
+                            "currently supported.", errno.EOPNOTSUPP)
 
         sc = subprocess.run([
             SMBCmd.SMBCACLS.value,
             f'//{data["server"]}/{data["share"]}',
             data['path'], '-j', '-U', data['username']],
             capture_output=True,
+            check=False,
             input=data['password'].encode()
         )
         if sc.returncode != 0:
@@ -198,12 +211,15 @@ class SMBService(Service):
         smb_sd = json.loads(sc.stdout.decode().splitlines()[1])
         if data['options']['output_format'] == 'SMB':
             return {"acl_type": "SMB", "acl_data": smb_sd}
-        else:
-            return self.middleware.call_sync('smb.convert_acl', ACLType.SMB.value, smb_sd)
+
+        return self.middleware.call_sync('smb.convert_acl', ACLType.SMB.value, smb_sd)
 
     @private
     async def smb_to_nfsv4(self, sd, ignore_errors=False):
         acl_out = {"uid": None, "gid": None, "acl": []}
+        idmaps = await self.middleware.call('idmap.convert_sids', [
+            entry['trustee']['sid'] for entry in sd['dacl']
+        ])
         for x in sd['dacl']:
             entry = {'tag': None, 'id': None, 'type': None, 'perms': {}, 'flags': {}}
             entry['perms'] = ACLPerms.convert('SMB', x['access_mask']['special'])
@@ -214,16 +230,15 @@ class SMBService(Service):
                 aclp = ACLPrincipal.from_sid(x['trustee']['sid'])
                 entry['tag'] = aclp.to_nfsv4()
             else:
-                trustee = await self.middleware.call('idmap.sid_to_unixid',
-                                                     x['trustee']['sid'])
+                trustee = idmaps['mapped'].get(x['trustee']['sid'])
                 if trustee is None:
                     if not ignore_errors:
                         raise CallError(f"Failed to convert SID [{x['trustee']['sid']}] "
                                         "to ID")
-                    else:
-                        self.logger.debug(f"Failed to convert SID [{x['trustee']['sid']}] "
-                                          f"to ID. Dropping entry from ACL: {x}.")
-                        continue
+
+                    self.logger.debug(f"Failed to convert SID [{x['trustee']['sid']}] "
+                                      f"to ID. Dropping entry from ACL: {x}.")
+                    continue
 
                 entry['tag'] = "USER" if trustee['id_type'] == "USER" else "GROUP"
                 entry['id'] = trustee['id']
@@ -240,12 +255,13 @@ class SMBService(Service):
             out['sid'] = aclp.to_sid()
             out['name'] = aclp.to_smb()
         else:
-            out['sid'] = await self.middleware.call('idmap.unixid_to_sid', {"id": unixid, "id_type": id_type})
-            if out['sid'] is not None:
-                try:
-                    out['name'] = (await self.middleware.call('idmap.sid_to_name', out['sid']))['name']
-                except CallError:
-                    out['name'] = None
+            idmaps = await self.middleware.call('idmap.convert_unixids', [{
+                'id_type': id_type, 'id': unixid
+            }])
+            key = f'{"UID" if id_type == "USER" else "GID"}:{id}'
+            if (entry := idmaps['mapped'].get(key)):
+                out['sid'] = entry['sid']
+                out['name'] = entry['name']
 
         return out
 
@@ -304,7 +320,10 @@ class SMBService(Service):
             if must_special_convert:
                 entry["flags"]["INHERIT_ONLY"] = True
                 dup_entry = entry.copy()
-                dup_entry["trustee"] = sd_out["owner"].copy() if entry["trustee"]["sid"] == "S-1-3-0" else sd_out["group"].copy()
+                dup_entry["trustee"] = (
+                    sd_out["owner"].copy() if entry["trustee"]["sid"] == "S-1-3-0"
+                    else sd_out["group"].copy()
+                )
                 dup_entry["flags"].update({
                     "OBJECT_INHERIT": False,
                     "CONTAINER_INHERIT": False,
@@ -326,5 +345,5 @@ class SMBService(Service):
         aclt = ACLType[acl_type]
         if aclt == ACLType.SMB:
             return await self.smb_to_nfsv4(data)
-        else:
-            return await self.nfsv4_to_smb(data)
+
+        return await self.nfsv4_to_smb(data)

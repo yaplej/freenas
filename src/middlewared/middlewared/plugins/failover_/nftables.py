@@ -1,7 +1,11 @@
-from subprocess import run, PIPE, STDOUT
+# Copyright (c) - iXsystems Inc. dba TrueNAS
+#
+# Licensed under the terms of the TrueNAS Enterprise License Agreement
+# See the file LICENSE.IX for complete terms and conditions
 
-from middlewared.service import Service, accepts, job, CallError
+from subprocess import PIPE, STDOUT, run
 
+from middlewared.service import CallError, Service, job
 
 FW_RULES_FILE = '/tmp/fw-rules.nft'
 JOB_LOCK = 'firewall_rules_update'
@@ -16,7 +20,7 @@ class NftablesService(Service):
     def generate_rules(self, data):
         """Generate a list of v4 and v6 firewall rules and apply them to nftables"""
         if data['drop']:
-            sshport = self.middleware.call_sync('ssh.config')['tcpport']
+            sshport = self.middleware.call_sync2(self.middleware.services.ssh.config).tcpport
             web = self.middleware.call_sync('system.general.config')
 
         for i in ('ip', 'ip6'):
@@ -31,15 +35,18 @@ class NftablesService(Service):
                 rules.append(f'add rule {i} filter INPUT tcp dport {sshport} counter accept')
                 rules.append(f'add rule {i} filter INPUT tcp dport {web["ui_port"]} counter accept')
                 rules.append(f'add rule {i} filter INPUT tcp dport {web["ui_httpsport"]} counter accept')
+                # only tcp and udp are dropped so that icmp (ping, path MTU
+                # discovery, IPv6 neighbor discovery) keeps working on the VIPs
+                drop = 'meta l4proto { tcp, udp } counter drop'
                 for j in data['vips']:
                     # only block the VIPs because there is the possibility of
                     # running MPIO for iSCSI which uses the non-VIP addresses of
                     # each controller on an HA system. We, obviously, dont want
                     # to block traffic there.
                     if j['type'] == 'INET' and i == 'ip':
-                        rules.append(f'add rule {i} filter INPUT {i} saddr {j["address"]}/32 counter drop')
+                        rules.append(f'add rule {i} filter INPUT {i} daddr {j["address"]}/32 {drop}')
                     elif j['type'] == 'INET6' and i == 'ip6':
-                        rules.append(f'add rule {i} filter INPUT {i} saddr {j["address"]}/128 counter drop')
+                        rules.append(f'add rule {i} filter INPUT {i} daddr {j["address"]}/128 {drop}')
 
             if i == 'ip':
                 v4 = rules
@@ -61,12 +68,16 @@ class NftablesService(Service):
 
         return True
 
-    @accepts()
+    def flush_chain_INPUT(self):
+        ip4_flush = not bool(run(['nft', 'flush', 'chain', 'ip', 'filter', 'INPUT']).returncode)
+        ip6_flush = not bool(run(['nft', 'flush', 'chain', 'ip6', 'filter', 'INPUT']).returncode)
+        return ip4_flush and ip6_flush
+
     @job(lock=JOB_LOCK)
     def drop_all(self, job):
         """
-        Drops (silently) all v4/v6 inbound traffic destined for the
-        VIP addresses on a TrueNAS SCALE HA system. SSH and webUI
+        Drops (silently) all v4/v6 inbound TCP/UDP traffic destined for
+        the VIP addresses on a TrueNAS SCALE HA system. SSH and webUI
         mgmt traffic is always allowed.
 
         NOTE:
@@ -84,13 +95,18 @@ class NftablesService(Service):
         if not vips:
             raise CallError('No VIP addresses detected on system')
 
+        if not self.flush_chain_INPUT():
+            self.logger.error('Failed flushing INPUT chain')
+
         return self.generate_rules({'drop': True, 'vips': vips})
 
-    @accepts()
     @job(lock=JOB_LOCK)
     def accept_all(self, job):
         """Accepts all v4/v6 inbound traffic"""
         if not self.middleware.call_sync('failover.licensed'):
             return False
+
+        if not self.flush_chain_INPUT():
+            self.logger.error('Failed flushing INPUT chain')
 
         return self.generate_rules({'drop': False, 'vips': []})

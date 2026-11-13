@@ -2,7 +2,7 @@
 	import os
 	import ipaddress
 	import stat
-        from middlewared.utils import filter_list
+	from middlewared.utils.filter_list import filter_list
 
 	ssh_config = render_ctx['ssh.config']
 
@@ -16,13 +16,10 @@
 			middleware.logger.debug("%s: changing owner to root:root", p)
 			os.chown(p, 0, 0)
 
-	if not ssh_config['sftp_log_level']:
-		ssh_config['sftp_log_level'] = 'ERROR'
+	sftp_log_level = ssh_config.sftp_log_level or 'ERROR'
+	sftp_log_facility = ssh_config.sftp_log_facility or 'AUTH'
 
-	if not ssh_config['sftp_log_facility']:
-		ssh_config['sftp_log_facility'] = 'AUTH'
-
-	ifaces = filter_list(render_ctx['interface.query'], [['name', 'in', ssh_config['bindiface']]])
+	ifaces = filter_list(render_ctx['interface.query'], [['name', 'in', ssh_config.bindiface]])
 	bind_ifaces = []
 	for iface in ifaces:
 		for alias in iface.get('state', {}).get('aliases', []):
@@ -35,76 +32,95 @@
 	if bind_ifaces:
 		bind_ifaces.insert(0, '127.0.0.1')
 
-	twofactor_auth = render_ctx['auth.twofactor.config']
-	twofactor_enabled = twofactor_auth['enabled'] and twofactor_auth['services']['ssh']
-	ad_allow_pam = False
-	ldap_enabled = False
-	ad = render_ctx["activedirectory.config"]
-	if ad['enable'] and not ad['restrict_pam']:
-		ad_allow_pam = True
-	if not ad['enable']:
-		ldap_enabled = render_ctx["ldap.config"]["enable"]
+	# sshd keeps the first value it reads for a keyword, and aux params come last in this file.
+	# `ChallengeResponseAuthentication` is the deprecated alias for the same keyword.
+	kbdinteractive_override = any(
+		opt in ssh_config.options for opt in ('KbdInteractiveAuthentication', 'ChallengeResponseAuthentication')
+	)
 
+	# The `password` method cannot send a one-time code, so it always fails when 2FA is enabled for SSH.
+	# That failed attempt also makes sshd reject a correct keyboard-interactive login on the same connection.
+	twofactor_auth = middleware.call_sync('auth.twofactor.config')
+	password_method = 'no' if twofactor_auth['enabled'] and twofactor_auth['services']['ssh'] else 'yes'
+
+	users = middleware.call_sync2(middleware.services.user.query, [['local', '=', True]])
+	root_user = next(user for user in users if user.username == 'root')
+	login_banner = render_ctx['system.advanced.login_banner']
 %>\
-Subsystem	sftp	internal-sftp -l ${ssh_config['sftp_log_level']} -f ${ssh_config['sftp_log_facility']}
-% if 'Protocol' not in ssh_config['options']:
+Subsystem	sftp	internal-sftp -l ${sftp_log_level} -f ${sftp_log_facility}
+% if 'Protocol' not in ssh_config.options:
 Protocol 2
 % endif
-% if 'UseDNS' not in ssh_config['options']:
+% if 'UseDNS' not in ssh_config.options:
 UseDNS no
 % endif
-% if 'ChallengeResponseAuthentication' not in ssh_config['options'] and not twofactor_enabled:
-ChallengeResponseAuthentication no
+% if not kbdinteractive_override:
+KbdInteractiveAuthentication no
 % endif
-% if 'ClientAliveCountMax' not in ssh_config['options']:
+% if 'ClientAliveCountMax' not in ssh_config.options:
 ClientAliveCountMax 3
 % endif
-% if 'ClientAliveInterval' not in ssh_config['options']:
+% if 'ClientAliveInterval' not in ssh_config.options:
 ClientAliveInterval 15
 % endif
 ## Scale doesnt have HPN patches yet
-% if 'NONE' in ssh_config['weak_ciphers'] and IS_FREEBSD:
-NoneEnabled yes
-% endif
-% if 'VersionAddendum' not in ssh_config['options']:
+% if 'VersionAddendum' not in ssh_config.options:
 VersionAddendum none
 % endif
 ## Add aes128-cbc by default. See #20044
-% if 'Ciphers' not in ssh_config['options'] and 'AES128-CBC' in ssh_config['weak_ciphers']:
+% if 'Ciphers' not in ssh_config.options and 'AES128-CBC' in ssh_config.weak_ciphers:
 Ciphers +aes128-cbc
 % endif
-% if ssh_config['tcpport'] > 0:
-Port ${ssh_config['tcpport']}
+% if ssh_config.tcpport > 0:
+Port ${ssh_config.tcpport}
 % endif
 % for ip in bind_ifaces:
 ListenAddress ${ip}
 % endfor
-% if ssh_config['rootlogin']:
+% if root_user.ssh_password_enabled:
 PermitRootLogin yes
 % else:
 PermitRootLogin without-password
 % endif
-% if ssh_config['tcpfwd']:
+% if ssh_config.tcpfwd:
 AllowTcpForwarding yes
 % else:
 AllowTcpForwarding no
 % endif
-% if ssh_config['compression']:
+% if ssh_config.compression:
 Compression delayed
 % else:
 Compression no
 % endif
-PasswordAuthentication ${"yes" if ssh_config['passwordauth'] else "no"}
-% if ssh_config['kerberosauth']:
+PasswordAuthentication no
+% if ssh_config.kerberosauth:
 GSSAPIAuthentication yes
 % endif
 PubkeyAuthentication yes
-${ssh_config['options']}
-% if twofactor_enabled or ad_allow_pam or ldap_enabled:
+
 # These are forced to be enabled with 2FA
 UsePAM yes
-ChallengeResponseAuthentication yes
-## We want to set this to no because in linux we have pam_motd being used as well when we use pam_oath.so resulting in duplicate motd's
+## Motd is handled by pam_motd
 PrintMotd no
-% endif
 SetEnv LC_ALL=C.UTF-8
+
+% if ssh_config.passwordauth:
+% for user in [user for user in users if user.ssh_password_enabled]:
+Match User "${user.username}"
+	PasswordAuthentication ${password_method}
+	KbdInteractiveAuthentication yes
+% endfor
+% for group in ssh_config.password_login_groups:
+Match Group "${group}"
+	PasswordAuthentication ${password_method}
+	KbdInteractiveAuthentication yes
+% endfor
+% endif
+% if login_banner != '':
+Banner /etc/login_banner
+% endif
+# These are aux params that MUST COME LAST
+# in the config. User provided "Match" blocks,
+# for example, need to come AFTER the UsePam
+# line. Otherwise ssh service WILL NOT START.
+${ssh_config.options}

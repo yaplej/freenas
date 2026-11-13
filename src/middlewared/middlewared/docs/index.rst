@@ -50,13 +50,8 @@ Methods can be special and be treated as a job. Job is a long running method whi
 
 Jobs are put in a single queue, processed as a FIFO, and can share an exclusive lock.
 
-Job is a decorator and takes the following parameters:
-
- - lock: a string or a callable for the shared lock name
- - process: a boolean on whether the job should run as a standalone process or a green thread.
-
 e.g.
-    @job(lock='update', process=True)
+    @job(lock='update')
     def update(self, job):
         job.set_progress(0, 'Fetching')
 
@@ -96,15 +91,20 @@ Server answers with either `connected` or `failed`.
 Authentication
 ~~~~~~~~~~~~~~
 
-Authentication happens by calling the `auth.login` method.
+Authentication happens by calling the `auth.login_ex` method with the appropriate
+``mechanism`` (e.g. ``PASSWORD_PLAIN``, ``API_KEY_PLAIN``, ``TOKEN_PLAIN``, ``SCRAM``).
 
 Request:
 
     {
       "id": "d8e715be-6bc7-11e6-8c28-00e04d680384",
       "msg": "method",
-      "method": "auth.login",
-      "params": ["username", "password"]
+      "method": "auth.login_ex",
+      "params": [{
+        "mechanism": "PASSWORD_PLAIN",
+        "username": "username",
+        "password": "password"
+      }]
     }
 
 Response:
@@ -112,5 +112,5 @@ Response:
     {
       "id": "d8e715be-6bc7-11e6-8c28-00e04d680384",
       "msg": "result",
-      "result": true,
+      "result": {"response_type": "SUCCESS", ...}
     }

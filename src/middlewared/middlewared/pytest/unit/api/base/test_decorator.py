@@ -1,0 +1,339 @@
+from typing import Annotated, Any
+
+import pytest
+
+from middlewared.api.base import BaseModel, LongString
+from middlewared.api.base.decorator import check_method_annotations
+
+
+class SimpleArgs(BaseModel):
+    name: str
+    count: int
+
+
+class SimpleResult(BaseModel):
+    result: str
+
+
+class MultipleArgs(BaseModel):
+    id_: int
+    name: str
+    enabled: bool
+
+
+class MultipleResult(BaseModel):
+    result: dict[str, int]
+
+
+class TestCheckMethodAnnotations:
+    """Tests for check_method_annotations function."""
+
+    def test_valid_method_annotations(self):
+        """Test that valid method annotations pass without error."""
+        def method(self, name: str, count: int) -> str:
+            pass
+
+        # Should not raise
+        check_method_annotations(method, 1, SimpleArgs, SimpleResult)
+
+    def test_valid_method_annotations_multiple_args(self):
+        """Test valid annotations with multiple arguments."""
+        def method(self, id_: int, name: str, enabled: bool) -> dict[str, int]:
+            pass
+
+        # Should not raise
+        check_method_annotations(method, 1, MultipleArgs, MultipleResult)
+
+    def test_valid_method_no_self(self):
+        """Test valid method without self parameter (static/class method)."""
+        def method(name: str, count: int) -> str:
+            pass
+
+        # Should not raise
+        check_method_annotations(method, 0, SimpleArgs, SimpleResult)
+
+    def test_missing_parameter_annotation(self):
+        """Test that missing parameter annotations raise ValueError."""
+        def method(self, name, count: int) -> str:
+            pass
+
+        with pytest.raises(ValueError, match="must have the following signature"):
+            check_method_annotations(method, 1, SimpleArgs, SimpleResult)
+
+    def test_wrong_parameter_annotation(self):
+        """Test that wrong parameter type annotations raise ValueError."""
+        def method(self, name: int, count: int) -> str:  # name should be str
+            pass
+
+        with pytest.raises(ValueError, match="must have the following signature"):
+            check_method_annotations(method, 1, SimpleArgs, SimpleResult)
+
+    def test_missing_parameter(self):
+        """Test that missing parameters raise ValueError."""
+        def method(self, name: str) -> str:  # missing count parameter
+            pass
+
+        with pytest.raises(ValueError, match="must have the following signature"):
+            check_method_annotations(method, 1, SimpleArgs, SimpleResult)
+
+    def test_extra_parameter(self):
+        """Test that extra parameters raise ValueError."""
+        def method(self, name: str, count: int, extra: str) -> str:
+            pass
+
+        with pytest.raises(ValueError, match="must have the following signature"):
+            check_method_annotations(method, 1, SimpleArgs, SimpleResult)
+
+    def test_missing_return_annotation(self):
+        """Test that missing return annotation raises ValueError."""
+        def method(self, name: str, count: int):
+            pass
+
+        with pytest.raises(ValueError, match="must have a `return` annotation"):
+            check_method_annotations(method, 1, SimpleArgs, SimpleResult)
+
+    def test_wrong_return_annotation(self):
+        """Test that wrong return type annotation raises ValueError."""
+        def method(self, name: str, count: int) -> int:  # should return str
+            pass
+
+        with pytest.raises(ValueError, match="must have a `return` annotation"):
+            check_method_annotations(method, 1, SimpleArgs, SimpleResult)
+
+    def test_args_index_offset(self):
+        """Test that args_index correctly skips prefix parameters."""
+        # Simulating a method with app, job parameters before actual args
+        def method(self, app, job, name: str, count: int) -> str:
+            pass
+
+        # Should not raise, args_index=3 skips self, app, job
+        check_method_annotations(method, 3, SimpleArgs, SimpleResult)
+
+    def test_args_index_offset_mismatch(self):
+        """Test that wrong args_index causes validation to fail."""
+        def method(self, app, job, name: str, count: int) -> str:
+            pass
+
+        # args_index=1 would try to validate app and job as name and count
+        with pytest.raises(ValueError, match="must have the following signature"):
+            check_method_annotations(method, 1, SimpleArgs, SimpleResult)
+
+    def test_complex_return_type(self):
+        """Test method with complex return type annotation."""
+        def method(self, id_: int, name: str, enabled: bool) -> dict[str, int]:
+            pass
+
+        # Should not raise
+        check_method_annotations(method, 1, MultipleArgs, MultipleResult)
+
+    def test_parameter_order_matters(self):
+        """Test that parameter order is validated."""
+        def method(self, count: int, name: str) -> str:  # wrong order
+            pass
+
+        with pytest.raises(ValueError, match="must have the following signature"):
+            check_method_annotations(method, 1, SimpleArgs, SimpleResult)
+
+    def test_annotated_type(self):
+        """Test that Annotated types work correctly."""
+        class AnnotatedArgs(BaseModel):
+            name: Annotated[str, "Some metadata"]
+            count: int
+
+        def method(self, name: Annotated[str, "Some metadata"], count: int) -> str:
+            pass
+
+        # Should not raise
+        check_method_annotations(method, 1, AnnotatedArgs, SimpleResult)
+
+    def test_discriminated_union_annotated_alias(self):
+        """A discriminated-union parameter may be annotated with its ``Annotated[..., Discriminator]`` alias.
+
+        pydantic strips the ``Discriminator`` metadata when exposing the model field's annotation, so the
+        alias must normalize to the same bare union and be accepted (as must the bare union itself).
+        """
+        from typing import Literal
+
+        from pydantic import Discriminator
+
+        class Cat(BaseModel):
+            type: Literal["cat"]
+            meow: str
+
+        class Dog(BaseModel):
+            type: Literal["dog"]
+            bark: str
+
+        Animal = Annotated[Cat | Dog, Discriminator("type")]
+
+        class AnimalArgs(BaseModel):
+            animal: Animal
+
+        # Annotating the parameter with the Annotated alias must pass.
+        def method_alias(self, animal: Animal) -> str:
+            pass
+
+        check_method_annotations(method_alias, 1, AnimalArgs, SimpleResult)
+
+        # Annotating with the bare union the alias wraps must pass too.
+        def method_union(self, animal: Cat | Dog) -> str:
+            pass
+
+        check_method_annotations(method_union, 1, AnimalArgs, SimpleResult)
+
+    def test_optional_type(self):
+        """Test that Optional/None types are validated."""
+        class OptionalArgs(BaseModel):
+            name: str | None
+            count: int
+
+        class OptionalResult(BaseModel):
+            result: str | None
+
+        def method(self, name: str | None, count: int) -> str | None:
+            pass
+
+        # Should not raise
+        check_method_annotations(method, 1, OptionalArgs, OptionalResult)
+
+    def test_no_parameters(self):
+        """Test method with no parameters (besides self)."""
+        class NoArgs(BaseModel):
+            pass
+
+        class NoArgsResult(BaseModel):
+            result: str
+
+        def method(self) -> str:
+            pass
+
+        # Should not raise
+        check_method_annotations(method, 1, NoArgs, NoArgsResult)
+
+    def test_async_method(self):
+        """Test that async methods are validated the same way."""
+        async def method(self, name: str, count: int) -> str:
+            pass
+
+        # Should not raise
+        check_method_annotations(method, 1, SimpleArgs, SimpleResult)
+
+    def test_longstring_return_matches_str(self):
+        """Test that model with LongString result accepts str annotation."""
+        class LongStringResult(BaseModel):
+            result: LongString
+
+        def method(self, name: str, count: int) -> str:
+            pass
+
+        check_method_annotations(method, 1, SimpleArgs, LongStringResult)
+
+    def test_longstring_optional_return_matches_str_optional(self):
+        """Test that model with LongString | None result accepts str | None annotation."""
+        class LongStringOptionalResult(BaseModel):
+            result: LongString | None
+
+        def method(self, name: str, count: int) -> str | None:
+            pass
+
+        check_method_annotations(method, 1, SimpleArgs, LongStringOptionalResult)
+
+    def test_normalize_as_inside_generic(self):
+        """Test __normalize_as__ is resolved inside list[X]."""
+        class Foo:
+            __normalize_as__ = str
+
+        class FooResult(BaseModel):
+            result: list[Foo]
+
+        def method(self, name: str, count: int) -> list[str]:
+            pass
+
+        check_method_annotations(method, 1, SimpleArgs, FooResult)
+
+    def test_normalize_as_inside_union_with_generic(self):
+        """Test __normalize_as__ in list[X] | X | int."""
+        class Foo:
+            __normalize_as__ = str
+
+        class FooResult(BaseModel):
+            result: list[Foo] | Foo | int
+
+        def method(self, name: str, count: int) -> list[str] | str | int:
+            pass
+
+        check_method_annotations(method, 1, SimpleArgs, FooResult)
+
+    def test_optional_annotation_allowed_for_field_with_default(self):
+        """Test that T | None annotation is accepted when model field has a default."""
+        class ArgsWithDefaults(BaseModel):
+            name: str = "default"
+            count: int = 0
+
+        def method(self, name: str | None, count: int | None) -> str:
+            pass
+
+        check_method_annotations(method, 1, ArgsWithDefaults, SimpleResult)
+
+    def test_optional_annotation_rejected_for_required_field(self):
+        """Test that T | None annotation is rejected when model field is required."""
+        def method(self, name: str | None, count: int) -> str:
+            pass
+
+        with pytest.raises(ValueError, match="must have the following signature"):
+            check_method_annotations(method, 1, SimpleArgs, SimpleResult)
+
+    def test_list_any_matches(self):
+        """list[Any] in both model and function annotation matches."""
+        class ListAnyResult(BaseModel):
+            result: list[Any]
+
+        def method(self, name: str, count: int) -> list[Any]:
+            pass
+
+        check_method_annotations(method, 1, SimpleArgs, ListAnyResult)
+
+    def test_dict_str_any_matches(self):
+        """dict[str, Any] in both model and function annotation matches."""
+        class DictResult(BaseModel):
+            result: dict[str, Any]
+
+        def method(self, name: str, count: int) -> dict[str, Any]:
+            pass
+
+        check_method_annotations(method, 1, SimpleArgs, DictResult)
+
+    def test_list_any_optional_matches(self):
+        """list[Any] | None matches list[Any] with default via None relaxation."""
+        class OptionalListArgs(BaseModel):
+            items: list[Any] = []
+
+        class DummyResult(BaseModel):
+            result: str
+
+        def method(self, items: list[Any] | None) -> str:
+            pass
+
+        check_method_annotations(method, 1, OptionalListArgs, DummyResult)
+
+    def test_filterable_pattern_with_model_default(self):
+        """list[Any] field + model field with default matches list[Any] | None, Model | None."""
+        class Options(BaseModel):
+            extra: dict[str, Any] = {}
+
+        class FilterArgs(BaseModel):
+            filters: list[Any] = []
+            options: Options = Options()
+
+        def method(self, filters: list[Any] | None = None, options: Options | None = None) -> str:
+            pass
+
+        check_method_annotations(method, 1, FilterArgs, SimpleResult)
+
+    def test_error_message_includes_function_name(self):
+        """Test that error messages include the function name."""
+        def my_special_method(self, name: int, count: int) -> str:
+            pass
+
+        with pytest.raises(ValueError, match="my_special_method"):
+            check_method_annotations(my_special_method, 1, SimpleArgs, SimpleResult)

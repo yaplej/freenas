@@ -1,10 +1,49 @@
 import contextlib
-import re
+import ipaddress
+import subprocess
+import tempfile
+from typing import Literal
 
-from middlewared.service import Service, filterable, filterable_returns, private
-from middlewared.schema import Dict, IPAddr, ValidationErrors
-from middlewared.utils import filter_list
-from middlewared.plugins.interface.netif import netif
+from pydantic import Field
+from truenas_os_pyutils.io import atomic_write
+from truenas_pynetif.address.netlink import get_links, netlink_route
+
+from middlewared.api import api_method
+from middlewared.api.base import BaseModel, IPv4Nameserver, IPv6Nameserver, UniqueList, single_argument_args
+from middlewared.api.current import DNSQueryItem
+from middlewared.plugins.interface.dhcp import dhcp_leases
+from middlewared.service import Service, filterable_api_method, private
+from middlewared.service_exception import CallError, ValidationErrors
+from middlewared.utils import MIDDLEWARE_RUN_DIR
+from middlewared.utils.filter_list import filter_list
+from middlewared.utils.nsupdate import build_nsupdate_payload
+
+
+class DNSNsUpdateOpA(BaseModel):
+    command: Literal['ADD', 'DELETE']
+    name: str
+    type: Literal['A'] = 'A'
+    ttl: int = 3600
+    address: IPv4Nameserver
+    do_ptr: bool = True
+
+
+class DNSNsUpdateOpAAAA(DNSNsUpdateOpA):
+    type: Literal['AAAA']
+    address: IPv6Nameserver
+
+
+@single_argument_args('data')
+class DNSNsUpdateArgs(BaseModel):
+    """ Override the nameserver used for nsupdate command. This may be required in
+    more complex environments where the nameservers are also KDCs. """
+    use_kerberos: bool = True
+    ops: UniqueList[DNSNsUpdateOpA | DNSNsUpdateOpAAAA] = Field(min_length=1)
+    timeout: int = 30
+
+
+class DNSNsUpdateResult(BaseModel):
+    result: None
 
 
 class DNSService(Service):
@@ -12,26 +51,26 @@ class DNSService(Service):
     class Config:
         cli_namespace = 'network.dns'
 
-    @filterable
-    @filterable_returns(Dict('nameserver', IPAddr('nameserver', required=True)))
+    @filterable_api_method(item=DNSQueryItem, roles=['NETWORK_INTERFACE_READ'])
     def query(self, filters, options):
         """
-        Query Name Servers with `query-filters` and `query-options`.
+        Query Name Servers with ``query-filters`` and ``query-options``.
         """
-        ips = set()
+        ips = []
         with contextlib.suppress(Exception):
             with open('/etc/resolv.conf') as f:
-                for line in f:
-                    if line.startswith('nameserver'):
-                        ip = line[len('nameserver'):].strip()
-                        try:
-                            IPAddr().validate(ip)  # make sure it's a valid IP (better safe than sorry)
-                            ips.add(ip)
-                        except ValidationErrors:
-                            self.logger.warning('IP %r in resolv.conf does not seem to be valid', ip)
-                            continue
+                for line in filter(lambda x: x.startswith('nameserver'), f):
+                    ip = line[len('nameserver'):].strip()
+                    try:
+                        ipaddress.ip_address(ip)  # make sure it's a valid IP (better safe than sorry)
+                    except ValidationErrors:
+                        self.logger.warning('IP %r in resolv.conf does not seem to be valid', ip)
+                    else:
+                        ip = {'nameserver': ip}
+                        if ip not in ips:
+                            ips.append(ip)
 
-        return filter_list([{'nameserver': i} for i in ips], filters, options)
+        return filter_list(ips, filters, options)
 
     @private
     def sync(self):
@@ -59,7 +98,7 @@ class DNSService(Service):
         resolvconf += self.middleware.call_sync('dns.configure_nameservers', nameservers)
 
         try:
-            with open('/etc/resolv.conf', 'w') as f:
+            with atomic_write('/etc/resolv.conf', 'w') as f:
                 f.write(resolvconf)
         except Exception:
             self.logger.error('Failed to write /etc/resolv.conf', exc_info=True)
@@ -74,27 +113,55 @@ class DNSService(Service):
         else:
             # means there aren't any nameservers configured so let's
             # check to see if dhcp is running on any of the interfaces
-            # and if there are, then check dhclient leases file for
-            # nameservers that were handed to us via dhcp
+            # and if there are, then check DHCP leases for
+            # nameservers that were handed to us via DHCP
             interfaces = self.middleware.call_sync('datastore.query', 'network.interfaces')
             if interfaces:
                 interfaces = [i['int_interface'] for i in interfaces if i['int_dhcp']]
             else:
-                ignore = self.middleware.call_sync('interface.internal_interfaces')
-                ignore.extend(self.middleware.call_sync('failover.internal_interfaces'))
-                ignore = tuple(ignore)
-                interfaces = list(filter(lambda x: not x.startswith(ignore), netif.list_interfaces().keys()))
+                ignore = tuple(self.middleware.call_sync('interface.internal_interfaces'))
+                interfaces = list()
+                with netlink_route() as sock:
+                    for ifname in get_links(sock):
+                        if not ifname.startswith(ignore):
+                            interfaces.append(ifname)
 
             dns_from_dhcp = set()
             for iface in interfaces:
-                dhclient_running, dhclient_pid = self.middleware.call_sync('interface.dhclient_status', iface)
-                if dhclient_running:
-                    leases = self.middleware.call_sync('interface.dhclient_leases', iface)
-                    for dns_srvs in re.findall(r'option domain-name-servers (.+)', leases or ''):
-                        for dns in dns_srvs.split(';')[0].split(','):
-                            dns_from_dhcp.add(f'nameserver {dns.strip()}\n')
+                lease = dhcp_leases(iface)
+                if lease and lease.domain_name_servers:
+                    for dns in lease.domain_name_servers.split():
+                        dns_from_dhcp.add(f'nameserver {dns.strip()}\n')
 
             for dns in dns_from_dhcp:
                 result += dns
 
         return result
+
+    @api_method(DNSNsUpdateArgs, DNSNsUpdateResult, private=True)
+    def nsupdate(self, data):
+        if data['use_kerberos']:
+            self.middleware.call_sync('kerberos.check_ticket')
+
+        with tempfile.NamedTemporaryFile(dir=MIDDLEWARE_RUN_DIR) as tmpfile:
+            # A / AAAA records go out as one transaction; each PTR gets its own
+            # "send" so records from different reverse zones never share an UPDATE
+            # (which the server rejects with NOTZONE). This is a single nsupdate
+            # invocation -- one GSS-TSIG negotiation, one exit code.
+            tmpfile.write(build_nsupdate_payload(data['ops']).encode())
+            tmpfile.file.flush()
+
+            cmd = ['nsupdate', '-t', str(data['timeout'])]
+            if data['use_kerberos']:
+                cmd.append('-g')
+
+            cmd.append(tmpfile.name)
+            nsupdate_proc = subprocess.run(cmd, capture_output=True)
+
+            # tsig verify failure is possible if a reverse zone is misconfigured.
+            # Unfortunately, this is quite common and so we have to skip it. Every
+            # other failure is raised so callers can react -- in particular the AD
+            # join retries on the transient "Server not found in Kerberos database"
+            # GSSAPI error seen during slow sysvol replication.
+            if nsupdate_proc.returncode and 'tsig verify failure' not in nsupdate_proc.stderr.decode():
+                raise CallError(f'nsupdate failed: {nsupdate_proc.stderr.decode()}')

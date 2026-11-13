@@ -1,8 +1,13 @@
-from pathlib import Path
+# Copyright (c) - iXsystems Inc. dba TrueNAS
+#
+# Licensed under the terms of the TrueNAS Enterprise License Agreement
+# See the file LICENSE.IX for complete terms and conditions
 
+from pathlib import Path
+from typing import Literal
+
+from middlewared.plugins.pool_.utils import ZPOOL_CACHE_FILE
 from middlewared.service import Service
-from middlewared.schema import Str, accepts
-from middlewared.plugins.pool import ZPOOL_CACHE_FILE
 
 ZPOOL_CACHE_FILE_SAVED = f'{ZPOOL_CACHE_FILE}.saved'
 ZPOOL_CACHE_FILE_OVERWRITE = f'{ZPOOL_CACHE_FILE}.overwrite'
@@ -13,8 +18,10 @@ class FailoverZpoolCacheFileService(Service):
         private = True
         namespace = 'failover.zpool.cachefile'
 
-    @accepts(Str('event', enum=['MASTER', 'BACKUP', 'SYNC'], default='MASTER'))
-    def setup(self, event):
+    def setup(
+        self,
+        event: Literal["MASTER", "BACKUP", "SYNC"] = "MASTER"
+    ):
         saved = Path(ZPOOL_CACHE_FILE_SAVED)
         default = Path(ZPOOL_CACHE_FILE)
         overwrite = Path(ZPOOL_CACHE_FILE_OVERWRITE)
@@ -48,4 +55,4 @@ class FailoverZpoolCacheFileService(Service):
                 saved.unlink(missing_ok=True)
             overwrite.unlink(missing_ok=True)
         except Exception:
-            self.logger.warning('Failed setting up zpool cacheilfe', exc_info=True)
+            self.logger.warning('Failed setting up zpool cachefile', exc_info=True)

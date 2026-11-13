@@ -2,10 +2,8 @@
 Description=Setup TrueNAS Network
 DefaultDependencies=no
 
-Before=network-pre.target
-
 After=middlewared.service systemd-modules-load.service
-Before=local-fs.target
+Before=local-fs.target network-pre.target
 Conflicts=systemd-networkd.service
 
 [Service]
@@ -14,6 +12,8 @@ RemainAfterExit=yes
 ExecStartPre=-midclt call etc.generate_checkpoint pre_interface_sync
 ExecStart=-midclt -t 120 call interface.sync true
 ExecStartPost=midclt call etc.generate_checkpoint interface_sync
+# Set netif complete sentinel
+ExecStartPost=touch /run/middleware/ix-netif-complete
 StandardOutput=null
 
 [Install]

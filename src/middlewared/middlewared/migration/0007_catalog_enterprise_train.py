@@ -1,7 +1,8 @@
-async def migrate(middleware):
-    if await middleware.call('system.product_type') == 'SCALE_ENTERPRISE':
-        await middleware.call(
-            'catalog.update',
-            await middleware.call('catalog.official_catalog_label'),
-            {'preferred_trains': [await middleware.call('catalog.official_enterprise_train')]}
-        )
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from middlewared.main import Middleware
+
+
+async def migrate(middleware: 'Middleware'):
+    await middleware.call2(middleware.services.catalog.update_train_for_enterprise)

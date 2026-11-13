@@ -1,33 +1,37 @@
 Source: truenas
 Section: admin
 Priority: optional
-Maintainer: William Grzybowski <william@grzy.org>
+Maintainer: TrueNAS Engineering <dev@truenas.com>
 Build-Depends: debhelper-compat (= 12)
 Standards-Version: 4.4.0
 Homepage: http://www.truenas.com
 
 Package: truenas
-Architecture: all
+Architecture: amd64 arm64
 Depends: acl,
-         cifs-utils,
-         collectd,
-         cpuid,
+         console-setup,
+         containerd.io,
+# We need to bring in dnsmasq-base explicitly as that is used for internal/automatic bridge network in virt plugin
+         dnsmasq-base,
+         docker-buildx-plugin,
          docker-ce,
-         docker-compose,
-         gdb,
-         glusterfs-server,
-         inadyn,
+         docker-ce-cli,
+         docker-compose-plugin,
+         gssproxy,
          kdump-tools,
          keepalived,
          ifenslave,
-         intel-pcm,
          libnginx-mod-http-uploadprogress,
+         libvirt-daemon-driver-lxc,
          libvirt-daemon-system,
          man-db,
          manpages,
          mc,
          middlewared,
-         minio,
+         middlewared-docs,
+         netdata,
+         netdata-plugin-chartsd,
+         netdata-plugin-pythond,
          nfs-common,
          nfs-kernel-server,
          net-tools,
@@ -35,17 +39,27 @@ Depends: acl,
          nut,
          nut-snmp,
          openssh-server,
-         openvpn,
+         openzfs-zfs-zed,
          proftpd,
          proftpd-mod-crypto,
          python3-midcli,
+         qemu-system-x86,
+         qemu-system-arm,
          truenas-samba,
+         truenas-sssd,
          snmpd,
+         snmp,
          sudo,
+# This is required for TPM support in VM plugin
+         swtpm,
+         swtpm-tools,
          systemd-coredump,
-         tftpd-hpa,
          tmux,
          truenas-binaries,
+         truenas-file-manager,
+         truenas-licensed,
+         libtruenas-licensed-dev,
+         truenas-s3,
          truenas-webui,
          usrmerge,
          waagent,

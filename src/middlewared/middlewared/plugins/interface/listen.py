@@ -1,9 +1,9 @@
-import asyncio
 from collections import namedtuple
 from itertools import zip_longest
 
-from middlewared.schema import Dict, List, returns, Str
-from middlewared.service import accepts, Service, private
+from middlewared.api import api_method
+from middlewared.api.current import InterfaceServicesRestartedOnSyncArgs, InterfaceServicesRestartedOnSyncResult
+from middlewared.service import Service, private
 
 PreparedDelegate = namedtuple("PreparedDelegate", ["delegate", "state", "addresses"])
 
@@ -22,23 +22,22 @@ class InterfaceService(Service):
     def register_listen_delegate(self, delegate):
         self.delegates.append(delegate)
 
-    @accepts()
-    @returns(List('services_to_be_restarted', items=[Dict(
-        'service_restart',
-        Str('type', required=True),
-        Str('service', required=True),
-        List('ips', required=True, items=[Str('ip')]),
-    )]))
+    @api_method(
+        InterfaceServicesRestartedOnSyncArgs,
+        InterfaceServicesRestartedOnSyncResult,
+        roles=['NETWORK_INTERFACE_READ']
+    )
     async def services_restarted_on_sync(self):
         """
         Returns which services will be set to listen on 0.0.0.0 (and, thus, restarted) on sync.
 
-        Example result:
-        [
-            // Samba service will be set ot listen on 0.0.0.0 and restarted because it was set up to listen on
-            // 192.168.0.1 which is being removed.
-            {"type": "SYSTEM_SERVICE", "service": "cifs", "ips": ["192.168.0.1"]},
-        ]
+        Example result::
+
+            [
+                // Samba service will be set ot listen on 0.0.0.0 and restarted because it was set up to listen on
+                // 192.168.0.1 which is being removed.
+                {"type": "SYSTEM_SERVICE", "service": "cifs", "ips": ["192.168.0.1"]},
+            ]
         """
         return [dict(await pd.delegate.repr(pd.state), ips=pd.addresses)
                 for pd in await self.listen_delegates_prepare()]
@@ -87,7 +86,7 @@ async def interface_post_sync(middleware):
     if POST_ROLLBACK_LISTEN_DELEGATES:
         for pd in POST_ROLLBACK_LISTEN_DELEGATES:
             middleware.logger.info("Restoring listen IPs on delegate %r: %r", pd.delegate, pd.state)
-            asyncio.ensure_future(pd.delegate.set_listen_state(pd.state))
+            middleware.create_task(pd.delegate.set_listen_state(pd.state))
 
         POST_ROLLBACK_LISTEN_DELEGATES[:] = []
         return
@@ -95,7 +94,7 @@ async def interface_post_sync(middleware):
     for pd in PRE_SYNC_LISTEN_DELEGATES:
         middleware.logger.info("Resetting listen IPs on delegate %r because %r addresses were removed", pd.delegate,
                                pd.addresses)
-        asyncio.ensure_future(pd.delegate.reset_listens(pd.state))
+        middleware.create_task(pd.delegate.reset_listens(pd.state))
 
 
 async def interface_post_rollback(middleware):

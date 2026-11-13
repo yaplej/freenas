@@ -1,33 +1,22 @@
-#!/usr/bin/env python3
-
-import pytest
-import sys
-import os
 from subprocess import run
 from time import sleep
-apifolder = os.getcwd()
-sys.path.append(apifolder)
-from functions import PUT, POST, GET, DELETE, SSH_TEST, wait_on_job
-from auto_config import (
-    ip,
-    pool_name,
-    dev_test,
-    user,
-    password,
-)
+
+import pytest
 from pytest_dependency import depends
+
+# DO NOT change the order of these imports
+# or the ntstatus import will fail
 from protocols import SMB
 from samba import ntstatus
 
-reason = 'Skipping for test development testing'
-# comment pytestmark for development testing with --dev-test
-pytestmark = pytest.mark.skipif(dev_test, reason=reason)
+from auto_config import pool_name, user, password
+from middlewared.test.integration.utils import call
+from middlewared.test.integration.utils.client import truenas_server
+from middlewared.test.integration.utils.legacy_functions import SSH_TEST
 
 
 dataset = f"{pool_name}/smb-vss"
-dataset_url = dataset.replace('/', '%2F')
 dataset_nested = f"{dataset}/sub1"
-dataset_nested_url = dataset_nested.replace('/', '%2F')
 
 SMB_NAME = "SMBVSS"
 smb_path = "/mnt/" + dataset
@@ -49,6 +38,7 @@ snapshots = {
 
 
 def check_previous_version_exists(path, home=False):
+    ip = truenas_server.ip
     cmd = [
         'smbclient',
         f'//{ip}/{SMB_NAME if not home else SMB_USER}',
@@ -114,18 +104,8 @@ def check_previous_version_contents(path, contents, offset):
 @pytest.mark.parametrize('ds', [dataset, dataset_nested])
 @pytest.mark.dependency(name="VSS_DATASET_CREATED")
 def test_001_creating_smb_dataset(request, ds):
-    depends(request, ["pool_04"], scope="session")
-    payload = {
-        "name": ds,
-        "share_type": "SMB"
-    }
-    results = POST("/pool/dataset/", payload)
-    assert results.status_code == 200, results.text
-    result = POST("/zfs/snapshot/", {
-        "dataset": ds,
-        "name": "init",
-    })
-    assert result.status_code == 200, results.text
+    assert call("pool.dataset.create", {"name": ds, "share_type": "SMB"})
+    assert call("pool.snapshot.create", {"dataset": ds, "name": "init"})
 
 
 @pytest.mark.dependency(name="VSS_USER_CREATED")
@@ -134,71 +114,54 @@ def test_002_creating_shareuser_to_test_acls(request):
 
     global vssuser_id
     global next_uid
-    results = GET('/user/get_next_uid/')
-    assert results.status_code == 200, results.text
-    next_uid = results.json()
-
-    payload = {
+    next_uid = call('user.get_next_uid')
+    vssuser_id = call("user.create", {
         "username": SMB_USER,
         "full_name": "SMB User",
         "group_create": True,
         "password": SMB_PWD,
         "uid": next_uid,
-    }
-    results = POST("/user/", payload)
-    assert results.status_code == 200, results.text
-    vssuser_id = results.json()
+    })['id']
 
 
 def test_003_changing_dataset_owner(request):
     depends(request, ["VSS_USER_CREATED"])
-    payload = {
-        'path': smb_path,
-        'uid': next_uid,
-        'options': {'recursive': True, 'traverse': True},
-    }
-    results = POST('/filesystem/chown/', payload)
-    assert results.status_code == 200, results.text
-    job_id = results.json()
-    job_status = wait_on_job(job_id, 180)
-    assert job_status['state'] == 'SUCCESS', str(job_status['results'])
+    call(
+        "filesystem.chown",
+        {
+            'path': smb_path,
+            'uid': next_uid,
+            'options': {'recursive': True, 'traverse': True},
+        },
+        job=True
+    )
 
 
 @pytest.mark.dependency(name="VSS_SHARE_CREATED")
 def test_004_creating_a_smb_share_path(request):
-    depends(request, ["VSS_DATASET_CREATED", "ssh_password"], scope="session")
+    depends(request, ["VSS_DATASET_CREATED"], scope="session")
     global payload, results, smb_id
-    payload = {
+    smb_id = call("sharing.smb.create", {
         "comment": "SMB VSS Testing Share",
         "path": smb_path,
         "name": SMB_NAME,
-        "purpose": "NO_PRESET",
-    }
-    results = POST("/sharing/smb/", payload)
-    assert results.status_code == 200, results.text
-    smb_id = results.json()['id']
-
+        "purpose": "LEGACY_SHARE",
+    })['id']
     cmd = f'mkdir {smb_path}/{SMB_USER}; zpool sync; net cache flush'
-    results = SSH_TEST(cmd, user, password, ip)
+    results = SSH_TEST(cmd, user, password)
     assert results['result'] is True, {"cmd": cmd, "res": results['output']}
 
 
 @pytest.mark.dependency(name="VSS_SMB_SERVICE_STARTED")
 def test_005_starting_cifs_service(request):
     depends(request, ["VSS_SHARE_CREATED"])
-    payload = {"service": "cifs"}
-    results = POST("/service/start/", payload)
-    assert results.status_code == 200, results.text
+    assert call("service.control", "START", "cifs", job=True)
 
 
 @pytest.mark.dependency(name="VSS_SMB1_ENABLED")
 def test_006_enable_smb1(request):
     depends(request, ["VSS_SHARE_CREATED"])
-    payload = {
-        "enable_smb1": True,
-    }
-    results = PUT("/smb/", payload)
-    assert results.status_code == 200, results.text
+    assert call("smb.update", {"minimum_protocol": "SMB1"})
 
 
 @pytest.mark.dependency(name="SHARE_HAS_SHADOW_COPIES")
@@ -211,7 +174,6 @@ def test_007_check_shadow_copies(request, proto):
     depends(request, ["VSS_USER_CREATED"])
     c = SMB()
     snaps = c.get_shadow_copies(
-        host=ip,
         share=SMB_NAME,
         username=SMB_USER,
         password=SMB_PWD,
@@ -229,7 +191,7 @@ def test_008_set_up_testfiles(request, payload):
     i = int(payload[-1])
     offset = i * 2 * len(payload)
     c = SMB()
-    c.connect(host=ip, share=SMB_NAME, username=SMB_USER, password=SMB_PWD, smb1=False)
+    c.connect(share=SMB_NAME, username=SMB_USER, password=SMB_PWD, smb1=False)
 
     for f in to_check:
         fd = c.create_file(f, "w")
@@ -241,12 +203,11 @@ def test_008_set_up_testfiles(request, payload):
         c.close(fd)
 
     sleep(5)
-    result = POST("/zfs/snapshot/", {
+    assert call("pool.snapshot.create", {
         "dataset": dataset,
         "name": payload,
         "recursive": True,
     })
-    assert result.status_code == 200, results.text
 
 
 @pytest.mark.parametrize('proto', ["SMB1", "SMB2"])
@@ -258,7 +219,6 @@ def test_009_check_shadow_copies_count_after_setup(request, proto):
     depends(request, ["VSS_USER_CREATED"])
     c = SMB()
     snaps = c.get_shadow_copies(
-        host=ip,
         share=SMB_NAME,
         username=SMB_USER,
         password=SMB_PWD,
@@ -303,11 +263,10 @@ def test_010_check_previous_versions_of_testfiles(request, zfs, gmt_data):
 
 def test_011_convert_to_home_share(request):
     depends(request, ["VSS_TESTFILES_VALIDATED"])
-    payload = {
-        "home": True,
-    }
-    results = PUT(f"/sharing/smb/id/{smb_id}", payload)
-    assert results.status_code == 200, results.text
+    assert call("sharing.smb.update", smb_id, {
+        "purpose": "LEGACY_SHARE",
+        "options": {"home": True}
+    })
 
 
 @pytest.mark.parametrize('zfs, gmt_data', snapshots.items())
@@ -332,35 +291,30 @@ def test_012_check_previous_versions_of_testfiles_home_share(request, zfs, gmt_d
 
 def test_050_delete_smb_user(request):
     depends(request, ["VSS_USER_CREATED"])
-    results = DELETE(f"/user/id/{vssuser_id}/", {"delete_group": True})
-    assert results.status_code == 200, results.text
+    call("user.delete", vssuser_id, {"delete_group": True})
+    call("sharing.smb.delete", smb_id)
 
 
 def test_051_disable_smb1(request):
     depends(request, ["VSS_SMB1_ENABLED"])
-    payload = {
-        "enable_smb1": False,
-        "aapl_extensions": False,
-    }
-    results = PUT("/smb/", payload)
-    assert results.status_code == 200, results.text
+    assert call("smb.update", {"minimum_protocol": "SMB2", "aapl_extensions": False})
 
 
 def test_052_stopping_smb_service(request):
     depends(request, ["VSS_SMB_SERVICE_STARTED"])
-    payload = {"service": "cifs"}
-    results = POST("/service/stop/", payload)
-    assert results.status_code == 200, results.text
+    assert call("service.control", "STOP", "cifs", job=True)
     sleep(1)
 
 
 def test_053_checking_if_smb_is_stoped(request):
     depends(request, ["VSS_SMB_SERVICE_STARTED"])
-    results = GET("/service?service=cifs")
-    assert results.json()[0]['state'] == "STOPPED", results.text
+    assert call(
+        "service.query",
+        [["service", "=", "cifs"]],
+        {"get": True},
+    )["state"] == "STOPPED"
 
 
 def test_054_destroying_smb_dataset(request):
     depends(request, ["VSS_DATASET_CREATED"])
-    results = DELETE(f"/pool/dataset/id/{dataset_url}/", {'recursive': True})
-    assert results.status_code == 200, results.text
+    call("pool.dataset.delete", dataset, {'recursive': True})

@@ -1,38 +1,54 @@
-from collections import deque
-from datetime import datetime, timedelta
+from dataclasses import dataclass
+from datetime import timedelta
+from time import time
+from typing import Any
 
-from systemd import journal
+from middlewared.alert.base import (
+    Alert,
+    AlertCategory,
+    AlertClass,
+    AlertClassConfig,
+    AlertLevel,
+    AlertSource,
+)
+from middlewared.alert.schedule import IntervalSchedule
 
-from middlewared.alert.base import AlertClass, AlertCategory, AlertLevel, Alert, ThreadedAlertSource
+
+@dataclass(kw_only=True)
+class SSHLoginFailuresAlert(AlertClass):
+    config = AlertClassConfig(
+        category=AlertCategory.SYSTEM,
+        level=AlertLevel.WARNING,
+        title="SSH Login Failures",
+        text="%(cnt)d SSH login failures in the last 24 hours",
+    )
+
+    cnt: int
 
 
-class SSHLoginFailuresAlertClass(AlertClass):
-    category = AlertCategory.SYSTEM
-    level = AlertLevel.WARNING
-    title = "SSH Login Failures"
-    text = "%(count)d SSH login failures in the last 24 hours:\n%(failures)s"
+class SSHLoginFailuresAlertSource(AlertSource):
+    schedule = IntervalSchedule(timedelta(hours=24))
 
+    async def check(self) -> list[Alert[Any]] | Alert[Any] | None:
+        cnt = await self.middleware.call(
+            "audit.query",
+            {
+                "services": ["SYSTEM"],
+                "query-filters": [
+                    # current time minus 24h in seconds
+                    ["message_timestamp", ">=", int(time() - 86_400)],
+                    ["success", "=", False],
+                    ["event", "=", "CREDENTIAL"],
+                    ["event_data.auth_action", "=", "USER_AUTH"],
+                    ["event_data.terminal", "=", "ssh"],
+                    ["event_data.function", "=", "PAM:authentication"],
+                ],
+                "query-options": {
+                    "count": True,
+                },
+            },
+        )
+        if cnt > 0:
+            return Alert(SSHLoginFailuresAlert(cnt=cnt))
 
-class SSHLoginFailuresAlertSource(ThreadedAlertSource):
-    def check_sync(self):
-        j = journal.Reader()
-        j.add_match("SYSLOG_IDENTIFIER=sshd")
-        j.seek_realtime(datetime.now() - timedelta(days=1))
-        count = 0
-        last_messages = deque([], 4)
-        for record in j:
-            if record["MESSAGE"].startswith("Failed password for"):
-                count += 1
-                last_messages.append(
-                    f"{record['__REALTIME_TIMESTAMP'].strftime('%d %b %H:%M:%S')}: {record['MESSAGE']}"
-                )
-
-        if count > 0:
-            return Alert(SSHLoginFailuresAlertClass, {
-                "count": count,
-                "failures": "\n".join(
-                    ([f"... first {count - len(last_messages)} messages skipped ..."] if count > len(last_messages)
-                     else []) +
-                    list(last_messages)
-                )
-            }, key=list(last_messages))
+        return None

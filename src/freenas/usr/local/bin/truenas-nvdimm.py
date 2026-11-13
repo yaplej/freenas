@@ -3,6 +3,8 @@ import re
 from subprocess import run
 from packaging import version
 
+from truenas_os_pyutils.io import atomic_write
+
 VERSION = re.compile(r'(?<=Version: ).*')
 PRODUCT = re.compile(r'(?<=Product Name: ).*')
 GEN3_MIN_VERS = version.Version('3.0').major
@@ -24,18 +26,37 @@ def parse_dmi():
 
 
 def write_config(config):
-    with open(NVDIMM_CONF_FILE, 'w') as f:
+    with atomic_write(NVDIMM_CONF_FILE, 'w', tmppath='/etc') as f:
         f.write('\n'.join(config) + '\n')
 
 
-def main():
-    prod, vers = parse_dmi()
+def is_m_series(prod):
+    lower_prod = prod.lower()
+    return all((
+        lower_prod.startswith('truenas-m'),
+        lower_prod.find('mini') == -1,
+    ))
 
-    gen1_2 = gen3 = False
-    if not all((prod, vers)) or not prod.startswith('TRUENAS-M'):
+
+def main():
+    try:
+        prod, vers = parse_dmi()
+    except Exception as e:
+        print(f'Unhandled exception parsing DMI: {e}')
+        return
+
+    if not is_m_series(prod):
         # nvdimm config module is only relevant on m series.
         return
-    elif version.parse(vers).major == GEN3_MIN_VERS:
+
+    try:
+        parsed_version = version.parse(vers)
+    except Exception as e:
+        print(f'Unhandled exception ({e}) parsing DMI version ({vers!r})')
+        return
+
+    gen1_2 = gen3 = False
+    if parsed_version.major == GEN3_MIN_VERS:
         # for now we only check to make sure that the current version is 3 because
         # we quickly found out that the SMBIOS defaults for the system-version value
         # from supermicro aren't very predictable. Since setting these values on a
@@ -55,7 +76,6 @@ def main():
         'options ntb driver_override="ntb_split"',
         'options ntb_transport use_dma=1',
     ]
-
     if gen1_2:
         # single nvdimm on gen1/2 hardware
         options.append('options ntb_split config="ntb_pmem:1:4:0,ntb_transport"')

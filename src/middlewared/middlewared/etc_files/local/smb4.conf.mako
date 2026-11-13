@@ -2,22 +2,22 @@
 # SMB.CONF(5)		The configuration file for the Samba suite 
 #
 <%
-    smb_ha_mode = middleware.call_sync('smb.get_smb_ha_mode')
-    failover_status = middleware.call_sync('failover.status')
+   shares = render_ctx['smb.generate_smb_configuration'].pop('SHARES', [])
 %>
 
 [global]
-    % if failover_status in ('SINGLE', 'MASTER'):
-    % if smb_ha_mode == "CLUSTERED":
-    clustering = Yes
-    ctdb:registry.tdb = Yes
-    kernel share modes = No
-    include = registry
+% for param, value in render_ctx['smb.generate_smb_configuration'].items():
+    ${param} = ${value}
+% endfor
+
+% for share_name, params in shares.items():
+[${share_name}]
+% for param, value in params.items():
+    % if isinstance(value, list):
+    ${param} = ${' '.join(value)}
     % else:
-    clustering = No
-    include = registry
+    ${param} = ${value}
     % endif
-    % else:
-    clustering = No
-    netbiosname = TN_STANDBY
-    % endif
+% endfor
+
+% endfor

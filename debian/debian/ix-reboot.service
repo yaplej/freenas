@@ -1,0 +1,17 @@
+[Unit]
+Description=Exec TrueNAS reboot tasks
+
+After=network.target middlewared.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=true
+ExecStop=/usr/bin/ha_panic
+ExecStop=/usr/local/bin/scst_util.sh stop-alua
+StandardOutput=null
+StandardError=null
+TimeoutStopSec=0
+
+[Install]
+WantedBy=multi-user.target

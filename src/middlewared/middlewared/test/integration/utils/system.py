@@ -1,0 +1,49 @@
+import os
+import sys
+
+from middlewared.test.integration.utils import truenas_server
+
+from .ssh import ssh
+
+try:
+    apifolder = os.getcwd()
+    sys.path.append(apifolder)
+    from auto_config import ha
+except ImportError:
+    ha = False
+
+__all__ = ["restart_systemd_svc", "get_gssproxy_state"]
+
+
+def restart_systemd_svc(svc_to_restart: str, remote_node: bool = False):
+    """
+    --- CI testing function ---
+    Command a service restart via systemctl.
+    Optional to request command on remote node (HA only)
+    NOTE: May be unstable with calls to standby node.
+    """
+    assert ssh(f"systemctl status {svc_to_restart}")
+    node_ip = None
+    if remote_node:
+        assert ha is True, "Cannot select remote_node on non-HA system"
+        ha_ips = truenas_server.ha_ips()
+        node_ip = ha_ips['standby']
+
+    assert ssh(f"systemctl restart {svc_to_restart}", ip=node_ip), \
+        (ssh(f"systemctl status {svc_to_restart}", ip=node_ip),
+         ssh(f"journalctl -xeu {svc_to_restart} | tail -100", ip=node_ip))
+
+
+def get_gssproxy_state() -> int | None:
+    """
+    Return value of /proc/net/rpc/use-gss-proxy or
+    None if proc file does not exist or read failure
+    """
+    rv = None
+    try:
+        val = ssh("cat /proc/net/rpc/use-gss-proxy")
+        rv = int(val)
+    except Exception:
+        pass
+
+    return rv

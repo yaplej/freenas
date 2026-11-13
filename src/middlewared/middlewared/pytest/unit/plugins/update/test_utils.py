@@ -22,10 +22,6 @@ from middlewared.plugins.update_.utils import can_update
     ("22.02.0", "22.02.1", True),
     # Anything can be updated to a MASTER release
     ("TrueNAS-SCALE-22.02-RC.1", "TrueNAS-SCALE-22.02-MASTER-20211029-134913", True),
-    # Anything can be updated to a INTERNAL build
-    ("TrueNAS-SCALE-22.02-RC.1", "TrueNAS-SCALE-22.02-INTERNAL-225", True),
-    # Master release can't be updated to INTERNAL build because INTERNAL are usually a bit outdated
-    ("TrueNAS-SCALE-22.02-MASTER-20211029-134913", "TrueNAS-SCALE-22.02-INTERNAL-225", False),
     # Older MASTER to newer MASTER
     ("TrueNAS-SCALE-22.02-MASTER-20211029-134913", "TrueNAS-SCALE-22.02-MASTER-20211029-205533", True),
     # Older INTERNAL to newer INTERNAL
@@ -34,7 +30,20 @@ from middlewared.plugins.update_.utils import can_update
     ("TrueNAS-SCALE-22.02-RC.1", "TrueNAS-SCALE-22.02-CUSTOM", True),
     ("TrueNAS-SCALE-22.02-MASTER-20211029-134913", "TrueNAS-SCALE-22.02-CUSTOM", True),
     ("22.02.0", "22.02.CUSTOM", True),
+    ("22.12.2-INTERNAL.9", "22.12.2-INTERNAL.11", True),
+    # Once per year cadence
+    ("25.10.2", "26-BETA.1", True),
+    ("26-BETA.1", "26.0", True),
+    ("25.10.2", "26.0", True),
 ])
 def test__can_update(old_version, new_version, result):
     assert can_update(old_version, new_version) is result
     assert can_update(new_version, old_version) is not result
+
+
+def test_can_update_internal_to_anything():
+    assert can_update("TrueNAS-SCALE-22.02-INTERNAL-225", "TrueNAS-SCALE-22.02-RC.1")
+
+
+def test_can_update_anything_to_internal():
+    assert can_update("TrueNAS-SCALE-22.02-RC.1", "TrueNAS-SCALE-22.02-INTERNAL-225")

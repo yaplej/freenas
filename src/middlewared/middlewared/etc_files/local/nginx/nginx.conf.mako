@@ -1,77 +1,117 @@
 <%
-    import contextlib
     import ipaddress
     import os
+    import re
+
+    from middlewared.alert.source.certificates import WebUiCertificateSetupFailedAlert
+    from middlewared.logger import NGINX_LOG_PATH
+    from middlewared.plugins.certificate.dhparam import DHPARAM_PEM_PATH
+    from middlewared.plugins.truenas_connect.utils import ALLOWED_ORIGIN_RE
 
     # Let's ensure that /var/log/nginx directory exists
-    if not os.path.exists('/var/log/nginx'):
-        os.makedirs('/var/log/nginx')
+    os.makedirs(NGINX_LOG_PATH, exist_ok=True)
 
-    with contextlib.suppress(OSError):
-        os.unlink('/var/log/nginx/error.log')
+    # The error log should be a real file owned by nginx
+    fix_error_file = False
+    nginx_error_log = os.path.join(NGINX_LOG_PATH, 'error.log')
+    try:
+        fix_error_file = os.path.islink(nginx_error_log)
+    except FileNotFoundError:
+        fix_error_file = True
 
-    # nginx unconditionally opens this file and never closes, preventing us from unmounting system dataset
-    os.symlink('/dev/null', '/var/log/nginx/error.log')
+    if fix_error_file:
+        try:
+            os.remove(nginx_error_log)
+        except Exception:
+            pass
+
+        with open(nginx_error_log, 'w') as f:
+            pass
+
+        # Match owner and permissions to access.log: ['www-data','adm']
+        nginx_uid = middleware.call_sync2(middleware.services.user.get_builtin_user_id, 'www-data')
+        nginx_gid = middleware.call_sync2(middleware.services.group.get_builtin_group_id, 'adm')
+        os.chown(nginx_error_log, nginx_uid, nginx_gid)
+        os.chmod(nginx_error_log, 0o640)
+
 
     general_settings = middleware.call_sync('system.general.config')
-    cert = general_settings['ui_certificate']
-    dhparams_file = middleware.call_sync('certificate.dhparam')
+    cert = None
+    if general_settings['ui_certificate']:
+        # Use query instead of get_instance to avoid raising exceptions that could break nginx rendering
+        cert_list = middleware.call_sync2(
+            middleware.services.certificate.query,
+            [["id", "=", general_settings['ui_certificate']]],
+        )
+        if cert_list:
+            cert = cert_list[0].model_dump(expose_secrets=True)
+
     x_frame_options = '' if general_settings['ui_x_frame_options'] == 'ALLOW_ALL' else general_settings['ui_x_frame_options']
 
-    # We can't afford nginx not running due to `bind(): Can't assign requested address` so we check that listen
-    # addresses exist.
-    ip_in_use = [ip['address'] for ip in middleware.call_sync('interface.ip_in_use', {'ipv6_link_local': False})]
+    ip_list = []
+    for ip in general_settings['ui_address']:
+        ip_list.append(ip)
 
-    middleware.call_sync('alert.oneshot_delete', 'WebUiBindAddressV2', 'IPv4')
-    if general_settings['ui_address'] == ['0.0.0.0']:
-        ip4_list = general_settings['ui_address']
-    else:
-        ip4_list = [ip for ip in general_settings['ui_address'] if ip in ip_in_use]
-        ip4_absent = [ip for ip in general_settings['ui_address'] if ip not in ip_in_use]
-        if ip4_absent:
-            ip4_list = ['0.0.0.0']
-            middleware.call_sync('alert.oneshot_create', 'WebUiBindAddressV2', {
-                'family': 'IPv4',
-                'addresses': ', '.join(ip4_absent),
-                'wildcard': '0.0.0.0',
-            })
-
-    middleware.call_sync('alert.oneshot_delete', 'WebUiBindAddressV2', 'IPv6')
-    if general_settings['ui_v6address'] == ['::']:
-        ip6_list = general_settings['ui_v6address']
-    else:
-        ip6_list = [ip for ip in general_settings['ui_v6address'] if ip in ip_in_use]
-        ip6_absent = [ip for ip in general_settings['ui_v6address'] if ip not in ip_in_use]
-        if ip6_absent:
-            ip6_list = ['::']
-            middleware.call_sync('alert.oneshot_create', 'WebUiBindAddressV2', {
-                'family': 'IPv6',
-                'addresses': ', '.join(ip6_absent),
-                'wildcard': '::',
-            })
-    ip6_list = [f'[{ip}]' for ip in ip6_list]
+    for ip in general_settings['ui_v6address']:
+        ip_list.append(f'[{ip}]')
 
     wg_config = middleware.call_sync('datastore.config', 'system.truecommand')
-    if middleware.call_sync('truecommand.connected')['connected'] and wg_config['wg_address']:
-        ip4_list.append(ipaddress.ip_network(wg_config['wg_address'], False).network_address)
-
-    ip_list = ip4_list + ip6_list
+    if wg_config['wg_address']:
+        ip_list.append(ipaddress.ip_network(wg_config['wg_address'], False).network_address)
 
     # Let's verify that required SSL support in the backend is complete by middlewared
-    if not cert or middleware.call_sync('certificate.cert_services_validation', cert['id'], 'nginx.certificate', False):
+    if not cert or middleware.call_sync2(
+        middleware.services.certificate.cert_services_validation,
+        cert['id'], 'nginx.certificate', False,
+    ):
         ssl_configuration = False
-        middleware.call_sync('alert.oneshot_create', 'WebUiCertificateSetupFailed', None)
+        middleware.call_sync2(middleware.services.alert.oneshot_create, WebUiCertificateSetupFailedAlert())
     else:
         ssl_configuration = True
-        middleware.call_sync('alert.oneshot_delete', 'WebUiCertificateSetupFailed', None)
+        middleware.call_sync2(middleware.services.alert.oneshot_delete, 'WebUiCertificateSetupFailed', None)
 
     system_version = middleware.call_sync('system.version')
+
+    # Check if FIPS mode is enabled
+    fips_enabled = middleware.call_sync2(middleware.services.system.security.info.fips_enabled)
+
+    sts_max_age = 31536000 if general_settings['ui_httpsredirect'] else 0
 
     if not any(i in general_settings['ui_httpsprotocols'] for i in ('TLSv1', 'TLSv1.1')):
         disabled_ciphers = ':!SHA1:!SHA256:!SHA384'
     else:
         disabled_ciphers = ''
     display_device_path = middleware.call_sync('vm.get_vm_display_nginx_route')
+    display_devices = middleware.call_sync('vm.device.query', [['attributes.dtype', '=', 'DISPLAY']])
+
+    tn_connect_config = middleware.call_sync2(middleware.services.tn_connect.config)
+    has_tn_connect = tn_connect_config.certificate is not None
+    # Validated when set; checked again so nothing else can reach the configuration.
+    tnc_allowed_origins = [o for o in tn_connect_config.allowed_origins if ALLOWED_ORIGIN_RE.fullmatch(o)]
+    try:
+        tnc_basename = middleware.call_sync2(middleware.services.tn_connect.hostname.basename_from_cert)
+        tnc_cert = middleware.call_sync2(
+            middleware.services.certificate.get_instance, tn_connect_config.certificate,
+        ).model_dump(expose_secrets=True) if tn_connect_config.certificate else None
+    except Exception:
+        # This should not happen but better safe then sorry as we don't want to disrupt nginx configuration
+        tnc_basename = tnc_cert = None
+        middleware.logger.exception('Failed to retrieve TNC certificate information')
+
+    servers = []
+    if tnc_cert and tnc_basename:
+        servers.append({
+            'name': tnc_basename,
+            'cert': tnc_cert,
+            'default_server': False,
+            })
+
+    servers.append({
+        'name': 'localhost',
+        'cert': cert if ssl_configuration else None,
+        'default_server': True,
+    })
+    current_api_version = middleware.api_versions[-1].version
 %>
 #
 #    TrueNAS nginx configuration file
@@ -87,6 +127,8 @@ events {
 http {
     include       mime.types;
     default_type  application/octet-stream;
+    # We need this because TNC domain exceeds 64
+    server_names_hash_bucket_size 128;
 
     # Types to enable gzip compression on
     gzip_types
@@ -115,190 +157,378 @@ http {
     # Disable tokens for security (#23684)
     server_tokens off;
 
+% if fips_enabled:
+    # Hide server information in error pages
+    # NOTE: This is a DoDin requirement, so don't remove
+    proxy_hide_header X-Powered-By;
+    proxy_hide_header Server;
+
+% endif
     gzip  on;
-    #upload_store /var/tmp/firmware;
-    client_body_temp_path /var/tmp/firmware;
 
-    access_log off;
-    error_log syslog:server=unix:/dev/log,nohostname;
+% if fips_enabled:
+    # Disable gzip for responses with cookies (BREACH attack mitigation)
+    # NOTE: will be controlled per-response based on Set-Cookie header
+    gzip_vary on;
+    gzip_proxied any;
+    gzip_disable "msie6";
 
+% endif
+    access_log /var/log/nginx/access.log combined buffer=32k flush=5s;
+    error_log /var/log/nginx/error.log;
+
+    # All middleware API/UI traffic is proxied over a private unix socket
+    upstream middlewared {
+        server unix:/run/middleware/middlewared-nginx.sock;
+    }
+
+    map $http_upgrade $connection_upgrade {
+        default upgrade;
+        '' close;
+    }
+
+    map $http_origin $allow_origin {
+        # Escaped: an unescaped `.` matches any character, so look-alike hosts would match too.
+        ~^${re.escape(str(tn_connect_config.tnc_base_url).rstrip("/"))}$ $http_origin;
+% if str(tn_connect_config.account_service_base_url).split('.')[1] in ('dev', 'staging'):
+        # Make CORS exception for localhost:4200 for internal development environments
+        ~^http://localhost:4200$ $http_origin;
+        ~^http://127\.0\.0\.1:4200$ $http_origin;
+% endif
+        default "";
+    }
+
+    # /api/versions also answers tn_connect.allowed_origins, for TNC clients run against this system from
+    # elsewhere (an ephemeral TNC stack, local development, CI). /_download keeps $allow_origin alone.
+    # Regex entries, like those above, because exact keys would have to fit map_hash_bucket_size.
+    map $http_origin $tnc_versions_allow_origin {
+% for origin in tnc_allowed_origins:
+        ~^${re.escape(origin)}$ $http_origin;
+% endfor
+        default $allow_origin;
+    }
+
+% if fips_enabled:
+    # Map to detect if response has Set-Cookie header (for disabling gzip)
+    map $sent_http_set_cookie $no_gzip_cookie {
+        ~.+ "1";
+        default "0";
+    }
+
+% endif
+% for server in servers:
     server {
-        server_name  localhost;
-% if ssl_configuration:
+        server_name  ${server['name']};
+% if server['cert']:
     % for ip in ip_list:
-        listen                 ${ip}:${general_settings['ui_httpsport']} default_server ssl http2;
+        listen                 ${ip}:${general_settings['ui_httpsport']} ${'default_server' if server['default_server'] else ''} ssl;
     % endfor
 
-        ssl_certificate        "${cert['certificate_path']}";
-        ssl_certificate_key    "${cert['privatekey_path']}";
-        ssl_dhparam "${dhparams_file}";
-
+        http2 on;
+        ssl_certificate        "${server['cert']['certificate_path']}";
+        ssl_certificate_key    "${server['cert']['privatekey_path']}";
+        ssl_dhparam "${DHPARAM_PEM_PATH}";
         ssl_session_timeout    120m;
         ssl_session_cache      shared:ssl:16m;
-
         ssl_protocols ${' '.join(general_settings['ui_httpsprotocols'])};
         ssl_prefer_server_ciphers on;
         ssl_ciphers EECDH+ECDSA+AESGCM:EECDH+aRSA+AESGCM:EECDH+ECDSA${"" if disabled_ciphers else "+SHA256"}:EDH+aRSA:EECDH:!RC4:!aNULL:!eNULL:!LOW:!3DES:!MD5:!EXP:!PSK:!SRP:!DSS${disabled_ciphers};
 
         ## If oscsp stapling is a must in cert extensions, we should make sure nginx respects that
         ## and handles clients accordingly.
-        % if 'Tlsfeature' in cert['extensions']:
+        % if 'Tlsfeature' in server['cert']['extensions']:
         ssl_stapling on;
         ssl_stapling_verify on;
         % endif
         #resolver ;
         #ssl_trusted_certificate ;
 % endif
-
-% if not general_settings['ui_httpsredirect'] or not ssl_configuration:
+% if not general_settings['ui_httpsredirect'] or not server['cert']:
     % for ip in ip_list:
         listen       ${ip}:${general_settings['ui_port']};
     % endfor
 % endif
-
 % if general_settings['ui_allowlist']:
     % for ip in general_settings['ui_allowlist']:
         allow ${ip};
     % endfor
         deny all;
 % endif
-
-        # Security Headers
-        add_header Strict-Transport-Security "max-age=${63072000 if general_settings['ui_httpsredirect'] else 0}; includeSubDomains; preload" always;
-        add_header X-Content-Type-Options "nosniff" always;
-        add_header X-XSS-Protection "1; mode=block" always;
-        add_header Permissions-Policy "geolocation=(),midi=(),sync-xhr=(),microphone=(),camera=(),magnetometer=(),gyroscope=(),fullscreen=(self),payment=()" always;
-        add_header Referrer-Policy "strict-origin" always;
+<%def name="security_headers(indent=8)">
+<% spaces = ' ' * indent %>
+${spaces}# Security Headers
+${spaces}add_header Strict-Transport-Security "max-age=${sts_max_age}; includeSubDomains" always;
+${spaces}add_header X-Content-Type-Options "nosniff" always;
+${spaces}add_header X-XSS-Protection "1; mode=block" always;
+${spaces}add_header Permissions-Policy "geolocation=(),midi=(),sync-xhr=(),microphone=(),camera=(),magnetometer=(),gyroscope=(),fullscreen=(self),payment=()" always;
+${spaces}add_header Referrer-Policy "strict-origin" always;
 % if x_frame_options:
-        add_header X-Frame-Options "${x_frame_options}" always;
+${spaces}add_header X-Frame-Options "${x_frame_options}" always;
 % endif
-
+</%def>
+<%def name="security_headers_enhanced(indent=8)">
+<% spaces = ' ' * indent %>
+${spaces}# NOTE: These are, generaly, good practice but they
+${spaces}# are also here for DoDin requirements so do not remove.
+${spaces}proxy_cookie_path / "/; Secure; HttpOnly; SameSite=Strict";
+${spaces}proxy_cookie_flags ~ secure httponly;
+${spaces}# Disable gzip for responses with cookies (BREACH attack mitigation)
+${spaces}gzip off;
+</%def>
+        ${security_headers()}
         location / {
             allow all;
             rewrite ^.* $scheme://$http_host/ui/ redirect;
         }
 
-        location ${display_device_path} {
-            rewrite ${display_device_path}/(.*) /$1  break;
-            proxy_pass http://${middleware.call_sync('vm.get_haproxy_uri')}/;
+% for device in display_devices:
+        location ${display_device_path}/${device.id} {
+    % if ":" in device.attributes.bind:
+            proxy_pass http://[${device.attributes.bind}]:${device.attributes.web_port}/;
+    % else:
+            proxy_pass http://${device.attributes.bind}:${device.attributes.web_port}/;
+    % endif
             proxy_http_version 1.1;
             proxy_set_header X-Real-Remote-Addr $remote_addr;
             proxy_set_header X-Real-Remote-Port $remote_port;
+            proxy_set_header X-Https $https;
             proxy_set_header X-Forwarded-For $remote_addr;
             proxy_set_header Upgrade $http_upgrade;
-            proxy_set_header Connection "Upgrade";
+            proxy_set_header Connection $connection_upgrade;
+            # Every SPICE channel gets its own websocket, and the server only
+            # pings the inputs and cursor channels every 300s, so the 60s
+            # default closes them on a console nobody is touching. The display
+            # channel keeps painting, which leaves a console that looks alive
+            # but ignores the keyboard and mouse.
+            proxy_read_timeout 3600;
+            proxy_send_timeout 3600;
         }
-
+% endfor
         location /progress {
             # report uploads tracked in the 'proxied' zone
             report_uploads proxied;
         }
 
-        location /api/docs {
-            proxy_pass http://127.0.0.1:6000/api/docs;
-            proxy_set_header Host $http_host;
-            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-            proxy_set_header X-Scheme $scheme;
-            proxy_set_header X-Script-Name /api/docs;
+        location /api {
+            allow all;  # This is handled by `Middleware.ws_can_access` because if we return HTTP 403, browser security
+                        # won't allow us to understand that connection error was due to client IP not being allowlisted.
+            proxy_pass http://middlewared/api;
+            proxy_http_version 1.1;
+            proxy_set_header X-Real-Remote-Addr $remote_addr;
+            proxy_set_header X-Real-Remote-Port $remote_port;
+            proxy_set_header X-Https $https;
+            proxy_set_header Upgrade $http_upgrade;
+            proxy_set_header Connection "upgrade";
+            proxy_read_timeout 3600;
+            proxy_send_timeout 3600;
+% if fips_enabled:
+            ${security_headers_enhanced(indent=12)}
+% endif
         }
 
-        location /api/docs/restful/static {
-            alias /usr/local/share/swagger-ui-dist;
+        location ~ ^/api/docs/?$ {
+            rewrite .* /api/docs/current redirect;
+        }
+
+        location /api/docs {
+            alias /usr/share/middlewared/docs;
+            add_header Cache-Control "no-store, no-cache, must-revalidate, max-age=0";
+            add_header Expires 0;
+        }
+
+        location /api/docs/current {
+            alias /usr/share/middlewared/docs/${current_api_version};
+            add_header Cache-Control "no-store, no-cache, must-revalidate, max-age=0";
+            add_header Expires 0;
+        }
+
+        location /api/versions {
+            allow all;  # This is handled by `Middleware.ws_can_access` because if we return HTTP 403, browser security
+                        # won't allow us to understand that connection error was due to client IP not being allowlisted.
+% if has_tn_connect or tnc_allowed_origins:
+            # Allow all internal origins.
+            add_header Access-Control-Allow-Origin $tnc_versions_allow_origin always;
+            add_header Access-Control-Allow-Headers "*" always;
+            add_header Vary Origin always;
+% endif
+            proxy_pass http://middlewared/api/versions;
+            proxy_http_version 1.1;
+            proxy_set_header X-Real-Remote-Addr $remote_addr;
+            proxy_set_header X-Real-Remote-Port $remote_port;
+            proxy_set_header X-Https $https;
+            proxy_set_header Upgrade $http_upgrade;
+            proxy_set_header Connection "upgrade";
+% if fips_enabled:
+            ${security_headers_enhanced(indent=12)}
+% endif
+        }
+
+        location @index {
+            add_header Cache-Control "no-store, no-cache, must-revalidate, max-age=0";
+            add_header Expires 0;
+            ${security_headers(indent=12)}
+            root /usr/share/truenas/webui;
+            try_files /index.html =404;
+        }
+
+        location = /ui/ {
+            allow all;
+            add_header Cache-Control "no-store, no-cache, must-revalidate, max-age=0" always;
+            add_header Clear-Site-Data '"cache"' always;
+            add_header Etag "${system_version}";
+            ${security_headers(indent=12)}
+            add_header Expires 0;
+            root /usr/share/truenas/webui;
+            try_files /index.html =404;
+        }
+
+        location = /ui/sw.js {
+            allow all;
+
+            # `allow`/`deny` are not allowed in `if` blocks so we'll have to make that check in the middleware itself.
+            proxy_set_header X-Real-Remote-Addr $remote_addr;
+            proxy_set_header X-Https $https;
+
+            add_header Cache-Control "no-store, no-cache, must-revalidate, max-age=0" always;
+            add_header Clear-Site-Data '"cache"' always;
+            add_header Etag "${system_version}";
+            ${security_headers(indent=12)}
+            add_header Expires 0;
+
+            alias /usr/share/truenas/webui/sw.js;
+        }
+
+        location = /ui/index.html {
+            allow all;
+
+            # `allow`/`deny` are not allowed in `if` blocks so we'll have to make that check in the middleware itself.
+            proxy_set_header X-Real-Remote-Addr $remote_addr;
+            proxy_set_header X-Https $https;
+
+            add_header Cache-Control "no-store, no-cache, must-revalidate, max-age=0" always;
+            add_header Clear-Site-Data '"cache"' always;
+            add_header Etag "${system_version}";
+            ${security_headers(indent=12)}
+            add_header Expires 0;
+
+            alias /usr/share/truenas/webui/index.html;
         }
 
         location /ui {
             allow all;
-            if ( $request_method ~ ^POST$ ) {
-                proxy_pass http://127.0.0.1:6000;
-            }
+
             # `allow`/`deny` are not allowed in `if` blocks so we'll have to make that check in the middleware itself.
             proxy_set_header X-Real-Remote-Addr $remote_addr;
+            proxy_set_header X-Https $https;
 
-            try_files $uri $uri/ /index.html =404;
-            alias /usr/share/truenas/webui;
             add_header Cache-Control "must-revalidate";
             add_header Etag "${system_version}";
-            add_header Strict-Transport-Security "max-age=${63072000 if general_settings['ui_httpsredirect'] else 0}; includeSubDomains; preload" always;
-            add_header X-Content-Type-Options "nosniff" always;
-            add_header X-XSS-Protection "1; mode=block" always;
-            add_header Permissions-Policy "geolocation=(),midi=(),sync-xhr=(),microphone=(),camera=(),magnetometer=(),gyroscope=(),fullscreen=(self),payment=()" always;
-            add_header Referrer-Policy "strict-origin" always;
-% if x_frame_options:
-            add_header X-Frame-Options "${x_frame_options}" always;
-% endif
+            ${security_headers(indent=12)}
+
+            alias /usr/share/truenas/webui;
+            try_files $uri $uri/ @index;
         }
 
         location /websocket {
             allow all;  # This is handled by `Middleware.ws_can_access` because if we return HTTP 403, browser security
                         # won't allow us to understand that connection error was due to client IP not being allowlisted.
-            proxy_pass http://127.0.0.1:6000/websocket;
+            proxy_pass http://middlewared/websocket;
             proxy_http_version 1.1;
             proxy_set_header X-Real-Remote-Addr $remote_addr;
             proxy_set_header X-Real-Remote-Port $remote_port;
+            proxy_set_header X-Https $https;
             proxy_set_header Upgrade $http_upgrade;
             proxy_set_header Connection "upgrade";
+            proxy_read_timeout 3600;
+            proxy_send_timeout 3600;
+% if fips_enabled:
+            ${security_headers_enhanced(indent=12)}
+% endif
         }
 
         location /websocket/shell {
             allow all;  # This is handled by `Middleware.ws_can_access` because if we return HTTP 403, browser security
                         # won't allow us to understand that connection error was due to client IP not being allowlisted.
-            proxy_pass http://127.0.0.1:6000/_shell;
+            proxy_pass http://middlewared/_shell;
             proxy_http_version 1.1;
             proxy_set_header X-Real-Remote-Addr $remote_addr;
             proxy_set_header X-Real-Remote-Port $remote_port;
+            proxy_set_header X-Https $https;
             proxy_set_header Upgrade $http_upgrade;
             proxy_set_header Connection "upgrade";
             proxy_send_timeout 7d;
             proxy_read_timeout 7d;
+% if fips_enabled:
+            ${security_headers_enhanced(indent=12)}
+% endif
         }
 
         location /api/v2.0 {
 	    # do not add the path to proxy_pass because of automatic url decoding
 	    # e.g. /api/v2.0/pool/dataset/id/tank%2Ffoo/ would become
 	    #      /api/v2.0/pool/dataset/id/tank/foo/
-            proxy_pass http://127.0.0.1:6000;
+            proxy_pass http://middlewared;
             proxy_http_version 1.1;
             proxy_set_header X-Real-Remote-Addr $remote_addr;
             proxy_set_header X-Real-Remote-Port $remote_port;
+            proxy_set_header X-Https $https;
             proxy_set_header Host $host;
             proxy_set_header X-Forwarded-For $remote_addr;
             proxy_set_header X-Server-Port $server_port;
             proxy_set_header X-Scheme $Scheme;
+% if fips_enabled:
+            ${security_headers_enhanced(indent=12)}
+% endif
         }
 
         location /_download {
-            proxy_pass http://127.0.0.1:6000;
+% if has_tn_connect:
+            # Allow all internal origins.
+            add_header Access-Control-Allow-Origin $allow_origin always;
+            add_header Access-Control-Allow-Headers "*" always;
+% endif
+            proxy_pass http://middlewared;
             proxy_http_version 1.1;
             proxy_set_header X-Real-Remote-Addr $remote_addr;
             proxy_set_header X-Real-Remote-Port $remote_port;
+            proxy_set_header X-Https $https;
             proxy_read_timeout 10m;
+% if fips_enabled:
+            ${security_headers_enhanced(indent=12)}
+% endif
         }
 
         location /_upload {
             # Allow uploads of any size. Its middlewared job to handle size.
             client_max_body_size 0;
-            proxy_pass http://127.0.0.1:6000;
+            proxy_pass http://middlewared;
             # make sure nginx does not buffer the upload and pass directly to middlewared
             proxy_request_buffering off;
             proxy_http_version 1.1;
             proxy_set_header X-Real-Remote-Addr $remote_addr;
             proxy_set_header X-Real-Remote-Port $remote_port;
-        }
-
-        location /images {
-            allow all;
-            alias /var/db/system/webui/images;
+            proxy_set_header X-Https $https;
+% if fips_enabled:
+            ${security_headers_enhanced(indent=12)}
+% endif
         }
 
         location /_plugins {
-            proxy_pass http://127.0.0.1:6000/_plugins;
+            proxy_pass http://middlewared/_plugins;
             proxy_http_version 1.1;
             proxy_set_header X-Real-Remote-Addr $remote_addr;
             proxy_set_header X-Real-Remote-Port $remote_port;
+            proxy_set_header X-Https $https;
             proxy_set_header Host $host;
             proxy_set_header X-Forwarded-For $remote_addr;
+% if fips_enabled:
+            ${security_headers_enhanced(indent=12)}
+% endif
         }
+
     }
+% endfor
+
 % if general_settings['ui_httpsredirect'] and ssl_configuration:
     server {
     % for ip in ip_list:
@@ -307,6 +537,6 @@ http {
         server_name localhost;
         return 307 https://$host:${general_settings['ui_httpsport']}$request_uri;
     }
-% endif
 
+% endif
 }

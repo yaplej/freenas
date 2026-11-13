@@ -1,9 +1,31 @@
 #!/bin/bash -ex
+
+FORCE_ARG=""
+if [[ "$1" == "--force" ]]; then
+    FORCE_ARG="--force"
+fi
+
+if [[ ! -S /run/middleware/middlewared.sock ]]; then
+    FORCE_ARG="--force"
+fi
+
 PACKAGES=(
+    # need to make things work
+    make
+    # linting
+    mypy
+    # Debian package building tools
+    dpkg-dev
+    dh-python
+    pybuild-plugin-pyproject
+    debhelper-compat
     # open-iscsi is used to test authorized networks for iscsi
     open-iscsi
     # Integration and unit test utils, python package management
+    python3-cryptography
     python3-pip
+    python3-pyfakefs
+    python3-pyotp
     python3-pytest
     python3-pytest-asyncio
     python3-pytest-dependency
@@ -15,14 +37,34 @@ PACKAGES=(
     sshpass
     # Unpack core dumps (https://jira.ixsystems.com/browse/NAS-113855)
     zstd
+    # Need following packages to be able to install cython-iscsi Python package
+    pkg-config
+    libiscsi-dev
 )
 PIP_PACKAGES=(
-    asyncmock
-    asynctest
-    pyfakefs
+    coverage
+    types-boto3
+    types-boto3[s3]
+    # linting
+    import-linter
+    ruff
+    # Render and lint API method docstrings in the unit test suite
+    sphinx
+    sphinx-lint
+    # Dependency of pykmip. No-op on python 3.4+. Just to prevent pip from complaining.
+    enum-compat
 )
 
-chmod +x /usr/bin/apt*
+if [ -f /usr/local/libexec/disable-rootfs-protection ]; then
+    # Running on SCALE
+    /usr/local/libexec/disable-rootfs-protection $FORCE_ARG
+    if [ $? -ne 0 ]; then
+        return 1
+    fi
+fi
+
 apt update
 apt install -y "${PACKAGES[@]}"
-pip install "${PIP_PACKAGES[@]}"
+if [ "${#PIP_PACKAGES[@]}" -gt 0 ]; then
+    pip install --break-system-packages --ignore-installed --root-user-action=ignore "${PIP_PACKAGES[@]}"
+fi

@@ -1,275 +1,11 @@
 # flake8: noqa
+import configparser
 import io
 import textwrap
-from unittest.mock import Mock
 
 import pytest
 
-from middlewared.plugins.cloud_sync import (
-    get_dataset_recursive, FsLockManager, lsjson_error_excerpt, RcloneVerboseLogCutter
-)
-
-
-def test__get_dataset_recursive_1():
-    dataset, recursive = get_dataset_recursive(
-        [
-            {
-                "children": [
-                    {
-                        "children": [],
-                        "properties": {
-                            "mountpoint": {
-                                "value": "/mnt/data/test",
-                            }
-                        }
-                    }
-                ],
-                "properties": {
-                    "mountpoint": {
-                        "value": "/mnt/data",
-                    }
-                }
-            },
-            {
-                "children": [],
-                "properties": {
-                    "mountpoint": {
-                        "value": "/mnt/data/test",
-                    }
-                }
-            }
-        ],
-        "/mnt/data",
-    )
-
-    assert dataset["properties"]["mountpoint"]["value"] == "/mnt/data"
-    assert recursive is True
-
-
-def test__get_dataset_recursive_2():
-    dataset, recursive = get_dataset_recursive(
-        [
-            {
-                "children": [
-                    {
-                        "children": [],
-                        "properties": {
-                            "mountpoint": {
-                                "value": "/mnt/data/test",
-                            }
-                        }
-                    }
-                ],
-                "properties": {
-                    "mountpoint": {
-                        "value": "/mnt/data",
-                    }
-                }
-            },
-            {
-                "children": [],
-                "properties": {
-                    "mountpoint": {
-                        "value": "/mnt/data/test",
-                    }
-                }
-            }
-        ],
-        "/mnt/data/test",
-    )
-
-    assert dataset["properties"]["mountpoint"]["value"] == "/mnt/data/test"
-    assert recursive is False
-
-
-def test__get_dataset_recursive_3():
-    dataset, recursive = get_dataset_recursive(
-        [
-            {
-                "children": [
-                    {
-                        "children": [],
-                        "properties": {
-                            "mountpoint": {
-                                "value": "/mnt/data/test",
-                            }
-                        }
-                    }
-                ],
-                "properties": {
-                    "mountpoint": {
-                        "value": "/mnt/data",
-                    }
-                }
-            },
-            {
-                "children": [],
-                "properties": {
-                    "mountpoint": {
-                        "value": "/mnt/data/test",
-                    }
-                }
-            }
-        ],
-        "/mnt/data/test2",
-    )
-
-    assert dataset["properties"]["mountpoint"]["value"] == "/mnt/data"
-    assert recursive is False
-
-
-def test__get_dataset_recursive_4():
-    dataset, recursive = get_dataset_recursive(
-        [
-            {
-                "children": [
-                    {
-                        "children": [
-                            {
-                                "children": [],
-                                "properties": {
-                                    "mountpoint": {
-                                        "value": "/mnt/data/backup/test0/test1/test2",
-                                    }
-                                }
-                            }
-                        ],
-                        "properties": {
-                            "mountpoint": {
-                                "value": "/mnt/data/backup",
-                            }
-                        }
-                    }
-                ],
-                "properties": {
-                    "mountpoint": {
-                        "value": "/mnt/data",
-                    }
-                }
-            },
-            {
-                "children": [
-                    {
-                        "children": [],
-                        "properties": {
-                            "mountpoint": {
-                                "value": "/mnt/data/backup/test0/test1/test2",
-                            }
-                        }
-                    }
-                ],
-                "properties": {
-                    "mountpoint": {
-                        "value": "/mnt/data/backup",
-                    }
-                }
-            },
-            {
-                "children": [],
-                "properties": {
-                    "mountpoint": {
-                        "value": "/mnt/data/backup/test0/test1/test2",
-                    }
-                }
-            }
-        ],
-        "/mnt/data/backup/test0",
-    )
-
-    assert dataset["properties"]["mountpoint"]["value"] == "/mnt/data/backup"
-    assert recursive is True
-
-
-def test__get_dataset_recursive_5():
-    dataset, recursive = get_dataset_recursive(
-        [
-            {
-                "children": [
-                    {
-                        "children": [
-                            {
-                                "children": [],
-                                "properties": {
-                                    "mountpoint": {
-                                        "value": "/mnt/data/backup/test0/test1/test2",
-                                    }
-                                }
-                            }
-                        ],
-                        "properties": {
-                            "mountpoint": {
-                                "value": "/mnt/data/backup",
-                            }
-                        }
-                    }
-                ],
-                "properties": {
-                    "mountpoint": {
-                        "value": "/mnt/data",
-                    }
-                }
-            },
-            {
-                "children": [
-                    {
-                        "children": [],
-                        "properties": {
-                            "mountpoint": {
-                                "value": "/mnt/data/backup/test0/test1/test2",
-                            }
-                        }
-                    }
-                ],
-                "properties": {
-                    "mountpoint": {
-                        "value": "/mnt/data/backup",
-                    }
-                }
-            },
-            {
-                "children": [],
-                "properties": {
-                    "mountpoint": {
-                        "value": "/mnt/data/backup/test0/test1/test2",
-                    }
-                }
-            }
-        ],
-        "/mnt/data/backup/test0/test3",
-    )
-
-    assert dataset["properties"]["mountpoint"]["value"] == "/mnt/data/backup"
-    assert recursive is False
-
-
-def test__fs_lock_manager_1():
-    flm = FsLockManager()
-    flm._lock = Mock
-    flm._choose_lock = lambda lock, direction: lock
-
-    lock = flm.lock("/mnt/tank/work", Mock())
-
-    assert flm.lock("/mnt/tank", Mock()) == lock
-
-
-def test__fs_lock_manager_2():
-    flm = FsLockManager()
-    flm._lock = Mock
-    flm._choose_lock = lambda lock, direction: lock
-
-    lock = flm.lock("/mnt/tank/work", Mock())
-
-    assert flm.lock("/mnt/tank/work/temp", Mock()) == lock
-
-
-def test__fs_lock_manager_3():
-    flm = FsLockManager()
-    flm._lock = Mock
-    flm._choose_lock = lambda lock, direction: lock
-
-    lock = flm.lock("/mnt/tank/work", Mock())
-
-    assert flm.lock("/mnt/tank/temp", Mock()) != lock
+from middlewared.plugins.cloud_sync import lsjson_error_excerpt, RcloneVerboseLogCutter, rclone_config_section
 
 
 @pytest.mark.parametrize("error,excerpt", [
@@ -294,9 +30,13 @@ def test__lsjson_error_excerpt(error, excerpt):
     assert lsjson_error_excerpt(error) == excerpt
 
 
-def INFO(v):
+def INFO(v=None):
+    if v is None:
+        prefix = "<6>"
+    else:
+        prefix = f"2020/01/22 22:32:{v:02d} "
     return textwrap.dedent(f"""\
-        2020/01/22 22:32:{v:02d} INFO  : 
+        {prefix}INFO  : 
         Transferred:   	  752.465G / 27.610 TBytes, 3%, 7.945 MBytes/s, ETA 5w6d1h16m55s
         Errors:               478 (retrying may help)
         Checks:                89 / 89, 100%
@@ -319,7 +59,8 @@ def INFO(v):
      f"WELCOME TO RCLONE\n{INFO(1)}{INFO(2)[:300]}\nKilled (9)"),
     (f"2020/01/27 13:16:15 INFO  : S3 bucket ixsystems: Waiting for transfers to finish\n"
      f"{INFO(1)}{INFO(2)}{INFO(3)}{INFO(4)}{INFO(5)}{INFO(6)}BYE!\n",
-     f"2020/01/27 13:16:15 INFO  : S3 bucket ixsystems: Waiting for transfers to finish\n{INFO(1)}{INFO(6)}BYE!\n")
+     f"2020/01/27 13:16:15 INFO  : S3 bucket ixsystems: Waiting for transfers to finish\n{INFO(1)}{INFO(6)}BYE!\n"),
+    (f"WELCOME TO RCLONE\n{INFO()}{INFO()}BYE!\n", f"WELCOME TO RCLONE\n{INFO()}BYE!\n"),
 ])
 def test__RcloneVerboseLogCutter(input, output):
     cutter = RcloneVerboseLogCutter(5)
@@ -339,3 +80,78 @@ def test__RcloneVerboseLogCutter(input, output):
         out += result
 
     assert out == output
+
+
+def test__rclone_config_section_basic():
+    out = rclone_config_section("remote", {"type": "sftp", "host": "h", "user": "u"})
+    assert out == "[remote]\ntype = sftp\nhost = h\nuser = u\n"
+
+
+def test__rclone_config_section_bool_rendered_lowercase():
+    out = rclone_config_section("remote", {"fast_list": True, "skip_region": False})
+    assert out == "[remote]\nfast_list = true\nskip_region = false\n"
+
+
+def test__rclone_config_section_stringifies_non_str_values():
+    out = rclone_config_section("remote", {"port": 22})
+    assert out == "[remote]\nport = 22\n"
+
+
+@pytest.mark.parametrize("payload", ["x\ntype = local", "x\r\ntype = local", "x\rtype = local"])
+def test__rclone_config_section_strips_line_breaks_from_value(payload):
+    out = rclone_config_section("remote", {"type": "sftp", "host": payload})
+    assert out == "[remote]\ntype = sftp\nhost = xtype = local\n"
+
+
+@pytest.mark.parametrize("value,written", [
+    # goconfig treats a value opening with a backtick (2+ chars) or a triple double-quote (6+ chars) as quoted: with
+    # no closing quote it rejects the whole file, with a closing quote it takes everything through the last matching
+    # quote.
+    ("`x", '"""`x"""'),
+    ('"""xyz', '""""""xyz"""'),
+    # the value is trimmed before quote detection, so a quote char behind leading whitespace still triggers quoting.
+    (" `x", '"""`x"""'),
+])
+def test__rclone_config_section_quotes_values_goconfig_would_mangle(value, written):
+    out = rclone_config_section("remote", {"pass": value})
+    assert out == f"[remote]\npass = {written}\n"
+
+
+@pytest.mark.parametrize("value,written", [
+    (" padded ", "padded"),
+    ("\tpadded", "padded"),
+    (" 0021accountnumber008", "0021accountnumber008"),
+])
+def test__rclone_config_section_trims_whitespace(value, written):
+    out = rclone_config_section("remote", {"account": value})
+    assert out == f"[remote]\naccount = {written}\n"
+
+
+def test__rclone_config_section_round_trips_through_configparser():
+    token = ' {"access_token": "x"} '
+    ini = configparser.ConfigParser()
+    ini.read_string(rclone_config_section("remote", {"token": token}))
+    assert ini["remote"]["token"] == token.strip()
+
+
+@pytest.mark.parametrize("value,written", [
+    # these fall under goconfig's quote-detection length gates (2 chars for a backtick, 6 for a triple double-quote)
+    # and would parse literally even unquoted; the serializer quotes them anyway, and they read back identically.
+    ("`", '"""`"""'),
+    ('"""x', '""""""x"""'),
+])
+def test__rclone_config_section_quoting_below_goconfig_length_gates_is_harmless(value, written):
+    out = rclone_config_section("remote", {"pass": value})
+    assert out == f"[remote]\npass = {written}\n"
+
+
+@pytest.mark.parametrize("value", [
+    "a`b",           # backtick not at the start is literal
+    'a"""b',         # triple quote not at the start is literal
+    '"x"',           # single double-quotes are only special for keys, not values
+    "ab%2Fcd%s",     # no interpolation layer
+    "",
+])
+def test__rclone_config_section_leaves_safe_values_verbatim(value):
+    out = rclone_config_section("remote", {"pass": value})
+    assert out == f"[remote]\npass = {value}\n"

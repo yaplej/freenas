@@ -1,0 +1,787 @@
+from __future__ import annotations
+
+import collections
+import contextlib
+import dataclasses
+import errno
+import functools
+import hashlib
+import json
+import logging
+import os
+import re
+import string
+import subprocess
+import typing
+import uuid
+
+import truenas_pylibsed as sed
+
+from .disk_io import create_gpt_partition, read_gpt, wipe_disk_quick
+from .gpt_parts import PART_TYPES, GptPartEntry
+from .identifier import build_identifier, join_serial_lunid
+from .udev import udev_fallback_identity
+
+logger = logging.getLogger(__name__)
+
+__all__ = ("DiskEntry", "iterate_disks", "VALID_WHOLE_DISK")
+
+
+RE_SERIAL_STRIP = re.compile(r'[\x00-\x1f\x7f\x22\x5c]')
+# sedutil-cli PBKDF2 parameters for legacy password compatibility
+SEDUTIL_ITERATIONS = 75000
+SEDUTIL_HASH_LEN = 32
+# sda, pmem0, vda, xvda, nvme0n1 but not sda1/vda1/xvda1/nvme0n1p1
+VALID_WHOLE_DISK = re.compile(r"^pmem\d+$|sd[a-z]+$|^vd[a-z]+$|^xvd[a-z]+$|^nvme\d+n\d+$")
+
+
+def sedutil_hash_password(password: str, serial: bytes) -> bytes:
+    """Hash a password the same way sedutil-cli does (PBKDF2-HMAC-SHA1)."""
+    return hashlib.pbkdf2_hmac(
+        "sha1", password.encode("utf-8"), serial, SEDUTIL_ITERATIONS, SEDUTIL_HASH_LEN
+    )
+
+
+@dataclasses.dataclass(frozen=True, slots=True, kw_only=True)
+class TempEntry:
+    temp_c: float | None = None
+    """The current temperature in celsius"""
+    crit: float | None = None
+    """This value is reported as celsius.
+
+    For SCSI drives (as described in SPC-6):
+        The REFERENCE TEMPERATURE field indicates
+        the maximum reported sensor temperature in
+        degrees Celsius at which the SCSI target
+        device is capable of operating continuously
+        without degrading the SCSI target device's
+        operation or reliability beyond manufacturer
+        accepted limits.
+
+    For NVMe drives (as described in base spec 2.0e)
+        The critical composite temperature threshold
+        (CCTEMP) field. This field indicates the
+        minimum Composite Temperature field value that
+        indicates a critical overheating condition
+        (e.g., may prevent continued normal operation,
+            possibility of data loss, automatic device
+            shutdown, extreme performance throttling,
+            or permanent damage)
+
+    For ATA drives (as described in ATA/ATAPI Command Set)
+        The "Over Limit" field (byte 7) represents the
+        maximum temperature limit. Operating the device
+        over this temperature may cause physical damage to
+        the device.
+    """
+
+
+@dataclasses.dataclass(frozen=True, kw_only=True)
+class DiskEntry:
+    name: str
+    """The disk's name (i.e. 'sda')"""
+    devpath: str
+    """The disk's /dev path (i.e. '/dev/sda')"""
+
+    @typing.overload
+    def __opener(
+        self,
+        *,
+        relative_path: str | None = None,
+        absolute_path: str | None = None,
+        mode: typing.Literal["r"] = "r",
+    ) -> str | None: ...
+
+    @typing.overload
+    def __opener(
+        self,
+        *,
+        relative_path: str | None = None,
+        absolute_path: str | None = None,
+        mode: typing.Literal["rb"],
+    ) -> bytes | None: ...
+
+    def __opener(
+        self,
+        *,
+        relative_path: str | None = None,
+        absolute_path: str | None = None,
+        mode: typing.Literal["r", "rb"] = "r",
+    ) -> str | bytes | None:
+        if relative_path is not None:
+            path = f"/sys/block/{self.name}/{relative_path}"
+        elif absolute_path is not None:
+            path = absolute_path
+        else:
+            raise ValueError("relative_path or absolute_path is required")
+
+        try:
+            with open(path, mode) as f:
+                # sysfs files include a trailing newline that breaks
+                # string comparisons (e.g. hwmon name matching in temp())
+                return f.read().strip()  # type: ignore[no-any-return]
+        except Exception:
+            return None
+
+    @functools.cached_property
+    def lbs(self) -> int:
+        """The disk's logical block size as reported by sysfs"""
+        try:
+            return int(self.__opener(relative_path="queue/logical_block_size"))  # type: ignore[arg-type]
+        except Exception:
+            # fallback to 512 always
+            return 512
+
+    @functools.cached_property
+    def pbs(self) -> int:
+        """The disk's physical block size as reported by sysfs"""
+        try:
+            return int(self.__opener(relative_path="queue/physical_block_size"))  # type: ignore[arg-type]
+        except Exception:
+            # fallback to 512 always
+            return 512
+
+    @functools.cached_property
+    def size_sectors(self) -> int:
+        """The disk's total size in sectors"""
+        # Cf. include/linux/types.h
+        # The kernel represents the disk
+        # size in units of 512 bytes always
+        # regardless of the disk's reported
+        # block size.
+        try:
+            return int(self.__opener(relative_path="size"))  # type: ignore[arg-type]
+        except Exception:
+            # rare but dont crash here
+            return 0
+
+    @functools.cached_property
+    def size_bytes(self) -> int:
+        """The disk's total size in bytes"""
+        # Cf. include/linux/types.h
+        # The kernel represents the disk
+        # size in units of 512 bytes always
+        # regardless of the disk's reported
+        # block size.
+        return 512 * self.size_sectors
+
+    @functools.cached_property
+    def _udev_identity(self) -> tuple[str | None, str | None]:
+        # only ever reached for a disk sysfs has no serial for, see `serial`
+        return udev_fallback_identity(self.name)
+
+    @functools.cached_property
+    def serial(self) -> str | None:
+        """The disk's serial number as reported by sysfs, or failing that as
+        udev resolved it."""
+        # nvme devices
+        serial = self.__opener(relative_path="device/serial")
+        if not serial:
+            # virtio-blk devices (vd)
+            serial = self.__opener(relative_path="serial")
+
+        if not serial:
+            if raw := self.__opener(relative_path="device/vpd_pg80", mode="rb"):
+                # VPD page 0x80 (Unit Serial Number) structure:
+                #   Byte 0: Peripheral qualifier & device type
+                #   Byte 1: Page code (0x80)
+                #   Bytes 2-3: Page length (16-bit big-endian)
+                #   Bytes 4+: ASCII serial-number data
+                #
+                # Reference: SCSI Primary Commands (SPC-7 rev 1) — Unit Serial Number VPD page 0x80, Table 599
+                if len(raw) >= 4:
+                    # unit serial page (vpd_pg80) command can never be > 255 characters
+                    # So we will grab page length from 3
+                    # Guard against devices that report a length larger than the buffer
+                    page_len = min(raw[3], len(raw) - 4)
+
+                    # Extract only the serial number data, skipping the 4-byte header
+                    serial_txt = raw[4:4 + page_len].decode('ascii', errors='ignore')
+                    # Strip characters that are either invalid per SCSI spec or break
+                    # downstream JSON serialization (netdata embeds these in chart names
+                    # without escaping):
+                    # - 0x00-0x1F, 0x7F: control chars / DEL (invalid per SPC-4)
+                    # - 0x22 ("): valid per SPC-4 but never used in real serials;
+                    #   appears as UTF-16LE descriptor type byte from buggy USB firmware
+                    # - 0x5C (\): valid per SPC-4 but never used in real serials;
+                    #   would break JSON string escaping
+                    serial = RE_SERIAL_STRIP.sub('', serial_txt).strip()
+                else:
+                    serial = ""
+
+        if not serial:
+            # pmem devices have a uuid attribute that we use as serial
+            serial = self.__opener(relative_path="uuid")
+
+        # strip is required because we see these cases otherwise
+        # >>> d.serial reported as '        3FJ1U1HT'
+        if serial and (serial := serial.strip()):
+            return serial
+
+        # sysfs has a serial for every disk we ship, so this only runs for a
+        # disk with no VPD page 0x80: usb-storage sets skip_vpd_pages, and a
+        # SCSI device may implement page 0x83 without page 0x80. udev usually
+        # still has one for those, and using it gives netdata, which runs as
+        # its own user and cannot read the partition table, the same identifier
+        # middlewared computes. It costs about 150us per such disk each time
+        # it runs, so on the disk-stats tick as well.
+        return self._udev_identity[0]
+
+    @functools.cached_property
+    def lunid(self) -> str | None:
+        """The disk's lunid as presented in sysfs, or failing that as udev
+        resolved it, but only for a disk whose serial came from udev too."""
+        if (lunid := self._sysfs_lunid()) is not None:
+            return lunid
+
+        # `serial` is cached, and only a disk without a sysfs serial made it
+        # look udev up
+        if self.serial and "_udev_identity" not in self.__dict__:
+            # sysfs had the serial, so udev was never consulted, and a wwid it
+            # does not carry (a t10 designator) stays None as it always has
+            return None
+
+        # usb-storage skips VPD pages entirely, so a disk whose serial came from
+        # udev has no wwid in sysfs either, while ata_id recorded the WWN it read
+        # from the drive. This is the lookup the serial already paid for.
+        return self._udev_identity[1]
+
+    def _sysfs_lunid(self) -> str | None:
+        """The disk's 'wwid' as presented in sysfs.
+
+        NOTE: 'lunid' might be a bit of a misnomer since
+            we're using the 'wwid' property of the disk
+            but it is the same principle and it allows us
+            to use common terms that most recognize."""
+        HEX = set(string.hexdigits.lower())
+
+        wwid = self.__opener(relative_path="device/wwid")
+        if wwid is None:
+            wwid = self.__opener(relative_path="wwid")
+
+        if wwid is not None:
+            # Normalize: strip whitespace and convert to lowercase
+            wwid = wwid.strip().lower()
+
+            # udev handling of WWN identifiers:
+            # - For SCSI devices: ID_WWN is set only for NAA descriptors (via scsi_id)
+            # - For NVMe devices: ID_WWN is set to the wwid sysfs value, which includes eui. prefix
+            #   (see /usr/lib/udev/rules.d/60-persistent-storage.rules)
+            # - For both: The middleware strips prefixes to get a consistent format
+            #
+            # We strip naa., 0x, and eui. prefixes to match middleware behavior.
+            # t10 identifiers are not used for ID_WWN and return None.
+            original_prefix = None
+            for prefix in ("naa.", "0x", "eui."):
+                if wwid.startswith(prefix):
+                    original_prefix = prefix
+                    wwid = wwid[len(prefix):]
+                    break
+            else:
+                # t10.* and others are not used for ID_WWN in udev
+                return None
+
+            # Remove spaces after prefix stripping
+            wwid = wwid.replace(" ", "")
+
+            # Truncate to 16 characters ONLY for NAA WWNs with valid hex characters.
+            # This matches udev's ID_WWN behavior for NAA WWNs specifically.
+            # EUI identifiers (common for NVMe) are NOT truncated.
+            #
+            # Reference: https://github.com/systemd/systemd/blob/e65455feade65c798fd1742220768eba7f81755b/
+            # src/udev/scsi_id/scsi_serial.c
+            # check_fill_0x83_id(): if (id_search->id_type == SCSI_ID_NAA && wwn != NULL)
+            #                       strncpy(wwn, serial + s, 16);
+            if original_prefix in ("naa.", "0x") and len(wwid) > 16 and set(wwid[:16]) <= HEX:
+                wwid = wwid[:16]
+
+        return wwid if wwid else None
+
+    @functools.cached_property
+    def model(self) -> str | None:
+        """The disk's model as reported by sysfs"""
+        return self.__opener(relative_path="device/model")
+
+    @functools.cached_property
+    def vendor(self) -> str | None:
+        return self.__opener(relative_path="device/vendor")
+
+    @functools.cached_property
+    def firmware_revision(self) -> str | None:
+        fr = self.__opener(relative_path="device/rev")
+        if fr is None:
+            fr = self.__opener(relative_path="device/firmware_rev")
+        return fr
+
+    @functools.cached_property
+    def media_type(self) -> str:
+        fr = self.__opener(relative_path="queue/rotational")
+        return "HDD" if fr == "1" else "SSD"
+
+    @functools.cached_property
+    def identifier(self) -> str:
+        """Return, ideally, a unique identifier for the disk."""
+        serial = self.serial
+        return build_identifier(
+            self.name, join_serial_lunid(serial, self.lunid) if serial else None, serial, self.__zfs_partition_uuid
+        )
+
+    def __zfs_partition_uuid(self) -> str | None:
+        with contextlib.suppress(Exception):
+            # We don't want to crash if we can't read partitions
+            for part in filter(
+                lambda p: PART_TYPES.get(p.partition_type_guid, "UNKNOWN") == "ZFS",
+                self.partitions() or (),
+            ):
+                return part.unique_partition_guid
+
+        return None
+
+    @functools.cached_property
+    def translation(self) -> typing.Literal["SATL", "SNTL", None]:
+        """Determine if the disk is using translation.
+
+        Returns:
+
+        SATL: (S)CSI-(A)TA (T)ranslation (L)ayer ATA devices
+            that sit behind a SCSI device.
+
+        SNTL: (S)CSI-(N)VMe (T)ranslation (L)ayer NVMe devices
+            that sit behind a SCSI(SAS) device.
+
+            NOTE: THIS IS NOT A REAL SPECIFICATION. We
+            just use it internally. (tri-mode HBAs are "fun")
+
+        None: No translation.
+        """
+        if os.path.exists(f"/sys/block/{self.name}/vpd_pg89"):
+            return "SATL"
+        elif self.name.startswith("sd") and self.vendor == "NVMe":
+            return "SNTL"
+        return None
+
+    def __run_smartctl_cmd_impl(self, cmd: list[str], raise_alert: bool = True) -> str:
+        if tl := self.translation:
+            if tl == "SATL":
+                cmd.extend(["-d", "sat"])
+            elif tl == "SNTL":
+                cmd.extend(["-d", "nvme"])
+
+        cp = subprocess.run(
+            cmd,
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            encoding="utf8",
+            errors="ignore",
+        )
+        if (cp.returncode & 0b11) != 0:
+            if raise_alert:
+                raise OSError(f"{cmd!r} failed for {self.name} ({cp.returncode!r}):\n{cp.stderr}")
+        return cp.stdout
+
+    @typing.overload
+    def smartctl_info(self, return_json: typing.Literal[True], raise_alert: bool = True) -> dict[str, typing.Any]: ...
+
+    @typing.overload
+    def smartctl_info(self, return_json: typing.Literal[False] = False, raise_alert: bool = True) -> str: ...
+
+    def smartctl_info(self, return_json: bool = False, raise_alert: bool = True) -> dict[str, typing.Any] | str:
+        """Return smartctl -x information.
+
+        Args:
+            return_json: If True, will return JSON serialized results.
+                        If False, returns raw string output.
+
+        Returns:
+            dict | str: Parsed JSON dict if return_json=True, raw string otherwise.
+        """
+        cmd = ["smartctl", "-x", self.devpath]
+        if return_json:
+            cmd.extend(["-jc"])
+
+        stdout = self.__run_smartctl_cmd_impl(cmd, raise_alert)
+        if return_json:
+            return json.loads(stdout)  # type: ignore[no-any-return]
+        else:
+            return stdout
+
+    def smartctl_test(
+        self, ttype: typing.Literal["long", "short", "offline", "conveyance"], raise_alert: bool = True
+    ) -> None:
+        """Run a SMART test.
+
+        ttype: str The type of SMART test to be ran.
+        """
+        self.__run_smartctl_cmd_impl(["smartctl", self.devpath, "-t", ttype], raise_alert)
+
+    def temp(self) -> TempEntry:
+        """Return temperature information as reported via sysfs.
+        This information is obtained via the drivetemp kernel
+        module.
+
+        NOTE: The `temp1_input` file will issue a command to the
+        disk each time it's accessed from user-space. It's the
+        callers responsibility to ensure this value is accessed
+        at a frequency that makes sense."""
+        base = f"/sys/block/{self.name}"
+        if "nvme" in self.name:
+            path = f"{base}/device"
+        else:
+            path = f"{base}/device/hwmon"
+
+        temp_c: float | None = None
+        crit: float | None = None
+        try:
+            with os.scandir(path) as sdir:
+                for i in filter(
+                    lambda x: x.is_dir() and x.name.startswith("hwmon"), sdir
+                ):
+                    try:
+                        name = self.__opener(absolute_path=f"{i.path}/name")
+                        if name not in ("nvme", "drivetemp"):
+                            continue
+                    except Exception:
+                        continue
+
+                    try:
+                        milli_c = int(
+                            self.__opener(absolute_path=f"{i.path}/temp1_input")  # type: ignore[arg-type]
+                        )
+                    except Exception:
+                        # if we can't get the temperature
+                        # then there is no reason to try
+                        # the other sysfs files.
+                        continue
+                    else:
+                        # sysfs values are stored in millidegrees celsius
+                        temp_c = milli_c / 1000
+
+                    try:
+                        crit = int(self.__opener(absolute_path=f"{i.path}/temp1_crit"))  # type: ignore[arg-type]
+                    except Exception:
+                        pass
+                    else:
+                        # syfs values are stored in millidegrees celsius
+                        crit = crit / 1000
+        except FileNotFoundError:
+            # pmem devices dont have this, for example
+            pass
+
+        return TempEntry(temp_c=temp_c, crit=crit)
+
+    def partitions(self, dev_fd: int | None = None) -> tuple[GptPartEntry, ...] | None:
+        """Return a tuple of `GptPartEntry` objects for any
+        GPT partitions written to the disk."""
+        try:
+            return read_gpt(dev_fd or self.devpath, self.lbs)
+        except Exception as e:
+            if isinstance(e, OSError) and e.errno in (errno.ENOMEDIUM, errno.EACCES, errno.EPERM):
+                # when we access the "identifier" attribute of the disk object
+                # we try to read partitions on the devices which requires
+                # opening the underlying device. Our users run TrueNAS
+                # on extravagant hardware and, sometimes, the devices dont
+                # respond very well to even opening them in RD_ONLY mode.
+                # For example, opening an empty sd-card reader device
+                # raises errno 123 (no medimum found). In this scenario
+                # and any other, we should not crash here.
+                # sd* devices are owned by [root,disk] and have 660 permissions.
+                # The netdata service runs as the netdata user and, under certain
+                # conditions, will fail this read resulting in spamming the syslog.
+                pass
+            else:
+                logger.exception("Unexpected error reading partitions for device: %r", self.devpath)
+
+            return None
+
+    def wipe_quick(self, dev_fd: int | None = None) -> None:
+        """Write 0's to the first and last 32MiB of the disk.
+        This should remove all filesystem metadata and partition
+        info."""
+        if dev_fd is None:
+            with open(os.open(self.devpath, os.O_RDWR | os.O_EXCL), "r+b") as f:
+                wipe_disk_quick(f.fileno(), disk_size=self.size_bytes)
+        else:
+            wipe_disk_quick(dev_fd, disk_size=self.size_bytes)
+
+    def format(self) -> uuid.UUID:
+        """Format the disk with a GPT partition table containing a single ZFS partition.
+
+        Creates a complete GPT (GUID Partition Table) structure on the disk,
+        including protective MBR, primary and secondary GPT headers, and partition entries.
+        The partition is configured for ZFS use with proper alignment and sizing.
+
+        This method automatically wipes any existing partitions before creating the new
+        GPT structure. It opens the device once and reuses the file descriptor for all
+        operations to optimize performance.
+
+        Returns:
+            uuid.UUID: The unique identifier (GUID) of the created partition
+
+        Raises:
+            ValueError: If there's insufficient space on the disk after applying
+                       alignment constraints
+            OSError: If the device cannot be opened or accessed
+
+        Note:
+            - The device must not be mounted or in use
+            - Requires root privileges to access block devices
+            - Automatically wipes existing partitions if present
+            - Creates a single partition spanning most of the disk with proper alignment
+            - Reserves space at the end of the disk for resilience (up to 2GB or 1% of disk)
+            - Uses 1MB alignment for optimal performance
+            - For 4K native disks, uses sector 2048 as the first usable sector
+            - Opens device only once for optimal performance
+        """
+        dev_fd = os.open(self.devpath, os.O_RDWR | os.O_EXCL)
+        try:
+            if self.partitions(dev_fd):
+                # existing partitions detected
+                # so we need to wipe them before
+                # we format the disk with new ones
+                self.wipe_quick(dev_fd)
+            return create_gpt_partition(
+                dev_fd,
+                ts_512=self.size_sectors,
+                lbs=self.lbs,
+                pbs=self.pbs,
+            )
+        finally:
+            os.close(dev_fd)
+
+    @contextlib.contextmanager
+    def _sed_fd(self, dev_fd: int | None, writable: bool) -> typing.Iterator[int]:
+        """Yield an fd for SED operations.
+
+        When ``dev_fd`` is provided it is used as-is and left open for the
+        caller to manage. Otherwise ``self.devpath`` is opened and closed on
+        exit.
+
+        ``os.open`` may raise (most notably ``FileNotFoundError`` when the
+        device node has gone away because the disk was physically pulled or the
+        kernel reassigned it a new name). This is intentionally NOT swallowed
+        here so each caller maps it to its own "unqueryable" return value via
+        the ``try``/``except`` it already wraps this in.
+        """
+        if dev_fd is not None:
+            yield dev_fd
+            return
+        flags = os.O_NONBLOCK | (os.O_RDWR if writable else os.O_RDONLY)
+        fd = os.open(self.devpath, flags)
+        try:
+            yield fd
+        finally:
+            os.close(fd)
+
+    def sed_device_info(self, dev_fd: int | None = None) -> dict[str, typing.Any] | None:
+        """Perform TCG Level 0 Discovery. No authentication required.
+
+        Returns:
+            dict with device_type, ssc_type, locking, tper, geometry, etc.
+            None if the device does not support TCG, is missing, or on any error.
+        """
+        try:
+            with self._sed_fd(dev_fd, writable=False) as fd:
+                return sed.get_device_info(fd)  # type: ignore[no-any-return]
+        except Exception:
+            return None
+
+    def is_sed(self, dev_fd: int | None = None) -> bool:
+        """Check if the disk supports SED (TCG Opal/Enterprise)."""
+        info = self.sed_device_info(dev_fd)
+        if info is None:
+            return False
+        return info["locking"]["supported"]  # type: ignore[no-any-return]
+
+    def sed_status(self, dev_fd: int | None = None) -> str:
+        """Return the SED status string for this disk.
+
+        Returns one of: 'NO_SED', 'FAILED', 'UNINITIALIZED', 'LOCKED', 'UNLOCKED'.
+        A missing device node (e.g. the disk was pulled) reports 'FAILED', i.e.
+        temporarily unqueryable rather than a loss of SED capability.
+        """
+        try:
+            with self._sed_fd(dev_fd, writable=False) as fd:
+                info = sed.get_device_info(fd)
+
+                locking = info["locking"]
+                if not locking["supported"]:
+                    return "NO_SED"
+                if info.get("ssc_type") == "enterprise":
+                    # Enterprise SSC drives may or may not report locking.enabled
+                    # accurately when factory-fresh — this is manufacturer-dependent.
+                    # Use the MSID authentication probe as the source of truth.
+                    if sed.is_uninitialized(fd, device_info=info):
+                        return "UNINITIALIZED"
+                elif not locking["enabled"]:
+                    return "UNINITIALIZED"
+                if locking["locked"]:
+                    return "LOCKED"
+                return "UNLOCKED"
+        except Exception:
+            return "FAILED"
+
+    def sed_unlock(self, password: str, dev_fd: int | None = None) -> tuple[bool, str | None]:
+        """Unlock a SED disk.
+
+        Tries raw password first (new-style), then falls back to
+        PBKDF2 hashing with Linux and BSD serial numbers for drives
+        provisioned with sedutil-cli.
+
+        Returns:
+            (True, None) on success or if already unlocked.
+            (False, error_message) on failure.
+        """
+        try:
+            with self._sed_fd(dev_fd, writable=True) as fd:
+                info = sed.get_device_info(fd)
+                if not info["locking"]["locked"]:
+                    return True, None
+
+                pw_bytes = password.encode("utf-8")
+
+                # 1) Try raw password (drives provisioned with truenas_pylibsed)
+                try:
+                    sed.unlock(fd, pw_bytes, device_info=info)
+                    return True, None
+                except TimeoutError:
+                    raise
+                except Exception:
+                    pass
+
+                # 2) Try PBKDF2 hash with Linux serial (sedutil-cli on Linux)
+                try:
+                    sed.unlock(fd, sedutil_hash_password(password, info["lnx_serial"]), device_info=info)
+                    return True, None
+                except TimeoutError:
+                    raise
+                except Exception:
+                    pass
+
+                # 3) Try PBKDF2 hash with BSD serial (sedutil-cli on FreeBSD)
+                try:
+                    sed.unlock(fd, sedutil_hash_password(password, info["bsd_serial"]), device_info=info)
+                    return True, None
+                except Exception as e:
+                    return False, str(e)
+        except Exception as e:
+            return False, str(e)
+
+    def sed_initial_setup(self, password: str, dev_fd: int | None = None) -> str:
+        """Provision a fresh SED disk with the given password.
+
+        Returns one of:
+            'NO_SED'           - Device does not support SED
+            'ACCESS_GRANTED'   - Already provisioned and password is valid
+            'LOCKING_DISABLED' - Provisioned but locking range not enabled
+            'SUCCESS'          - Setup completed successfully
+            'SETUP_FAILED'     - Initial setup call failed
+        """
+        try:
+            with self._sed_fd(dev_fd, writable=True) as fd:
+                info = sed.get_device_info(fd)
+                if not info["locking"]["supported"]:
+                    return "NO_SED"
+
+                pw_bytes = password.encode("utf-8")
+
+                if info.get("ssc_type") == "enterprise":
+                    # Enterprise SSC drives may or may not report locking.enabled
+                    # accurately when factory-fresh — this is manufacturer-dependent.
+                    # Use the MSID authentication probe as the source of truth.
+                    try:
+                        uninitialized = sed.is_uninitialized(fd, device_info=info)
+                    except Exception:
+                        logger.exception("SED initial setup failed for %r", self.devpath)
+                        return "SETUP_FAILED"
+                    if not uninitialized:
+                        try:
+                            locking_info = sed.get_locking_info(fd, pw_bytes, device_info=info)
+                            if locking_info["read_lock_enabled"] and locking_info["write_lock_enabled"]:
+                                return "ACCESS_GRANTED"
+                            return "LOCKING_DISABLED"
+                        except Exception:
+                            logger.exception("SED initial setup failed for %r", self.devpath)
+                            return "SETUP_FAILED"
+                elif info["locking"]["enabled"]:
+                    try:
+                        locking_info = sed.get_locking_info(fd, pw_bytes, device_info=info)
+                        if locking_info["read_lock_enabled"] and locking_info["write_lock_enabled"]:
+                            return "ACCESS_GRANTED"
+                        return "LOCKING_DISABLED"
+                    except Exception:
+                        logger.exception("SED initial setup failed for %r", self.devpath)
+                        return "SETUP_FAILED"
+
+                try:
+                    sed.initial_setup(fd, pw_bytes, device_info=info)
+                    return "SUCCESS"
+                except Exception:
+                    logger.exception("SED initial setup failed for %r", self.devpath)
+                    return "SETUP_FAILED"
+        except Exception:
+            # FIXME: A SED whose device node is gone also lands here and is reported
+            # as not being a SED disk. This happens when the disk drops off the bus.
+            logger.exception("SED discovery failed for %r", self.devpath)
+            return "NO_SED"
+
+    def sed_factory_reset(self, psid: str, dev_fd: int | None = None) -> tuple[bool, str]:
+        """Factory reset a SED disk using the PSID from the drive label.
+
+        WARNING: This permanently erases all data on the drive.
+
+        Returns:
+            (True, 'SUCCESS') on success.
+            (False, error_message) on failure.
+        """
+        try:
+            with self._sed_fd(dev_fd, writable=True) as fd:
+                info = sed.get_device_info(fd)
+                sed.factory_reset(fd, psid.encode("utf-8"), device_info=info)
+                return True, "SUCCESS"
+        except Exception as e:
+            return False, str(e)
+
+    def sed_change_password(
+        self,
+        old_password: bytes,
+        new_password: bytes,
+        dev_fd: int | None = None
+    ) -> tuple[bool, str]:
+        """Change the SED password.
+
+        Returns:
+            (True, 'SUCCESS') on success.
+            (False, error_message) on failure.
+        """
+        try:
+            with self._sed_fd(dev_fd, writable=True) as fd:
+                info = sed.get_device_info(fd)
+                sed.change_password(fd, old_password, new_password, device_info=info)
+                return True, "SUCCESS"
+        except Exception as e:
+            return False, str(e)
+
+    def sed_locking_info(self, password: str, dev_fd: int | None = None) -> dict[str, typing.Any] | None:
+        """Query the global locking range (range 0) properties.
+
+        Returns:
+            dict with range_start, range_length, read_lock_enabled, etc.
+            None on authentication failure or error.
+        """
+        try:
+            with self._sed_fd(dev_fd, writable=False) as fd:
+                info = sed.get_device_info(fd)
+                locking_info: dict[str, typing.Any] = sed.get_locking_info(
+                    fd, password.encode("utf-8"), device_info=info
+                )
+                return locking_info
+        except Exception:
+            return None
+
+
+def iterate_disks() -> collections.abc.Generator[DiskEntry]:
+    """Iterate over /dev and yield valid devices."""
+    with os.scandir("/dev") as sdir:
+        for i in filter(lambda x: VALID_WHOLE_DISK.match(x.name), sdir):
+            yield DiskEntry(name=i.name, devpath=i.path)

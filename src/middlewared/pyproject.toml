@@ -1,0 +1,129 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "middlewared"
+description = "TrueNAS Middleware Daemon"
+version = "0.0.0"
+license = "BSD-3-Clause"
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python",
+    "Programming Language :: Python :: 3",
+]
+requires-python = ">=3.11"
+
+[project.scripts]
+configure_fips = "middlewared.scripts.configure_fips:main"
+ha_panic = "middlewared.scripts.ha_panic:main"
+setup_cgroups = "middlewared.scripts.setup_cgroups:main"
+middlewared = "middlewared.main:main"
+wait_on_disks = "middlewared.scripts.wait_on_disks:main"
+start_vendor_service = "middlewared.scripts.vendor_service:main"
+
+[tool.mypy]
+plugins = [
+    "middlewared.test.linter.mypy_query_options",
+    "middlewared.test.linter.mypy_call2",
+    "pydantic.mypy",
+    "sqlalchemy.ext.mypy.plugin",
+]
+
+[[tool.mypy.overrides]]
+module = [
+    "acme.*",
+    "apps_ci.*",
+    "apps_schema.*",
+    "apps_validation.*",
+    "boto3.*",
+    "botocore.*",
+    "catalog_reader.*",
+    "certbot_dns_cloudflare.*",
+    "certbot_dns_digitalocean.*",
+    "google.*",
+    "google_auth_httplib2.*",
+    "googleapiclient.*",
+    "influxdb.*",
+    "jeepney.*",
+    "josepy.*",
+    "kmip.*",
+    "lexicon.*",
+    "ldap.*",
+    "licenselib.*",
+    "mako.*",
+    "pam.*",
+    "samba.*",
+    "pyinotify.*",
+    "pyudev.*",
+    "tdb.*",
+    "truenas_keyring",
+    "truenas_pam_faillog",
+    "truenas_pam_session",
+    "truenas_pylibsed.*",
+    "truenas_pysnmp.*",
+    "truenas_zfstierd_client.*",
+    "truenas_zfstierd_common.*",
+    "truesearch_client.*",
+    "wbclient",
+]
+ignore_missing_imports = true
+
+[tool.ruff]
+line-length = 120
+target-version = "py313"
+exclude = ["middlewared/alembic/*"]
+
+[tool.ruff.lint]
+select = [
+    # pycodestyle
+    "E",
+    # Pyflakes
+    "F",
+    # flake8-async
+    "ASYNC",
+    # flake8-tidy-imports
+    "TID",
+    # isort
+    "I",
+]
+ignore = [
+    # Async function definition with a `timeout` parameter
+    "ASYNC109",
+    # Prefer absolute imports over relative imports from parent modules
+    "TID252",
+]
+
+[tool.ruff.lint.isort]
+force-sort-within-sections = true
+
+[tool.ruff.lint.flake8-tidy-imports.banned-api]
+"pydantic.SecretStr".msg = "Use pydantic.Secret[str]"
+"secrets".msg = "Use middlewared.utils.secrets"
+
+[tool.ruff.lint.per-file-ignores]
+"middlewared/api/**/__init__.py" = ["F401", "F403", "F405"]
+"middlewared/test/**" = [
+    # `secrets` is banned: Use middlewared.utils.secrets
+    "TID251",
+]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["middlewared*"]
+
+[tool.setuptools]
+include-package-data = true
+
+[tool.setuptools.package-data]
+middlewared = [
+    "alembic/**/*",
+    "alembic.ini",
+    "assets/**/*",
+    "etc_files/**/*",
+    "migration/**/*",
+    "pytest/**/*",
+    "test/integration/assets/**/*",
+    "test/integration/utils/**/*",
+]

@@ -7,7 +7,9 @@ Create Date: 2021-08-26 14:35:02.063560+00:00
 """
 from alembic import op
 import sqlalchemy as sa
+from sqlalchemy import text
 import enum
+import json
 
 
 # revision identifiers, used by Alembic.
@@ -206,12 +208,14 @@ def upgrade():
         entry = {
             "acltemplate_name": i.name,
             "acltemplate_acltype": acltype,
-            "acltemplate_acl": i.value["acl"],
+            "acltemplate_acl": json.dumps(i.value["acl"]),
             "acltemplate_builtin": True,
         }
+        columns = ','.join(entry.keys())
+        placeholders = ','.join([f":{key}" for key in entry.keys()])
         conn.execute(
-            f"INSERT INTO filesystem_acltemplate ({','.join(entry.keys())}) VALUES ({','.join(['?'] * len(entry))})",
-            tuple(entry.values()),
+            text(f"INSERT INTO filesystem_acltemplate ({columns}) VALUES ({placeholders})"),
+            entry
         )
     # ### end Alembic commands ###
 

@@ -1,6 +1,12 @@
-# -*- coding=utf-8 -*-
-import logging
-
-logger = logging.getLogger(__name__)
-
-__all__ = []
+from middlewared.alert.service import (  # noqa: F401
+    aws_sns,
+    influxdb_,
+    mail,
+    mattermost,
+    opsgenie,
+    pagerduty,
+    slack,
+    snmp_trap,
+    telegram,
+    victorops,
+)

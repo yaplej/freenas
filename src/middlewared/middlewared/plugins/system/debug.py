@@ -1,141 +1,178 @@
+import contextlib
 import io
 import os
-import requests
 import shutil
-import subprocess
 import tarfile
+import time
 
-from middlewared.schema import accepts, returns
-from middlewared.service import CallError, job, private, Service
+from ixdiagnose.config import conf
+from ixdiagnose.event import event_callbacks
+from ixdiagnose.run import generate_debug
+import requests
 
-from .utils import DEBUG_MAX_SIZE
+from middlewared.api import api_method
+from middlewared.api.current import SystemDebugArgs, SystemDebugResult
+from middlewared.service import CallError, Service, job, private
+from middlewared.utils.privilege import credential_has_full_admin
+
+from .utils import DEBUG_MAX_SIZE, get_debug_execution_dir
 
 
 class SystemService(Service):
-
     @private
-    @job(lock='system.debug_generate')
-    def debug_generate(self, job):
+    @job(lock="system.debug_generate", lock_queue_size=1)
+    def debug_generate(self, job, caller_has_full_admin=False):
         """
         Generate system debug file.
 
         Result value will be the absolute path of the file.
         """
-        system_dataset_path = self.middleware.call_sync('systemdataset.config')['path']
-        if system_dataset_path is not None:
-            direc = os.path.join(system_dataset_path, 'ixdiagnose')
-        else:
-            direc = '/var/tmp/ixdiagnose'
-        dump = os.path.join(direc, 'ixdiagnose.tgz')
+        system_dataset_path = self.middleware.call_sync("systemdataset.config")["path"]
 
-        # Be extra safe in case we have left over from previous run
-        if os.path.exists(direc):
-            shutil.rmtree(direc)
+        i = 0
+        while True:
+            execution_dir = get_debug_execution_dir(system_dataset_path, i)
+            dump = os.path.join(execution_dir, "ixdiagnose.tgz")
 
-        cp = subprocess.Popen(
-            ['ixdiagnose', '-d', direc, '-s', '-F', '-p'],
-            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-            encoding='utf-8', errors='ignore', bufsize=1,
+            # Be extra safe in case we have left over from previous run
+            try:
+                with contextlib.suppress(FileNotFoundError):
+                    shutil.rmtree(execution_dir, ignore_errors=False)
+            except Exception as e:
+                i += 1
+                if i >= 5:
+                    raise CallError(f"Failed to generate ixdiagnose debug: {e!r}")
+                else:
+                    self.logger.warning(
+                        "Failed to generate ixdiagnose debug: %r", str(e)
+                    )
+            else:
+                break
+
+        conf.apply(
+            {
+                "compress": True,
+                "debug_path": os.path.join(execution_dir, "debug"),
+                "clean_debug_path": True,
+                "compressed_path": dump,
+                "caller_has_full_admin": caller_has_full_admin,
+            }
         )
 
-        for line in iter(cp.stdout.readline, ''):
-            line = line.rstrip()
+        def progress_callback(percent, desc):
+            job.set_progress(percent, desc)
 
-            if line.startswith('**') and '%: ' in line:
-                percent, desc = line.split('%: ', 1)
-                try:
-                    percent = int(percent.split()[-1])
-                except ValueError:
-                    continue
-                job.set_progress(percent, desc)
-        _, stderr = cp.communicate()
+        event_callbacks.register(progress_callback)
 
-        if cp.returncode != 0:
-            raise CallError(f'Failed to generate debug file: {stderr}')
+        try:
+            return generate_debug()
+        except Exception as e:
+            raise CallError(f"Failed to generate debug: {e!r}")
 
-        job.set_progress(100, 'Debug generation finished')
-
-        return dump
-
-    @accepts()
-    @returns()
-    @job(lock='system.debug', pipes=['output'])
+    @api_method(SystemDebugArgs, SystemDebugResult, roles=["READONLY_ADMIN"])
+    @job(lock="system.debug", lock_queue_size=0, pipes=["output"])
     def debug(self, job):
         """
         Download a debug file.
         """
-        job.set_progress(0, 'Generating debug file')
+        job.set_progress(0, "Generating debug file")
+        caller_has_full_admin = job.credentials is not None and credential_has_full_admin(job.credentials)
         debug_job = self.middleware.call_sync(
-            'system.debug_generate',
-            job_on_progress_cb=lambda encoded: job.set_progress(int(encoded['progress']['percent'] * 0.9),
-                                                                encoded['progress']['description'])
+            "system.debug_generate",
+            caller_has_full_admin,
+            job_on_progress_cb=lambda encoded: job.set_progress(
+                int(encoded["progress"]["percent"] * 0.9),
+                encoded["progress"]["description"],
+            ),
         )
 
         standby_debug = None
-        if self.middleware.call_sync('failover.licensed'):
+        if self.middleware.call_sync("failover.licensed"):
             try:
-                standby_debug = self.middleware.call_sync(
-                    'failover.call_remote', 'system.debug_generate', [], {'job': True}
-                )
+                try:
+                    standby_debug = self.middleware.call_sync(
+                        "failover.call_remote", "system.debug_generate",
+                        [caller_has_full_admin], {"job": True}
+                    )
+                except CallError as e:
+                    if "positional argument" not in str(e):
+                        raise
+                    # Remote node is running older version without caller_has_full_admin param
+                    self.logger.warning("Retrying standby debug generation without caller_has_full_admin")
+                    standby_debug = self.middleware.call_sync(
+                        "failover.call_remote", "system.debug_generate",
+                        [], {"job": True}
+                    )
             except Exception:
-                self.logger.warn('Failed to get debug from standby node', exc_info=True)
+                self.logger.exception("Failed to get debug from standby node")
             else:
-                remote_ip = self.middleware.call_sync('failover.remote_ip')
+                remote_ip = self.middleware.call_sync("failover.remote_ip")
                 url = self.middleware.call_sync(
-                    'failover.call_remote', 'core.download', ['filesystem.get', [standby_debug], 'debug.txz'],
+                    "failover.call_remote",
+                    "core.download",
+                    ["filesystem.get", [standby_debug], "debug.txz"],
                 )[1]
 
-                url = f'http://{remote_ip}:6000{url}'
+                url = f"http://{remote_ip}:6000{url}"
                 # no reason to honor proxy settings in this
                 # method since we're downloading the debug
                 # archive directly across the heartbeat
                 # interface which is point-to-point
-                proxies = {'http': '', 'https': ''}
+                proxies = {"http": "", "https": ""}
                 standby_debug = io.BytesIO()
                 with requests.get(url, stream=True, proxies=proxies) as r:
                     for i in r.iter_content(chunk_size=1048576):
                         if standby_debug.tell() > DEBUG_MAX_SIZE * 1048576:
-                            raise CallError(f'Standby debug file is bigger than {DEBUG_MAX_SIZE}MiB.')
+                            raise CallError(
+                                f"Standby debug file is bigger than {DEBUG_MAX_SIZE}MiB."
+                            )
                         standby_debug.write(i)
 
         debug_job.wait_sync()
         if debug_job.error:
             raise CallError(debug_job.error)
 
-        job.set_progress(90, 'Preparing debug file for streaming')
+        job.set_progress(90, "Preparing debug file for streaming")
 
         if standby_debug:
             # Debug file cannot be big on HA because we put both debugs in memory
             # so they can be downloaded at once.
             try:
                 if os.stat(debug_job.result).st_size > DEBUG_MAX_SIZE * 1048576:
-                    raise CallError(f'Debug file is bigger than {DEBUG_MAX_SIZE}MiB.')
+                    raise CallError(f"Debug file is bigger than {DEBUG_MAX_SIZE}MiB.")
             except FileNotFoundError:
-                raise CallError('Debug file was not found, try again.')
+                raise CallError("Debug file was not found, try again.")
 
-            network = self.middleware.call_sync('network.configuration.config')
-            node = self.middleware.call_sync('failover.node')
+            network = self.middleware.call_sync("network.configuration.config")
+            node = self.middleware.call_sync("failover.node")
 
             tario = io.BytesIO()
-            with tarfile.open(fileobj=tario, mode='w') as tar:
-
-                if node == 'A':
-                    my_hostname = network['hostname']
-                    remote_hostname = network['hostname_b']
+            host_status = self.middleware.call_sync("failover.status")
+            with tarfile.open(fileobj=tario, mode="w") as tar:
+                if node == "A":
+                    my_hostname = network["hostname"]
+                    remote_hostname = network["hostname_b"]
                 else:
-                    my_hostname = network['hostname_b']
-                    remote_hostname = network['hostname']
+                    my_hostname = network["hostname_b"]
+                    remote_hostname = network["hostname"]
 
-                tar.add(debug_job.result, f'{my_hostname}.txz')
+                tar.add(
+                    debug_job.result,
+                    f"{my_hostname}{'_active' if host_status == 'MASTER' else ''}.txz",
+                )
 
-                tarinfo = tarfile.TarInfo(f'{remote_hostname}.txz')
+                tarinfo = tarfile.TarInfo(f"{remote_hostname}.txz")
                 tarinfo.size = standby_debug.tell()
+                # need to set a valid modify time because `standby_debug`
+                # is an io.BytesIO object which doesn't have any type of
+                # file metadata on it.
+                tarinfo.mtime = time.time()
                 standby_debug.seek(0)
                 tar.addfile(tarinfo, fileobj=standby_debug)
 
             tario.seek(0)
             shutil.copyfileobj(tario, job.pipes.output.w)
         else:
-            with open(debug_job.result, 'rb') as f:
+            with open(debug_job.result, "rb") as f:
                 shutil.copyfileobj(f, job.pipes.output.w)
         job.pipes.output.w.close()

@@ -7,10 +7,16 @@ export PYBUILD_NAME=middlewared
 	dh $@ --with python3 --buildsystem=pybuild
 
 override_dh_auto_build:
+	python3 -m middlewared.scripts.generate_s3_providers
+	FAKE_ENV=1 python3 -m middlewared.test.linter.api_import_check
+	FAKE_ENV=1 python3 -m middlewared.test.linter.etc_check
 	dh_auto_build
-	env FREENAS_INSTALL=yes /usr/sbin/migrate93 -f freenas-v1.db -s pwenc_secret
-	env FREENAS_INSTALL=yes PYTHONPATH=. /usr/sbin/migrate113 -f freenas-v1.db -s pwenc_secret
-	cd middlewared && env PYTHONPATH=.. FREENAS_DATABASE=../freenas-v1.db FREENAS_PWENC_SECRET=../pwenc_secret alembic upgrade head
+	sqlite3 freenas-v1.db < middlewared/alembic/initial.sql
+	cd middlewared && env PYTHONPATH=.. FAKE_ENV=1 FREENAS_DATABASE=../freenas-v1.db alembic upgrade head
+
+override_dh_installsystemd:
+	dh_installsystemd --name=zettarepl --no-enable --no-start
+	dh_installsystemd
 
 override_dh_install:
 	dh_install

@@ -1,0 +1,461 @@
+from __future__ import annotations
+
+import asyncio
+import errno
+import itertools
+import os
+import re
+import shlex
+from typing import TYPE_CHECKING, Any, TypeVar
+import uuid
+
+from truenas_pylibvirt import DomainDoesNotExistError
+from truenas_pylibvirt.domain.base.configuration import parse_numeric_set
+from truenas_pylibvirt.nsexec import ALL_CAPABILITIES as CAPABILITIES
+
+from middlewared.api.base import BaseModel, Excluded, excluded_field
+from middlewared.api.current import (
+    ContainerCreate,
+    ContainerCreateResult,
+    ContainerDeleteOptions,
+    ContainerEntry,
+    ContainerUpdate,
+    QueryOptions,
+    ZFSResourceQuery,
+    ZFSResourceRenameArgsData,
+    ZFSResourceSnapshotCloneArgsData,
+    ZFSResourceSnapshotCountQuery,
+    ZFSResourceSnapshotDestroyArgsData,
+)
+from middlewared.job import JobCancelledException, State
+from middlewared.plugins.zfs.exceptions import ZFSDestroyFailedException
+from middlewared.pylibvirt import gather_pylibvirt_domains_states, get_pylibvirt_domain_state
+from middlewared.service import CallError, CRUDServicePart, ValidationError, ValidationErrors
+import middlewared.sqlalchemy as sa
+from middlewared.utils.cpu import online_cpus
+from middlewared.utils.libvirt.utils import ACTIVE_STATES, retrieve_status, same_uuid
+from middlewared.utils.memory import get_memory_info
+
+from .dataset import ensure_datasets
+from .info import license_active, pool_choices
+from .lifecycle import pylibvirt_container
+from .utils import container_dataset
+
+if TYPE_CHECKING:
+    from middlewared.job import Job
+    from middlewared.utils.types import AuditCallback
+
+
+ContainerDataT = TypeVar('ContainerDataT', bound=ContainerEntry)
+
+
+# Based on RFC 1123 hostname rules but with a tighter total-length cap of 100
+# characters (RFC 1123 allows 253).  Container names become part of ZFS dataset
+# paths (e.g. pool/.truenas_containers/containers/<name>) and ZFS has a practical
+# limit of ZFS_MAX_DATASET_NAME_LEN.  Capping at 100 leaves
+# comfortable headroom for the dataset path prefix and snapshot names.
+RE_NAME = re.compile(
+    r"\A"
+    r"(?!\d{1,3}(?:\.\d{1,3}){3}\Z)"                    # reject IPv4 dotted-decimal
+    r"(?=.{1,100}\Z)"                                    # total length 1-100 (see above)
+    r"(?:[a-z0-9](?:[a-z0-9\-]{0,61}[a-z0-9])?\.)*"     # zero or more non-final labels
+    r"[a-z0-9](?:[a-z0-9\-]{0,61}[a-z0-9])?"            # final label (1-63 chars)
+    r"\Z",
+    re.IGNORECASE,
+)
+
+
+def cpuset_error(cpuset: str, online: frozenset[int]) -> str | None:
+    if '_' in cpuset:
+        return 'Underscores are not allowed in CPU set values'
+    if any(c.isspace() for c in cpuset):
+        return 'Whitespace is not allowed in CPU set values'
+    try:
+        cpus = parse_numeric_set(cpuset)
+    except ValueError as e:
+        return f'Invalid cpuset format: {e}'
+    if offline := set(cpus) - online:
+        return f'CPU(s) {", ".join(map(str, sorted(offline)))} are not online'
+    return None
+
+
+class ContainerCreateWithDataset(ContainerCreate):
+    pool: Excluded = excluded_field()
+    image: Excluded = excluded_field()
+    dataset: str  # type: ignore[assignment]
+
+
+class ContainerCreateWithDatasetArgs(BaseModel):
+    container_create: ContainerCreateWithDataset
+    """Container create with dataset parameters."""
+
+
+class ContainerCreateWithDatasetResult(ContainerCreateResult):
+    pass
+
+
+class ContainerModel(sa.Model):
+    __tablename__ = 'container_container'
+
+    id = sa.Column(sa.Integer(), primary_key=True)
+    uuid = sa.Column(sa.Text())
+    name = sa.Column(sa.Text())
+    description = sa.Column(sa.Text())
+    autostart = sa.Column(sa.Boolean())
+    time = sa.Column(sa.Text())
+    cpuset = sa.Column(sa.Text(), nullable=True)
+    memory = sa.Column(sa.Integer(), nullable=True)
+    shutdown_timeout = sa.Column(sa.Integer())
+    dataset = sa.Column(sa.Text())
+    init = sa.Column(sa.Text())
+    initdir = sa.Column(sa.Text(), nullable=True)
+    initenv = sa.Column(sa.JSON(dict))
+    inituser = sa.Column(sa.Text(), nullable=True)
+    initgroup = sa.Column(sa.Text(), nullable=True)
+    idmap_slice = sa.Column(sa.Integer(), nullable=True)
+    capabilities_policy = sa.Column(sa.Text())
+    capabilities_state = sa.Column(sa.JSON(dict))
+
+
+class ContainerServicePart(CRUDServicePart[ContainerEntry]):
+    _datastore = 'container.container'
+    _datastore_sql_filters = frozenset((
+        'id', 'uuid', 'name', 'description', 'autostart', 'time', 'cpuset', 'shutdown_timeout', 'dataset', 'init',
+        'initdir', 'inituser', 'initgroup', 'capabilities_policy', 'memory',
+    ))
+    _entry = ContainerEntry
+
+    def extend_context_sync(self, rows: list[dict[str, Any]], extra: dict[str, Any]) -> dict[str, Any]:
+        return {
+            'devices': self.devices_by_container(rows),
+            'states': gather_pylibvirt_domains_states(
+                self.middleware,
+                rows,
+                self.middleware.libvirt_domains_manager.containers_connection,
+                lambda container: pylibvirt_container(self, self.state_entry(container)),
+            ) if retrieve_status(extra) else None,
+        }
+
+    def devices_by_container(self, rows: list[dict[str, Any]]) -> dict[int, list[Any]]:
+        devices_by_container: dict[int, list[Any]] = {}
+        if not rows:
+            return devices_by_container
+
+        for device in self.call_sync2(
+            self.s.container.device.query,
+            [['container', 'in', [row['id'] for row in rows]]],
+        ):
+            devices_by_container.setdefault(device.container, []).append(device)
+
+        return devices_by_container
+
+    def state_entry(self, row: dict[str, Any]) -> ContainerEntry:
+        # State gathering only reads the container's identity to find its libvirt domain, so
+        # the runtime-only fields are filled with placeholders just to satisfy the model.
+        return ContainerEntry(**{
+            **self.extend_container(dict(row)),
+            'devices': [],
+            'status': {'state': 'STOPPED', 'pid': None, 'domain_state': None},
+        })
+
+    async def extend(self, data: dict[str, Any], context: dict[str, Any]) -> dict[str, Any]:
+        devices = context['devices'].get(data['id'], [])
+
+        data.update({
+            'status': None if context['states'] is None else get_pylibvirt_domain_state(context['states'], data),
+            'devices': devices,
+        })
+
+        self.extend_container(data)
+
+        return data
+
+    async def compress(self, data: dict[str, Any]) -> dict[str, Any]:
+        idmap = data.pop('idmap')
+        if idmap is None:
+            data['idmap_slice'] = None
+        elif idmap['type'] == 'DEFAULT':
+            data['idmap_slice'] = 0
+        elif idmap['type'] == 'ISOLATED':
+            data['idmap_slice'] = idmap['slice']
+
+        return data
+
+    def extend_container(self, container: dict[str, Any]) -> dict[str, Any]:
+        idmap_slice = container.pop('idmap_slice')
+        if idmap_slice is None:
+            container['idmap'] = None
+        elif idmap_slice == 0:
+            container['idmap'] = {'type': 'DEFAULT'}
+        else:
+            container['idmap'] = {
+                'type': 'ISOLATED',
+                'slice': idmap_slice,
+            }
+
+        return container
+
+    async def create_with_dataset(self, data: ContainerCreateWithDataset) -> ContainerEntry:
+        verrors = ValidationErrors()
+        data = await self.validate(verrors, 'container_create', data)
+        verrors.check()
+
+        entry = await self._create(data.model_dump())
+        await self.middleware.call('etc.generate', 'libvirt_guests')
+        return entry
+
+    async def do_create(self, job: Job, data: ContainerCreate) -> ContainerEntry:
+        verrors = ValidationErrors()
+        pool = data.pool or (await self.call2(self.s.lxc.config)).preferred_pool
+        if not pool:
+            verrors.add(
+                'container_create.pool',
+                'Either configure a preferred pool in lxc settings or provide a pool name.'
+            )
+        elif pool not in await pool_choices(self):
+            verrors.add(
+                'container_create.pool',
+                'Pool not found.'
+            )
+        data = await self.validate(verrors, 'container_create', data)
+        verrors.check()
+        assert pool is not None
+
+        image = data.image.model_dump()
+        pull_job = await self.call2(self.s.container.image.pull, pool, image)
+        try:
+            image_snapshot = await job.wrap(pull_job)
+        except asyncio.CancelledError:
+            pull_job.abort()
+            raise
+        except ValidationErrors as image_verrors:
+            verrors.add_child('container_create.image', image_verrors)
+            verrors.check()
+
+        if pull_job.state == State.ABORTED:
+            raise JobCancelledException()
+
+        await ensure_datasets(self, pool)
+        dataset = os.path.join(container_dataset(pool), f'containers/{data.name}')
+
+        # Populate dataset
+        if pool == image_snapshot.split('@')[0].split('/')[0]:  # noqa
+            # The container is in the same pool as images. We can just clone the image.
+            await self.call2(
+                self.s.zfs.resource.snapshot.clone,
+                ZFSResourceSnapshotCloneArgsData(snapshot=image_snapshot, dataset=dataset, bypass=True),  # noqa
+            )
+        else:
+            # The container is on the different pool. Let's replicate the image.
+            source_dataset, source_snapshot = image_snapshot.split('@', 1)  # noqa
+            await job.wrap(await self.middleware.call(
+                'replication.run_onetime', {
+                    'direction': 'PUSH',
+                    'transport': 'LOCAL',
+                    'source_datasets': [source_dataset],
+                    'target_dataset': dataset,
+                    'recursive': True,
+                    'name_regex': source_snapshot,
+                    'retention_policy': 'SOURCE',
+                    'replicate': True,
+                    'readonly': 'IGNORE',
+                }
+            ))
+            await self.call2(
+                self.s.zfs.resource.snapshot.destroy_impl,
+                ZFSResourceSnapshotDestroyArgsData(path=f'{dataset}@{source_snapshot}', bypass=True),
+            )
+
+        entry = await self._create(data.model_dump(exclude={'pool', 'image'}) | {'dataset': dataset})
+        await self.middleware.call('etc.generate', 'libvirt_guests')
+        return entry
+
+    async def do_update(
+        self, id_: int, data: ContainerUpdate, *, audit_callback: AuditCallback,
+    ) -> ContainerEntry:
+        old = await self.get_instance(id_)
+        new = old.model_copy(update=data.model_dump(exclude_unset=True))
+        audit_callback(new.name)
+
+        verrors = ValidationErrors()
+        new = await self.validate(verrors, 'container_update', new, old=old)
+        verrors.check()
+
+        name_changed = old.name != new.name
+        if name_changed:
+            if old.status.state in ACTIVE_STATES:
+                raise CallError('Container must be stopped before renaming.')
+
+            old_dataset = old.dataset
+            new_dataset = old_dataset[:old_dataset.rfind('/') + 1] + new.name
+            await self.call2(
+                self.s.zfs.resource.rename_impl,
+                ZFSResourceRenameArgsData(current_name=old_dataset, new_name=new_dataset, bypass=True),
+            )
+            new = new.model_copy(update={'dataset': new_dataset})
+
+        entry = await self._update(id_, new.model_dump(exclude={'id', 'devices', 'status_or_null'}))
+
+        if old.shutdown_timeout != new.shutdown_timeout:
+            await self.middleware.call('etc.generate', 'libvirt_guests')
+
+        return entry
+
+    def do_delete(self, id_: int, options: ContainerDeleteOptions, *, audit_callback: AuditCallback) -> None:
+        container = self.get_instance__sync(id_)
+        audit_callback(container.name)
+
+        if container.status.state in ACTIVE_STATES and not options.force:
+            raise ValidationError(
+                'container_delete.force',
+                f'Container {container.name!r} is {container.status.state.lower()}. Stop it first, '
+                f'or pass force=True to stop and delete it.',
+                errno.EBUSY,
+            )
+
+        # A dataset that is already missing - a victim of a legacy .ix-virt deletion,
+        # say - is not an error; the dangling records are still cleaned up below.
+        resources = self.call_sync2(
+            self.s.zfs.resource.list_impl,
+            ZFSResourceQuery(paths=[container.dataset], properties=None, get_children=True),
+        )
+        dataset_exists = bool(resources)
+
+        # Everything a non-recursive destroy would refuse has to be caught before libvirt is
+        # touched. Undefining the domain is not itself destructive - the next start rebuilds it
+        # from the container's configuration - but getting there kills a running container and
+        # discards a suspended one's state, and the destroy then fails anyway.
+        if dataset_exists and not options.recursive:
+            if len(resources) > 1:
+                raise ValidationError(
+                    'container_delete.recursive',
+                    f'Container {container.name!r} dataset {container.dataset!r} has child datasets. '
+                    'Set `recursive` to delete the container together with them.',
+                    errno.ENOTEMPTY,
+                )
+
+            snapshots = self.call_sync2(
+                self.s.zfs.resource.snapshot.count_impl,
+                ZFSResourceSnapshotCountQuery(paths=[container.dataset]),
+            ).get(container.dataset, 0)
+            if snapshots:
+                raise ValidationError(
+                    'container_delete.recursive',
+                    f'Container {container.name!r} dataset {container.dataset!r} has {snapshots} snapshot(s). '
+                    'Set `recursive` to delete the container together with them.',
+                    errno.ENOTEMPTY,
+                )
+
+        # Deleting the domain destroys it if it is active and gives its post-stop
+        # actions time to finish before undefining it, so the container's runtime
+        # mounts - the idmapped root under /run/truenas_containers/ among them - are
+        # gone before ZFS is touched. Stopping it instead returns while those are
+        # still being torn down and the destroy then fails on a busy dataset.
+        self.delete_container_from_libvirt(container)
+
+        # Destroy the dataset first and only remove the DB records once it is actually
+        # gone, so a failed destroy never orphans the dataset with no container row
+        # pointing at it.
+        if dataset_exists:
+            # bypass, because the container dataset tree is a protected path that only this plugin manages.
+            try:
+                self.call_sync2(
+                    self.s.zfs.resource.destroy_impl, container.dataset, recursive=options.recursive,
+                    bypass=True,
+                )
+            except ZFSDestroyFailedException as e:
+                raise CallError(f'Failed to delete container {container.name!r} dataset: {e.message}')
+
+        self.delete_container_from_db(container)
+        self.middleware.call_sync('etc.generate', 'libvirt_guests')
+
+    def delete_container_from_libvirt(self, container: ContainerEntry) -> None:
+        pylibvirt_container_obj = pylibvirt_container(self, container)
+        try:
+            self.middleware.libvirt_domains_manager.containers.delete(pylibvirt_container_obj)
+        except DomainDoesNotExistError:
+            pass
+
+    def delete_container_from_db(self, container: ContainerEntry) -> None:
+        for device in container.devices:
+            self.middleware.call_sync('datastore.delete', 'container.device', device.id)
+
+        self.run_coroutine(self._delete(container.id))
+
+    async def validate(
+        self, verrors: ValidationErrors, schema_name: str, data: ContainerDataT, old: ContainerEntry | None = None,
+    ) -> ContainerDataT:
+        if not await license_active(self):
+            verrors.add(
+                f'{schema_name}.name',
+                'System is not licensed to use containers.'
+            )
+
+        if data.uuid is None:
+            data = data.model_copy(update={'uuid': str(uuid.uuid4())})
+
+        if old is None or data.uuid != old.uuid:
+            rows = await self.middleware.call('datastore.query', 'container.container', [])
+            if any(
+                (old is None or row['id'] != old.id) and row['uuid'] and same_uuid(data.uuid, row['uuid'])
+                for row in rows
+            ):
+                verrors.add(f'{schema_name}.uuid', 'A container with this UUID already exists.', errno.EEXIST)
+
+        if data.idmap is not None:
+            if data.idmap.type == 'ISOLATED':
+                if data.idmap.slice is None:
+                    used_slices = {
+                        container.idmap.slice
+                        for container in await self.query([], QueryOptions())
+                        if container.idmap is not None and container.idmap.type == 'ISOLATED'
+                    }
+                    idmap_slice = next(
+                        s for s in itertools.count(1) if s not in used_slices
+                    )
+                    data = data.model_copy(update={
+                        'idmap': data.idmap.model_copy(update={'slice': idmap_slice}),
+                    })
+
+        if invalid_caps := set(data.capabilities_state) - CAPABILITIES:
+            verrors.add(
+                f'{schema_name}.capabilities_state',
+                f'Invalid capabilities: {", ".join(sorted(invalid_caps))}'
+            )
+
+        try:
+            init = shlex.split(data.init)
+        except ValueError as e:
+            verrors.add(f'{schema_name}.init', f'Parse error: {e.args[0]}')
+        else:
+            if not init:
+                verrors.add(f'{schema_name}.init', 'Must not be empty')
+
+        # Only rechecked on change, so a host that has since lost CPUs or memory does not block unrelated edits.
+        if data.cpuset and (old is None or data.cpuset != old.cpuset):
+            if error := cpuset_error(data.cpuset, await self.to_thread(online_cpus)):
+                verrors.add(f'{schema_name}.cpuset', error)
+
+        if data.memory is not None and (old is None or data.memory != old.memory):
+            host_memory = (await self.to_thread(get_memory_info))['total'] // 1024 ** 2
+            if data.memory > host_memory:
+                verrors.add(f'{schema_name}.memory', f"Cannot exceed the host's physical memory ({host_memory} MiB)")
+
+        filters: list[tuple[str, str, Any]] = [('name', '=', data.name)]
+        if old:
+            filters.append(('id', '!=', old.id))
+
+        if await self.query(filters, QueryOptions()):
+            verrors.add(
+                f'{schema_name}.name',
+                'A container with this name already exists.', errno.EEXIST
+            )
+        elif not RE_NAME.match(data.name):
+            verrors.add(
+                f'{schema_name}.name',
+                'Name must be a valid hostname (up to 100 characters total): 1-63 characters per label, '
+                'only letters, digits, and hyphens within each label, labels separated by dots, '
+                'and must not be an IPv4 address.'
+            )
+
+        return data

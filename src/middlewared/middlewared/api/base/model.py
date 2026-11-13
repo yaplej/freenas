@@ -1,0 +1,582 @@
+from collections.abc import Callable
+import inspect
+from types import NoneType, new_class
+from typing import Annotated, Any, Literal, Self, get_args, get_origin
+
+from pydantic import BaseModel as PydanticBaseModel
+from pydantic import ConfigDict, Field, GetCoreSchemaHandler, Secret, create_model, model_serializer
+from pydantic._internal._decorators import Decorator, PydanticDescriptorProxy
+from pydantic._internal._model_construction import ModelMetaclass
+from pydantic.fields import FieldInfo
+from pydantic.json_schema import SkipJsonSchema
+from pydantic.main import IncEx, ModelT
+from pydantic.types import SecretType
+from pydantic_core import PydanticUndefined, SchemaSerializer, core_schema
+
+from middlewared.api.base.full_admin import FullAdminOnly, document_full_admin_fields
+from middlewared.api.base.line_breaks import add_line_break_validators
+from middlewared.api.base.private import guard_private_fields, is_private_guard
+from middlewared.api.base.types.string import SECRET_VALUE
+from middlewared.utils.lang import undefined
+from middlewared.utils.typing_ import is_union
+
+__all__ = ["DumpableModel", "BaseModel", "ForUpdateMetaclass",
+           "query_result", "query_result_from_item", "query_result_item",
+           "added_event_model", "changed_event_model", "removed_event_model",
+           "single_argument_args", "single_argument_result",
+           "NotRequired", "model_subset",
+           "convert_model"]
+
+
+class _NotRequired:
+    # `_not_required_serializer` filters this sentinel out of serialized models by identity, so cloning
+    # a model must never clone the sentinel along with it.
+    def __copy__(self) -> "_NotRequired":
+        return self
+
+    def __deepcopy__(self, memo: dict[int, Any]) -> "_NotRequired":
+        return self
+
+    def __reduce__(self) -> tuple[Callable[[], "_NotRequired"], tuple[()]]:
+        return _get_not_required, ()
+
+
+def _get_not_required() -> "_NotRequired":
+    return NotRequired
+
+
+NotRequired = _NotRequired()
+"""Use as the default value for fields that may be excluded from the model."""
+_SERIALIZER_NAME = "serializer"
+"""Reserved name for model serializers `_not_required_serializer` and `_for_update_serializer`."""
+
+
+def _serialize_secret(value: Secret[SecretType], info: core_schema.SerializationInfo) -> SecretType | str:
+    """
+    Return the hidden value if "expose_secrets" was passed to `model_dump`. Otherwise, return the redaction string.
+    """
+    if isinstance(info.context, dict) and info.context.get("expose_secrets") is True:
+        return value.get_secret_value()
+    else:
+        # always serialize Secret as if info.mode="json" (never return a Secret object)
+        return SECRET_VALUE
+
+
+# Lifted from `pydantic.Secret`. We only change the serializer function, `_serialize_secret`.
+Secret.__pydantic_serializer__ = SchemaSerializer(
+    core_schema.any_schema(
+        serialization=core_schema.plain_serializer_function_ser_schema(
+            _serialize_secret,
+            info_arg=True,
+            when_used='always',
+        )
+    )
+)
+
+
+@model_serializer(mode="wrap")
+def _not_required_serializer(  # type: ignore[no-untyped-def]
+    self: "BaseModel",
+    serializer: core_schema.SerializerFunctionWrapHandler,
+):
+    """Exclude all fields that are set to `NotRequired`."""
+    return {
+        k: v
+        for k, v in serializer(self).items()
+        if v is not NotRequired
+    }
+
+
+@model_serializer(mode="wrap")
+def _for_update_serializer(  # type: ignore[no-untyped-def]
+    self: "BaseModel",
+    serializer: core_schema.SerializerFunctionWrapHandler,
+):
+    if self is undefined:  # type: ignore[comparison-overlap]
+        # Can happen if `ForUpdateMetaclass` models are nestsed. Defer serialization to the outer model.
+        return self
+
+    aliases = {field.alias or name: name for name, field in self.model_fields.items()}
+
+    return {
+        k: v
+        for k, v in serializer(self).items()
+        if (
+            (getattr(self, aliases[k]) != undefined) if k in aliases and hasattr(self, aliases[k])
+            else v != undefined
+        )
+    }
+
+
+def _apply_model_serializer(cls: type["BaseModel"], model_serializer: PydanticDescriptorProxy[Any]) -> None:
+    """Update a model's custom model serializer.
+
+    As per pydantic's current implementation, it is not possible for a model to have more than one functional model
+    serializer. If `cls` already has a functional model serializer, it will be replaced with the new one.
+
+    """
+    setattr(cls, _SERIALIZER_NAME, model_serializer.wrapped)
+    cls.__pydantic_decorators__.model_serializers = {
+        _SERIALIZER_NAME: Decorator.build(
+            cls,
+            cls_var_name=_SERIALIZER_NAME,
+            shim=model_serializer.shim,
+            info=model_serializer.decorator_info,  # type: ignore[arg-type]
+        )
+    }
+    cls.model_rebuild(force=True)
+
+
+def _is_field_level_metadata(metadata: Any) -> bool:
+    """Whether `metadata` must stay in `FieldInfo.metadata` instead of being folded into the annotation.
+
+    `SkipJsonSchema` (and therefore `Private`) stops being honored once it is nested inside a union member, and
+    the private guard has to see every supplied value, so neither may be folded by `_annotate_not_required`.
+    `FullAdminOnly` is looked up on the field itself, so folding it would silently unprotect the field.
+    """
+    return (
+        isinstance(metadata, (SkipJsonSchema, FullAdminOnly))  # type: ignore[misc]
+        or is_private_guard(metadata)
+    )
+
+
+def _annotate_not_required(annotation: Any | None, metadata: tuple[Any, ...] = ()) -> Any:
+    if get_origin(annotation) is Secret:
+        inner = get_args(annotation)[0]
+        if metadata:
+            inner = Annotated[inner, *metadata]
+        new_annotation: Any = Secret[inner | _NotRequired]  # type: ignore[valid-type]
+    else:
+        if metadata:
+            annotation = Annotated[annotation, *metadata]
+        new_annotation = annotation | _NotRequired
+
+    return new_annotation
+
+
+class _BaseModelMetaclass(ModelMetaclass):
+    """Any `BaseModel` subclass that uses the `NotRequired` default value on any of its fields receives the appropriate
+    model serializer."""
+    # FIXME: In the future we want to set defaults on all fields
+    # that are not required. Remove this metaclass at that time.
+
+    def __new__(mcls, name: str, bases: tuple[type[Any], ...], namespace: dict[str, Any], **kwargs: Any) -> type:
+        cls = super().__new__(mcls, name, bases, namespace, **kwargs)
+
+        # Must run before the `NotRequired` handling below so that the guard is treated as field-level
+        # metadata instead of being folded into the annotation.
+        has_private = guard_private_fields(cls)
+        documented_full_admin = document_full_admin_fields(cls)
+
+        has_not_required = False
+        wrapped_secret_default = False
+        for field in cls.model_fields.values():  # type: ignore[attr-defined]
+            if field.default is NotRequired:
+                # Update annotation of any field with a default of `NotRequired` since fields
+                # are serialized according to their annotation, not their value.
+                # Field metadata (e.g. `MaxLen`) is folded into the inner annotation so the
+                # constraint applies to the typed arm of the union rather than only to the
+                # union as a whole — otherwise the model config's `str_max_length` wins for
+                # the bare `str` arm.
+                field_level = [metadata for metadata in field.metadata if _is_field_level_metadata(metadata)]
+                foldable = [metadata for metadata in field.metadata if not _is_field_level_metadata(metadata)]
+                field.annotation = _annotate_not_required(field.annotation, tuple(foldable))
+                field.metadata = field_level
+                has_not_required = True
+            elif (
+                get_origin(field.annotation) is Secret
+                and field.default is not PydanticUndefined
+                and field.default is not undefined
+                and not isinstance(field.default, Secret)
+            ):
+                # Pydantic does not validate defaults, so a bare default on a `Secret` field (e.g.
+                # `Secret[str] = Field(default="")`) stays an unwrapped value, which is inconsistent with explicitly
+                # specified values. Wrap it so model instances are consistent.
+                field.default = new_class(
+                    "Secret",
+                    (Secret[get_args(field.annotation)[0]],),  # type: ignore[misc]
+                )(field.default)
+                wrapped_secret_default = True
+
+        if has_not_required:
+            # If any field has a default of `NotRequired`, apply the serializer to the model.
+            # This rebuilds the model, which is also required for the wrapped `Secret` defaults above.
+            _apply_model_serializer(cls, _not_required_serializer)  # type: ignore[arg-type]
+        elif wrapped_secret_default:
+            # A mutated `field.default` only takes effect on instantiation after the model is rebuilt.
+            cls.model_rebuild(force=True)  # type: ignore[attr-defined]
+        elif has_private or documented_full_admin:
+            # Same for a mutated `field.metadata` or `field.description`.
+            cls.model_rebuild(  # type: ignore[attr-defined]
+                force=True,
+                # A model whose annotations contain forward references that are not defined yet cannot be
+                # built at this point. Pydantic leaves it incomplete and rebuilds it, picking up the guard,
+                # on first use.
+                raise_errors=False,
+            )
+
+        return cls
+
+
+class ForUpdateMetaclass(_BaseModelMetaclass):
+    """
+    Using this metaclass on a model will change all of its fields default values to `undefined`.
+    Such a model might be instantiated with any subset of its fields, which can be useful to validate request bodies
+    for requests with PATCH semantics.
+    """
+
+    def __new__(mcls, name: str, bases: tuple[type[Any], ...], namespace: dict[str, Any], **kwargs: Any) -> type:
+        cls = ModelMetaclass.__new__(mcls, name, bases, namespace, **kwargs)
+
+        # This bypasses `_BaseModelMetaclass.__new__`, so private fields have to be guarded, and `FullAdmin`
+        # fields documented, here as well.
+        # No explicit rebuild is needed: `_apply_model_serializer` below rebuilds the model unconditionally.
+        guard_private_fields(cls)
+        document_full_admin_fields(cls)
+
+        for field in cls.model_fields.values():  # type: ignore[attr-defined]
+            # We want to back `default` and `default_factory` so that `model_subset` can later use them.
+            # However, `field` (an instance of `FieldInfo`) has `__slots__` which prevents us from adding new
+            # attributes like `_original_default` and `_original_default_factory`.
+            # What we do instead is create a hackish `default_factory` function that returns `undefined` as it should,
+            # but if a second argument is passed, and it is `True` (only `model_subset` does that) then we return
+            # the original `default` and `default_factory` values.
+            default_factory = ForUpdateMetaclass._default_factory(field.default, field.default_factory)
+            # Set defaults of all fields to `undefined`.
+            # New defaults do not apply until model is rebuilt in `_apply_model_serializer`.
+            field.default = undefined
+            field.default_factory = default_factory
+
+        _apply_model_serializer(cls, _for_update_serializer)  # type: ignore[arg-type]
+        return cls
+
+    @staticmethod
+    def _default_factory(default: Any, default_factory: Any) -> Any:
+        def f(data: Any = None, return_original_default: bool = False) -> Any:
+            if return_original_default:
+                return default, default_factory
+
+            return undefined
+
+        return f
+
+
+class DumpableModel(PydanticBaseModel):
+    def model_dump(  # type: ignore[override]
+        self,
+        *,
+        mode: Literal["json", "python"] = "python",
+        include: IncEx | None = None,
+        exclude: IncEx | None = None,
+        context: dict[str, Any] | None = None,
+        by_alias: bool = True,  # pydantic default is `False`
+        exclude_unset: bool = False,
+        exclude_defaults: bool = False,
+        exclude_none: bool = False,
+        round_trip: bool = False,
+        warnings: bool | Literal["none", "warn", "error"] = False,  # pydantic default is `True`
+        serialize_as_any: bool = False,
+        expose_secrets: bool = False,
+    ) -> dict[str, Any]:
+        """
+        Usage docs: https://docs.pydantic.dev/2.10/concepts/serialization/#modelmodel_dump
+
+        Re-implementation of the original `model_dump` function to change some default values.
+
+        `expose_secrets`: new parameter. If `False`, will replace `Secret` fields with a placeholder.
+        """
+        if isinstance(context, dict) and "expose_secrets" in context:
+            raise ValueError(
+                "Do not specify `expose_secrets` via `context`; use explicit `expose_secrets` parameter instead."
+            )
+
+        return super().model_dump(
+            mode=mode,
+            include=include,
+            exclude=exclude,
+            context={**(context or {}), "expose_secrets": expose_secrets},
+            by_alias=by_alias,
+            exclude_unset=exclude_unset,
+            exclude_defaults=exclude_defaults,
+            exclude_none=exclude_none,
+            round_trip=round_trip,
+            warnings=warnings,
+            serialize_as_any=serialize_as_any,
+        )
+
+
+class BaseModel(DumpableModel, metaclass=_BaseModelMetaclass):
+    model_config = ConfigDict(
+        extra="forbid",
+        strict=True,
+        str_max_length=1024,
+        arbitrary_types_allowed=True,
+        # FIXME: for pydantic 2.11 use:
+        # validate_by_name=True,
+        # validate_by_alias=True,
+        populate_by_name=True,
+    )
+
+    @classmethod
+    def __get_pydantic_core_schema__(
+        cls,
+        source: Any,
+        handler: GetCoreSchemaHandler,
+    ) -> core_schema.CoreSchema:
+        """Reject a line break in every string of the model that `Multiline` did not opt out.
+
+        A value interpolated bare into a line-oriented configuration file is not free-form, and
+        finding every such field is not something a reviewer can be relied on to do. The ban is the
+        default instead, and a field whose value is genuinely more than one line says so.
+        """
+        return add_line_break_validators(handler(source))
+
+    @classmethod
+    def __pydantic_init_subclass__(cls, **kwargs: Any) -> None:
+        for k, v in cls.model_fields.items():
+            if is_union(get_origin(v.annotation)):
+                for option in get_args(v.annotation):
+                    if get_origin(option) is Secret:
+                        def dump(t: Any) -> str:
+                            return str(t).replace("typing.", "").replace("middlewared.api.base.types.base.", "")
+
+                        raise TypeError(
+                            f"Model {cls.__name__} has field {k} defined as {dump(v.annotation)}. {dump(option)} "
+                            "cannot be a member of an Optional or a Union, please make the whole field a `Secret`."
+                        )
+            if not v.description and (parent_field := cls.__base__.model_fields.get(k)):  # type: ignore[union-attr]
+                v.description = parent_field.description
+
+    @classmethod
+    def model_fields_by_alias(cls) -> dict[str, FieldInfo]:
+        return {field.alias or name: field for name, field in cls.model_fields.items()}
+
+    @classmethod
+    def schema_model_fields(cls) -> dict[str, FieldInfo]:
+        return {
+            key: field
+            for key, field in cls.model_fields_by_alias().items()
+            if not any(isinstance(metadata, SkipJsonSchema) for metadata in field.metadata)  # type: ignore[misc]
+        }
+
+    @classmethod
+    def from_previous(cls, value: Any) -> Any:
+        """
+        Converts model value from a preceding API version to this API version. `value` can be modified in-place.
+        :param value: value of the same model in the preceding API version.
+        :return: value in this API version.
+        """
+        return value
+
+    @classmethod
+    def to_previous(cls, value: Any) -> Any:
+        """
+        Converts model value from this API version to a preceding API version. `value` can be modified in-place.
+        :param value: value in this API version.
+        :return: value of the same model in the preceding API version.
+        """
+        return value
+
+    def updated(self, value: "BaseModel") -> Self:
+        """
+        Returns an updated version of this model using All the fields that are present in the `value` model and are not
+        `undefined`.
+        :param value: model to update from.
+        :return: updated version of this model.
+        """
+        update = {}
+        for field in value.model_fields.keys():
+            if not hasattr(self, field):
+                continue
+
+            field_value = getattr(value, field)
+            if field_value is undefined:
+                continue
+
+            update[field] = field_value
+
+        return self.model_copy(update=update)
+
+
+def single_argument_args(name: str) -> Callable[[type[BaseModel]], type[BaseModel]]:
+    """
+    Model class decorator used to define an arguments model for a method that accepts a single dictionary argument.
+
+    :param name: name for that single argument.
+    :return: a model class that consists of unique `name` field that is represented by a class being decorated.
+        Class name will be preserved.
+    """
+    def wrapper(klass: type[BaseModel]) -> type[BaseModel]:
+        if any(field.is_required() for field in klass.model_fields.values()):
+            factory = None
+        else:
+            # All fields have defaults so we don't have to require the single argument
+            factory = klass
+
+        model = create_model(  # type: ignore[call-overload]
+            klass.__name__,
+            __base__=(BaseModel,),
+            __module__=klass.__module__,
+            **{
+                name: Annotated[
+                    klass,
+                    Field(
+                        default_factory=factory,  # type: ignore[arg-type]
+                        description=f"{klass.__name__} parameters.",
+                    ),
+                ]
+            },
+        )
+        model.from_previous = klass.from_previous
+        model.to_previous = klass.to_previous
+        return model  # type: ignore[no-any-return]
+
+    return wrapper
+
+
+def single_argument_result(klass: type | None, klass_name: str | None = None) -> type[BaseModel]:
+    """
+    Can be used as:
+    * Decorator for a class. In that case, it will create a class that represents a return value for a function that
+      returns a single dictionary, represented by the decorated class.
+    * Standalone model generator. Will return a model class named `klass_name` that consists of a single field
+      represented by `klass` (in that case, `klass` can be a primitive type).
+
+    :param klass: class or a primitive type to create model from.
+    :param klass_name: required, when being called as a standalone model generator. Returned class will have that name.
+        (otherwise, the decorated class name will be preserved).
+    :return: a model class that consists of unique `result` field that corresponds to `klass`.
+    """
+    if klass is None:
+        klass = NoneType
+
+    if klass.__module__ == "builtins":
+        if klass_name is None:
+            raise TypeError("You must specify class name when using `single_argument_result` for built-in types")
+    else:
+        klass_name = klass_name or klass.__name__
+
+    module = inspect.getmodule(inspect.stack()[1][0])
+    if module:
+        module_name = module.__name__
+    else:
+        module_name = None
+
+    model = create_model(
+        klass_name,
+        __base__=(BaseModel,),
+        __module__=module_name,  # type: ignore[arg-type]
+        result=Annotated[klass, Field(description=f"{klass_name} return fields.")],
+    )
+    if issubclass(klass, BaseModel):
+        model.from_previous = klass.from_previous  # type: ignore[method-assign]
+        model.to_previous = klass.to_previous  # type: ignore[method-assign]
+    return model
+
+
+def query_result(item: type[PydanticBaseModel], name: str | None = None) -> type[BaseModel]:
+    return query_result_from_item(query_result_item(item), name or item.__name__.removesuffix("Entry") + "QueryResult")
+
+
+def query_result_from_item(item: type[PydanticBaseModel], name: str) -> type[BaseModel]:
+    if item.__normalize_as__ != item:  # type: ignore[attr-defined]
+        result = Annotated[
+            list[item.__normalize_as__] |  # type: ignore[name-defined]
+            item.__normalize_as__ |  # type: ignore[name-defined]
+            list[item] |  # type: ignore[valid-type]
+            item |  # type: ignore[valid-type]
+            int,
+            Field()
+        ]
+    else:
+        result = Annotated[  # type: ignore[assignment,misc]
+            list[item] |  # type: ignore[valid-type]
+            item |
+            int,
+            Field()
+        ]
+
+
+    return create_model(
+        name,
+        __base__=(BaseModel,),
+        __module__=item.__module__,
+        result=result,
+    )
+
+
+def query_result_item(item: type[ModelT]) -> type[ModelT]:
+    # All fields must be non-required since we can query subsets of fields
+    result = create_model(
+        item.__name__.removesuffix("Entry") + "QueryResultItem",
+        __base__=(item,),
+        __module__=item.__module__,
+        __cls_kwargs__={"metaclass": ForUpdateMetaclass},
+    )
+    result.__normalize_as__ = item  # type: ignore[attr-defined]
+    item.__query_result_item__ = result  # type: ignore[attr-defined]
+    return result
+
+
+def added_event_model(item: type[BaseModel]) -> type[BaseModel]:
+    return create_model(
+        item.__name__.removesuffix("Entry") + "AddedEvent",
+        __base__=(BaseModel,),
+        __module__=item.__module__,
+        id=Annotated[item.model_fields["id"].annotation, Field()],
+        fields=Annotated[item, Field()],
+    )
+
+
+def changed_event_model(item: type[BaseModel]) -> type[BaseModel]:
+    return create_model(
+        item.__name__.removesuffix("Entry") + "ChangedEvent",
+        __base__=(BaseModel,),
+        __module__=item.__module__,
+        id=Annotated[item.model_fields["id"].annotation, Field()],
+        fields=Annotated[item, Field()],
+    )
+
+
+def removed_event_model(item: type[BaseModel]) -> type[BaseModel]:
+    return create_model(
+        item.__name__.removesuffix("Entry") + "RemovedEvent",
+        __base__=(BaseModel,),
+        __module__=item.__module__,
+        id=Annotated[item.model_fields["id"].annotation, Field()],
+    )
+
+
+def model_subset(base: type[BaseModel], fields: list[str]) -> type[BaseModel]:
+    """Create a model that is a subclass of `base` but only has `fields` fields."""
+    keep = set(fields)
+    model = create_model(
+        base.__name__ + "Subset",
+        __base__=(base,),
+        __module__=base.__module__,
+    )
+
+    # We inherit *all* of `base`'s fields; drop the ones not requested.
+    for field_name in list(model.model_fields):
+        if field_name not in keep:
+            del model.model_fields[field_name]
+
+    for field_name, field in model.model_fields.items():
+        # Restore the original default/default_factory backed up by `ForUpdateMetaclass` (if it was present). We read
+        # the single-layer backup off `base`'s field: subclassing re-runs `ForUpdateMetaclass`, which would otherwise
+        # double-wrap the value on `field` itself.
+        src = base.model_fields[field_name]
+        default, default_factory = src.default, src.default_factory
+        try:
+            default, default_factory = src.default_factory({}, True)  # type: ignore[call-arg,misc]
+        except TypeError:
+            pass
+        field.default, field.default_factory = default, default_factory
+
+    model.model_rebuild(force=True)
+
+    return model
+
+
+def convert_model[E: BaseModel](src: BaseModel, type_: type[E]) -> E:
+    return type_.model_validate({name: getattr(src, name) for name in type_.model_fields})

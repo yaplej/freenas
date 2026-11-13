@@ -1,17 +1,24 @@
+import os
 import subprocess
 
-from middlewared.utils import run
+from middlewared.plugins.grub_config import write_grub_config
+
+GRUB_CFG = '/boot/grub/grub.cfg'
+GRUB_CFG_TMP = '/boot/grub/grub.cfg.tmp'
 
 
-async def render(service, middleware):
+def render(service, middleware):
+    write_grub_config(middleware)
+
     try:
-        await run(["truenas-grub.py"], encoding="utf-8", errors="ignore")
+        subprocess.run(
+            ["grub-mkconfig", "-o", GRUB_CFG_TMP], check=True, capture_output=True, encoding="utf-8", errors="ignore",
+        )
     except subprocess.CalledProcessError as e:
-        middleware.logger.error("truenas-grub.py error:\n%s", e.stderr)
+        middleware.logger.error("grub-mkconfig error:\n%s", e.stderr)
         raise
 
-    try:
-        await run(["update-grub"], encoding="utf-8", errors="ignore")
-    except subprocess.CalledProcessError as e:
-        middleware.logger.error("update-grub.py error:\n%s", e.stderr)
-        raise
+    with open(GRUB_CFG_TMP, 'r') as f:
+        os.fsync(f.fileno())
+
+    os.replace(GRUB_CFG_TMP, GRUB_CFG)

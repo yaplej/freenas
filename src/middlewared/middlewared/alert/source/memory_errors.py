@@ -1,0 +1,107 @@
+# Copyright (c) - iXsystems Inc. dba TrueNAS
+#
+# Licensed under the terms of the TrueNAS Enterprise License Agreement
+# See the file LICENSE.IX for complete terms and conditions
+
+from dataclasses import dataclass
+from typing import Any
+
+from middlewared.alert.applicability import HA_LICENSED, TRUENAS_HARDWARE, TRUENAS_OR_MINI_HARDWARE
+from middlewared.alert.base import Alert, AlertCategory, AlertClass, AlertClassConfig, AlertLevel, AlertSource
+from middlewared.alert.schedule import CrontabSchedule
+from middlewared.utils.size import format_size
+
+
+@dataclass(kw_only=True)
+class MemoryErrorsAlert(AlertClass):
+    config = AlertClassConfig(
+        category=AlertCategory.HARDWARE,
+        level=AlertLevel.WARNING,
+        title='Uncorrected Memory Errors Detected',
+        text='%(count)d total uncorrected errors detected for %(loc)s.',
+        applies_to=TRUENAS_OR_MINI_HARDWARE,
+        proactive_support=True,
+    )
+
+    count: int
+    loc: str
+
+
+@dataclass(kw_only=True)
+class MemorySizeMismatchAlert(AlertClass):
+    config = AlertClassConfig(
+        category=AlertCategory.HARDWARE,
+        level=AlertLevel.WARNING,
+        title='Memory Size Mismatch Detected',
+        text="Memory size on this controller %(r1)s doesn't match other controller %(r2)s",
+        applies_to=TRUENAS_HARDWARE,
+        listed_only_when=HA_LICENSED,
+        proactive_support=True,
+    )
+
+    r1: str
+    r2: str
+
+
+class MemoryErrorsAlertSource(AlertSource):
+    schedule = CrontabSchedule(hour=1)  # every 24hrs
+    applies_to = TRUENAS_OR_MINI_HARDWARE
+
+    async def check(self) -> list[Alert[Any]]:
+        alerts: list[Alert[Any]] = []
+        for mem_ctrl, info in (await self.call2(self.s.hardware.memory.error_info)).items():
+            location = f'memory controller {mem_ctrl}'
+            if (val := info['uncorrected_errors_with_no_dimm_info']) is not None and val > 0:
+                # this means that there were uncorrected errors where no additional information
+                # is available. These errors occur when the system detects an uncorrectable memory
+                # error, but specific details about the error are not provided or accessible.
+                # Because of this fact, we'll just report the error count without the DIMM information.
+                alerts.append(Alert(MemoryErrorsAlert(count=val, loc=location)))
+            elif (val := info['uncorrected_errors']) is not None and val > 0:
+                # this means that there were uncorrected errors where the dimm information was able
+                # to be obtained.
+                for dimm_key in filter(lambda x: x.startswith(('dimm', 'rank')), info):
+                    if (val2 := info[dimm_key]['uncorrected_errors']) is not None and val2 > 0:
+                        # the specific dimm
+                        alerts.append(Alert(
+                            MemoryErrorsAlert(count=val2, loc=location + f' on dimm {dimm_key}')
+                        ))
+
+        return alerts
+
+
+class MemorySizeMismatchAlertSource(AlertSource):
+    schedule = CrontabSchedule(hour=1)  # every 24hrs
+    applies_to = TRUENAS_HARDWARE
+    run_on_backup_node = False
+
+    async def check(self) -> list[Alert[Any]]:
+        alerts: list[Alert[Any]] = []
+        if not await self.middleware.call('failover.licensed'):
+            return alerts
+
+        r1 = (await self.middleware.call('system.mem_info'))['physmem_size']
+        if r1 is None:
+            return alerts
+
+        try:
+            r2 = (await self.middleware.call(
+                'failover.call_remote', 'system.mem_info', [], {'raise_connect_error': False}
+            ))['physmem_size']
+            if r2 is None:
+                return alerts
+        except Exception:
+            return alerts
+
+        # UEFI reserves parts of memory at every boot so
+        # this means the exact amount of bytes is not
+        # guaranteed. This also means that each controller
+        # might not have the _exact_ amount of bytes. We're
+        # going to consider > 2% of difference is too much
+        # and alert on it.
+        if abs(r1 - r2) > (0.02 * max(abs(r1), abs(r2))):
+            alerts.append(Alert(
+                MemorySizeMismatchAlert(r1=format_size(r1), r2=format_size(r2))
+            ))
+
+        return alerts

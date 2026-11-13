@@ -1,8 +1,10 @@
+from datetime import timedelta
 import re
-from datetime import datetime, timedelta
 
-from middlewared.schema import accepts, Str
-from middlewared.service import job, private, Service, ServiceChangeMixin
+from middlewared.alert.source.dif_formatted_disks import DifFormattedAlert
+from middlewared.service import Service, ServiceChangeMixin, job, private
+from middlewared.utils.disks import dev_to_ident
+from middlewared.utils.time_utils import utc_now
 
 RE_IDENT = re.compile(r'^\{(?P<type>.+?)\}(?P<value>.+)$')
 
@@ -12,8 +14,7 @@ class DiskService(Service, ServiceChangeMixin):
     DISK_EXPIRECACHE_DAYS = 7
 
     @private
-    @accepts(Str('name'))
-    async def sync(self, name):
+    async def sync(self, name: str):
         """
         Syncs a disk `name` with the database cache.
         """
@@ -36,7 +37,7 @@ class DiskService(Service, ServiceChangeMixin):
             new = True
             qs = await self.middleware.call('datastore.query', 'storage.disk', [('disk_name', '=', name)])
             for i in qs:
-                i['disk_expiretime'] = datetime.utcnow() + timedelta(days=self.DISK_EXPIRECACHE_DAYS)
+                i['disk_expiretime'] = utc_now() + timedelta(days=self.DISK_EXPIRECACHE_DAYS)
                 await self.middleware.call('datastore.update', 'storage.disk', i['disk_identifier'], i)
             disk = {'disk_identifier': ident}
 
@@ -44,19 +45,21 @@ class DiskService(Service, ServiceChangeMixin):
 
         self._map_device_disk_to_db(disk, disks[name])
 
+        if await self.middleware.call('system.sed_enabled') and (new or disk.get('disk_sed') is None):
+            # If system is enterprise, we would like to make sure SED status is correctly reflected
+            disk['disk_sed'] = await self.middleware.call('disk.is_sed', name)
+
         if not new:
             await self.middleware.call('datastore.update', 'storage.disk', disk['disk_identifier'], disk)
         else:
             disk['disk_identifier'] = await self.middleware.call('datastore.insert', 'storage.disk', disk)
 
         if disks[name]['dif']:
-            await self.middleware.call('alert.oneshot_create', 'DifFormatted', [name])
+            await self.call2(self.s.alert.oneshot_create, DifFormattedAlert(name))
         else:
-            await self.middleware.call('alert.oneshot_delete', 'DifFormatted', None)
+            await self.call2(self.s.alert.oneshot_delete, 'DifFormatted', None)
 
         await self.restart_services_after_sync()
-
-        await self.middleware.call('enclosure.sync_disk', disk['disk_identifier'])
 
     @private
     def log_disk_info(self, sys_disks):
@@ -94,50 +97,40 @@ class DiskService(Service, ServiceChangeMixin):
                 return disk
 
     @private
-    def dev_to_ident(self, name, sys_disks, uuids):
-        if name not in sys_disks:
-            return ''
-        else:
-            dev = sys_disks[name]
-
-        if dev['serial_lunid']:
-            return f'{{serial_lunid}}{dev["serial_lunid"]}'
-        elif dev['serial']:
-            return f'{{serial}}{dev["serial"]}'
-        elif dev['parts']:
-            for part in filter(lambda x: x['partition_type'] in uuids, dev['parts']):
-                return f'{{uuid}}{part["partition_uuid"]}'
-
-        return f'{{devicename}}{name}'
+    def dev_to_ident(self, name, sys_disks):
+        return dev_to_ident(name, sys_disks)
 
     @private
-    @accepts()
     @job(lock='disk.sync_all')
-    def sync_all(self, job):
-        """
-        Synchronize all disks with the cache in database.
-        """
+    def sync_all(self, job, opts: dict[str, bool] | None = None):
+        """Synchronize all disks with the cache in database."""
         # Skip sync disks on standby node
         licensed = self.middleware.call_sync('failover.licensed')
-        if licensed and self.middleware.call_sync('failover.status') == 'BACKUP':
-            return
+        if licensed:
+            status = self.middleware.call_sync('failover.status')
+            if status == 'BACKUP':
+                return
+
+        if opts is None:
+            opts = dict()
+        opts.setdefault('zfs_guid', False)
 
         job.set_progress(10, 'Enumerating system disks')
+        sed_enabled_system = self.middleware.call_sync('system.sed_enabled')
         sys_disks = self.middleware.call_sync('device.get_disks', True)
         number_of_disks = self.log_disk_info(sys_disks)
 
         job.set_progress(20, 'Enumerating disk information from database')
         db_disks = self.middleware.call_sync('datastore.query', 'storage.disk', [], {'order_by': ['disk_expiretime']})
 
-        uuids = self.middleware.call_sync('disk.get_valid_zfs_partition_type_uuids')
         options = {'send_events': False, 'ha_sync': False}
         seen_disks = {}
+        added = set()
         changed = set()
         deleted = set()
         dif_formatted_disks = []
-        increment = round((40 - 20) / number_of_disks, 3)  # 20% of the total percentage
+        increment = round((40 - 20) / max(number_of_disks, 1), 3)  # 20% of the total percentage
         progress_percent = 40
-        encs = self.middleware.call_sync('enclosure.query')
         for idx, disk in enumerate(db_disks, start=1):
             progress_percent += increment
             job.set_progress(progress_percent, f'Syncing disk {idx}/{number_of_disks}')
@@ -145,16 +138,16 @@ class DiskService(Service, ServiceChangeMixin):
             original_disk = disk.copy()
 
             name = self.ident_to_dev(disk['disk_identifier'], sys_disks)
-            if not name or self.dev_to_ident(name, sys_disks, uuids) != disk['disk_identifier']:
+            if not name or self.dev_to_ident(name, sys_disks) != disk['disk_identifier']:
                 # 1. can't translate identitifer to device
                 # 2. or can't translate device to identifier
                 if not disk['disk_expiretime']:
-                    disk['disk_expiretime'] = datetime.utcnow() + timedelta(days=self.DISK_EXPIRECACHE_DAYS)
+                    disk['disk_expiretime'] = utc_now() + timedelta(days=self.DISK_EXPIRECACHE_DAYS)
                     self.middleware.call_sync(
                         'datastore.update', 'storage.disk', disk['disk_identifier'], disk, options
                     )
-                    changed.add(disk['disk_identifier'])
-                elif disk['disk_expiretime'] < datetime.utcnow():
+                    deleted.add(disk['disk_identifier'])
+                elif disk['disk_expiretime'] < utc_now():
                     # Disk expire time has surpassed, go ahead and remove it
                     if disk['disk_kmip_uid']:
                         self.middleware.call_sync(
@@ -162,7 +155,6 @@ class DiskService(Service, ServiceChangeMixin):
                             background=True
                         )
                     self.middleware.call_sync('datastore.delete', 'storage.disk', disk['disk_identifier'], options)
-                    deleted.add(disk['disk_identifier'])
                 continue
             else:
                 disk['disk_expiretime'] = None
@@ -173,21 +165,16 @@ class DiskService(Service, ServiceChangeMixin):
                     dif_formatted_disks.append(name)
 
                 self._map_device_disk_to_db(disk, sys_disks[name])
+                if sed_enabled_system and disk['disk_sed'] is None:
+                    disk['disk_sed'] = self.middleware.call_sync('disk.is_sed', name)
 
             if name not in sys_disks and not disk['disk_expiretime']:
                 # If for some reason disk is not identified as a system disk mark it to expire.
-                disk['disk_expiretime'] = datetime.utcnow() + timedelta(days=self.DISK_EXPIRECACHE_DAYS)
+                disk['disk_expiretime'] = utc_now() + timedelta(days=self.DISK_EXPIRECACHE_DAYS)
 
             if self._disk_changed(disk, original_disk):
                 self.middleware.call_sync('datastore.update', 'storage.disk', disk['disk_identifier'], disk, options)
                 changed.add(disk['disk_identifier'])
-
-            try:
-                self.middleware.call_sync('enclosure.sync_disk', disk['disk_identifier'], encs)
-            except Exception:
-                self.logger.error(
-                    'Unhandled exception in enclosure.sync_disk for %r', disk['disk_identifier'], exc_info=True
-                )
 
             seen_disks[name] = disk
 
@@ -195,7 +182,7 @@ class DiskService(Service, ServiceChangeMixin):
         progress_percent = 70
         for name in filter(lambda x: x not in seen_disks, sys_disks):
             progress_percent += increment
-            disk_identifier = self.dev_to_ident(name, sys_disks, uuids)
+            disk_identifier = self.dev_to_ident(name, sys_disks)
             if qs is None:
                 qs = self.middleware.call_sync('datastore.query', 'storage.disk')
 
@@ -211,6 +198,8 @@ class DiskService(Service, ServiceChangeMixin):
             original_disk = disk.copy()
             disk['disk_name'] = name
             self._map_device_disk_to_db(disk, sys_disks[name])
+            if sed_enabled_system and (new or disk.get('disk_sed') is None):
+                disk['disk_sed'] = self.middleware.call_sync('disk.is_sed', name)
 
             if sys_disks[name]['dif']:
                 dif_formatted_disks.append(name)
@@ -223,42 +212,39 @@ class DiskService(Service, ServiceChangeMixin):
                     changed.add(disk['disk_identifier'])
             else:
                 self.middleware.call_sync('datastore.insert', 'storage.disk', disk, options)
-                changed.add(disk['disk_identifier'])
-
-            try:
-                self.middleware.call_sync('enclosure.sync_disk', disk['disk_identifier'], encs)
-            except Exception:
-                self.logger.error(
-                    'Unhandled exception in enclosure.sync_disk for %r', disk['disk_identifier'], exc_info=True
-                )
+                added.add(disk['disk_identifier'])
+                qs.append(disk)
 
         if dif_formatted_disks:
-            self.middleware.call_sync('alert.oneshot_create', 'DifFormatted', dif_formatted_disks)
+            self.call_sync2(self.s.alert.oneshot_create, DifFormattedAlert(', '.join(dif_formatted_disks)))
         else:
-            self.middleware.call_sync('alert.oneshot_delete', 'DifFormatted', None)
+            self.call_sync2(self.s.alert.oneshot_delete, 'DifFormatted', None)
 
-        if changed or deleted:
+        if added or changed or deleted:
             job.set_progress(92, 'Restarting necessary services')
             self.middleware.call_sync('disk.restart_services_after_sync')
 
             # we query the db again since we've made changes to it
             job.set_progress(94, 'Emitting disk events')
-            disks = {i['disk_identifier']: i for i in self.middleware.call_sync('datastore.query', 'storage.disk')}
+            disks = {i['identifier']: i for i in self.middleware.call_sync('disk.query')}
+            for add in added:
+                self.middleware.send_event('disk.query', 'ADDED', id=add, fields=disks[add])
             for change in changed:
                 self.middleware.send_event('disk.query', 'CHANGED', id=change, fields=disks[change])
             for delete in deleted:
-                self.middleware.send_event('disk.query', 'CHANGED', id=delete, cleared=True)
+                self.middleware.send_event('disk.query', 'REMOVED', id=delete)
 
-        if licensed:
+        if opts['zfs_guid']:
+            job.set_progress(95, 'Synchronizing ZFS GUIDs')
+            self.middleware.call_sync('disk.sync_all_zfs_guid')
+
+        if licensed and status == 'MASTER':
             job.set_progress(96, 'Synchronizing database to standby controller')
             # there could be, literally, > 1k database changes in this method on large systems
-            # so we've forgoed queuing up the number of db changes in the HA journal thread
-            # in favor of just sync'ing the database to the remote node after we're done. The
-            # (potential) speed improvement this provides is substantial
-            try:
-                self.middleware.call_sync('failover.send_database')
-            except Exception:
-                self.logger.warning('Failed to sync database to standby controller', exc_info=True)
+            # so we're not sync'ing these db changes synchronously. Instead we're sync'ing the
+            # entire database to the remote node after we're done. The (potential) speed
+            # improvement this provides is substantial
+            self.middleware.call_sync('failover.datastore.force_send')
 
         job.set_progress(100, 'Syncing all disks complete')
         return 'OK'
@@ -274,11 +260,34 @@ class DiskService(Service, ServiceChangeMixin):
             db_disk[f'disk_{key}'] = disk[key]
 
     @private
+    def sync_size_if_changed(self, name: str):
+        try:
+            with open(f'/sys/block/{name}/size') as f:
+                current_size = int(f.read().strip()) * 512
+        except (FileNotFoundError, ValueError, OSError):
+            return
+
+        try:
+            disk = self.middleware.call_sync(
+                'datastore.query', 'storage.disk',
+                [('disk_name', '=', name)], {'get': True}
+            )
+        except IndexError:
+            return
+
+        try:
+            stored_size = int(disk.get('disk_size') or 0)
+        except (ValueError, TypeError):
+            stored_size = 0
+
+        if stored_size != current_size:
+            self.middleware.call_sync(
+                'datastore.update', 'storage.disk',
+                disk['disk_identifier'], {'disk_size': current_size}
+            )
+
+    @private
     async def restart_services_after_sync(self):
-        await self.middleware.call('disk.update_smartctl_args_for_disks')
-        if await self.middleware.call('service.started', 'collectd'):
-            await self.middleware.call('service.restart', 'collectd')
-        await self._service_change('smartd', 'restart')
         await self._service_change('snmp', 'restart')
 
     expired_disks = set()
@@ -296,12 +305,12 @@ class DiskService(Service, ServiceChangeMixin):
         }
 
     @private
-    async def process_datastore_event(self, type, kwargs):
-        if type == "CHANGED" and "fields" in kwargs:
+    async def process_datastore_event(self, type_, kwargs):
+        if type_ == "CHANGED" and "fields" in kwargs:
             if kwargs["fields"]["expiretime"] is not None:
                 if kwargs["fields"]["identifier"] not in self.expired_disks:
                     self.expired_disks.add(kwargs["fields"]["identifier"])
-                    return "CHANGED", {"id": kwargs["id"], "cleared": True}
+                    return "REMOVED", {"id": kwargs["id"]}
 
                 return None
             else:
@@ -309,14 +318,13 @@ class DiskService(Service, ServiceChangeMixin):
                     self.expired_disks.remove(kwargs["fields"]["identifier"])
                     return "ADDED", {"id": kwargs["id"], "fields": kwargs["fields"]}
 
-        return type, kwargs
+        return type_, kwargs
 
 
 async def setup(middleware):
     await middleware.call("disk.init_datastore_events_processor")
 
     await middleware.call("datastore.register_event", {
-        "description": "Sent on disk changes.",
         "datastore": "storage.disk",
         "plugin": "disk",
         "prefix": "disk_",

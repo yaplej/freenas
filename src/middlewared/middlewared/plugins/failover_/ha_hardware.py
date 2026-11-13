@@ -1,5 +1,12 @@
+# Copyright (c) - iXsystems Inc. dba TrueNAS
+#
+# Licensed under the terms of the TrueNAS Enterprise License Agreement
+# See the file LICENSE.IX for complete terms and conditions
+
 import enum
 import re
+
+from middlewared.utils.entitlements import LicenseFeature, get_entitlement
 
 
 class HA_HARDWARE(enum.Enum):
@@ -22,3 +29,15 @@ class HA_HARDWARE(enum.Enum):
     XSERIES_NODEB = re.compile(r'ESCE B_(5[0-9A-F]{15})', re.M)
 
     MSERIES_ENCLOSURE = re.compile(r'\s*(ECStream|iX)\s*4024S([ps])', re.M)
+
+
+def is_licensed_for_ha() -> bool:
+    """Whether this system's license grants high availability.
+
+    The rule itself lives in POLICY so there is one place to change it. This stays a
+    plain function with no middleware dependency, because scripts/ha_panic.py imports
+    it directly and runs as an ExecStop= when middlewared may already be gone, so it
+    calls get_entitlement() rather than going through the truenas.entitlements
+    service: there may be no middleware left to ask.
+    """
+    return get_entitlement(LicenseFeature.HA).entitled

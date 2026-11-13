@@ -1,0 +1,107 @@
+<%
+    # The daemon reads this file whole and one malformed value refuses the
+    # entire load: keys stay lowercase, a heading name stays quoted, an enum
+    # renders as the daemon's lowercase token, and a key the daemon would
+    # refuse empty is omitted rather than printed empty. Every enabled
+    # bucket renders, a missing dataset included: the daemon excludes a row
+    # it cannot mount and answers 503 for it, where an omitted row would
+    # answer NoSuchBucket.
+    from middlewared.api.current import S3AuditMask
+
+    data = render_ctx["s3.render_data"]
+    config = data.config
+
+    def audit_value(mask: S3AuditMask) -> str:
+        # ALL is the daemon's `all`; a list, empty included, is the mask.
+        # The daemon refuses a duplicated name and the plugin stores masks
+        # deduplicated; dict.fromkeys covers a row read from a datastore
+        # that predates that, keeping the stored order
+        return "all" if mask == "ALL" else ",".join(dict.fromkeys(mask))
+%>\
+[server]
+% if data.listen:
+listen = ${data.listen}
+% endif
+## a TLS listener renders whatever pair the deployment has, a missing
+## half included: the daemon refuses the load rather than serve the
+## address in the clear, and that refusal is the answer the caller gets
+% if data.listen_tls:
+listen_tls = ${data.listen_tls}
+% if data.tls_cert:
+tls_cert = ${data.tls_cert}
+% endif
+% if data.tls_key:
+tls_key = ${data.tls_key}
+% endif
+% endif
+servers = ${config.servers}
+% if config.region:
+region = ${config.region}
+% endif
+## the system's own names, screened against the daemon's grammar where
+## they are gathered; empty renders nothing and the daemon stays
+## path-style only
+% if data.base_hosts:
+base_hosts = ${data.base_hosts}
+% endif
+host_id = ${data.host_id}
+owner_id_seed = ${data.owner_id_seed}
+## the release the SOSAPI ModelName names; screened where it is
+## gathered, and empty renders nothing — the daemon then names its own
+## version
+% if data.truenas_version:
+truenas_version = ${data.truenas_version}
+% endif
+log_level = ${config.log_level.lower()}
+% if data.audit_supported:
+% if config.default_audit:
+default_audit = ${audit_value(config.default_audit)}
+% endif
+default_audit_overflow = ${config.default_audit_overflow.lower()}
+% endif
+% for bucket in data.buckets:
+<% b = bucket.entry %>\
+% if b.enabled:
+
+[bucket "${b.name}"]
+dataset = ${b.dataset}
+path = ${bucket.mountpoint}
+## BUCKET is the daemon's default
+% if b.layout == "DATASET":
+layout = whole_dataset
+% endif
+owner = ${b.owner}
+owner_id = ${b.owner_uid}
+permissions_model = ${b.permissions_model.lower()}
+## the row states both halves of the pair: the model is only ever s3 or
+## multiprotocol here, the third value the API takes having been resolved
+## into the two before it was stored, so the file can carry no
+## contradiction for the daemon to refuse
+object_ownership = ${b.object_ownership.lower()}
+versioning = ${b.versioning.lower()}
+## a selection of none is the key omitted, never rendered empty; the cap
+## is inert without a selection, so it rides beside one
+% if b.snapshot_versions:
+snapshot_versions = ${", ".join(b.snapshot_versions)}
+snapshot_versions_max = ${b.snapshot_versions_max}
+% endif
+multipart_etag = ${b.multipart_etag.lower()}
+object_lock = ${"enabled" if b.object_lock else "off"}
+% if b.object_lock_default_mode:
+object_lock_default_mode = ${b.object_lock_default_mode.lower()}
+% endif
+% if b.object_lock_default_days:
+object_lock_default_days = ${b.object_lock_default_days}
+% endif
+% if data.audit_supported:
+## None inherits the server default by omission; an empty list is the
+## empty mask, rendered so it shadows the default
+% if b.audit is not None:
+audit = ${audit_value(b.audit)}
+% endif
+% if b.audit_overflow:
+audit_overflow = ${b.audit_overflow.lower()}
+% endif
+% endif
+% endif
+% endfor

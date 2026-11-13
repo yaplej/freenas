@@ -1,55 +1,149 @@
-# -*- coding=utf-8 -*-
-from concurrent.futures import Executor, Future, ThreadPoolExecutor
-from itertools import count
+import asyncio
+from collections.abc import Callable, Coroutine
+import concurrent.futures
+import functools
+import itertools
 import logging
-import os
 import threading
+from typing import Any
 
-import prctl
+from truenas_pylibzfs import open_handle
 
+from .prctl import set_name
+
+thread_local_storage = threading.local()
 logger = logging.getLogger(__name__)
+__all__ = [
+    "set_thread_name",
+    "start_daemon_thread",
+    "run_coro_threadsafe",
+    "IoThreadPoolExecutor",
+    "io_thread_pool_executor",
+    "thread_local_storage",
+]
 
-__all__ = ["set_thread_name", "start_daemon_thread", "IoThreadPoolExecutor"]
 
-counter = count(1)
+def _discard_future_exception(fut: concurrent.futures.Future[Any], log_exceptions: bool) -> None:
+    """Callback to prevent 'Future exception was never retrieved' warnings."""
+    if not fut.cancelled():
+        exc = fut.exception()
+        if exc is not None and log_exceptions:
+            logger.warning("Exception in fire-and-forget coroutine: %r", exc)
 
 
-def set_thread_name(name):
-    prctl.set_name(name)
+def run_coro_threadsafe[T](coro: Coroutine[Any, Any, T], loop: asyncio.AbstractEventLoop, *,
+                           log_exceptions: bool = False) -> None:
+    """
+    Schedule a coroutine from a non-async context without leaking futures.
+
+    Unlike asyncio.run_coroutine_threadsafe(), this does not require the
+    caller to await or retrieve the result. The future is automatically
+    cleaned up when the coroutine completes.
+
+    Use this for fire-and-forget coroutine scheduling from threads.
+
+    Args:
+        coro: The coroutine to schedule.
+        loop: The event loop to schedule the coroutine on.
+        log_exceptions: If True, log exceptions as warnings.
+    """
+    fut = asyncio.run_coroutine_threadsafe(coro, loop)
+    fut.add_done_callback(
+        functools.partial(
+            _discard_future_exception,
+            log_exceptions=log_exceptions
+        )
+    )
 
 
-def start_daemon_thread(*args, **kwargs):
+def set_thread_name(name: str) -> None:
+    """
+    Set the calling thread's comm name visible in `ps -e`, `top`, and `htop`.
+
+    This updates /proc/self/comm (or /proc/self/task/[tid]/comm for non-main threads).
+    The name is limited to 15 characters. For the main thread, this is also the
+    process name shown in process listings.
+
+    Note: This only sets the comm name, not cmdline. Threads share the process
+    cmdline and cannot have individual command lines.
+    """
+    set_name(name)
+
+
+def initializer(thread_name: str, tls: threading.local) -> None:
+    set_name(thread_name)
+    if open_handle is not None:
+        tls.lzh = open_handle(
+            history_prefix="tn-mw: ",
+            # TODO: investigate mnttab_cache
+            # wrt to zfs native encryption
+            mnttab_cache=True
+        )
+
+
+def start_daemon_thread(*, name: str, **kwargs: Any) -> threading.Thread:
+    """
+    Start a daemon thread with the given arguments.
+
+    The `name` parameter is required to facilitate troubleshooting and to easily
+    identify which thread of the parent process was created by what.
+
+    Args:
+        *args: Positional arguments passed to `threading.Thread`.
+        name: The name of the thread (required).
+        **kwargs: Keyword arguments passed to `threading.Thread`.
+
+    Returns:
+        The started `threading.Thread` instance.
+    """
     kwargs.setdefault("daemon", True)
     if not kwargs["daemon"]:
         raise ValueError("`start_daemon_thread` called with `daemon=False`")
 
-    t = threading.Thread(*args, **kwargs)
+    t = threading.Thread(name=name, **kwargs)
     t.start()
     return t
 
 
-class IoThreadPoolExecutor(Executor):
-    def __init__(self):
-        self.thread_count = (20 if ((os.cpu_count() or 1) + 4) < 32 else 32) + 1
-        self.executor = ThreadPoolExecutor(
-            self.thread_count,
-            "IoThread",
-            initializer=lambda: set_thread_name("IoThread"),
-        )
+class IoThreadPoolExecutor(concurrent.futures.Executor):
+    _cnt: Callable[[], int] = itertools.count(1).__next__
 
-    def submit(self, fn, *args, **kwargs):
-        if len(self.executor._threads) == self.thread_count and self.executor._idle_semaphore._value - 1 <= 1:
-            fut = Future()
-            logger.trace("Calling %r in a single-use thread", fn)
-            start_daemon_thread(name=f"ExtraIoThread_{next(counter)}", target=worker, args=(fut, fn, args, kwargs))
-            return fut
+    def __init__(self) -> None:
+        self.executor = concurrent.futures.ThreadPoolExecutor(
+            thread_name_prefix="IoThread",
+            initializer=initializer,
+            initargs=("IoThread", thread_local_storage),
+        )
+        # py3.13+ fixed calculation of default workers
+        # so we just use whatever they use. NOTE: not
+        # best practice to depend on attribute of a class
+        # beginning with underscore since that's paradigm
+        # for being "private" and can change at any given
+        # time.
+        self.thread_count: int = self.executor._max_workers
+
+    def submit[**P, T](self, fn: Callable[P, T], /, *args: P.args, **kwargs: P.kwargs) -> concurrent.futures.Future[T]:
+        if len(self.executor._threads) == self.thread_count:
+            if self.executor._idle_semaphore._value - 1 <= 1:
+                fut: concurrent.futures.Future[T] = concurrent.futures.Future()
+                logger.trace("Calling %r in a single-use thread", fn)  # type: ignore[attr-defined]
+                start_daemon_thread(
+                    name=f"ExtraIoThread_{self._cnt()}",
+                    target=worker,
+                    args=(fut, fn, thread_local_storage, args, kwargs),
+                )
+                return fut
 
         return self.executor.submit(fn, *args, **kwargs)
 
 
-def worker(fut, fn, args, kwargs):
-    set_thread_name("ExtraIoThread")
+def worker[T](fut: concurrent.futures.Future[T], fn: Callable[..., T], tls: threading.local, args: tuple[Any, ...],
+              kwargs: dict[str, Any]) -> None:
+    initializer("ExtraIoThread", tls)
     try:
         fut.set_result(fn(*args, **kwargs))
     except Exception as e:
         fut.set_exception(e)
+
+
+io_thread_pool_executor: IoThreadPoolExecutor = IoThreadPoolExecutor()

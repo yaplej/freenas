@@ -1,44 +1,76 @@
-from middlewared.service import private, Service
-from .netif import netif
+from __future__ import annotations
+
+import socket
+
+from truenas_pynetif.configure import (
+    VlanConfig,
+)
+from truenas_pynetif.configure import (
+    configure_vlan as pynetif_configure_vlan,
+)
+from truenas_pynetif.netlink import LinkInfo, ParentInterfaceNotFound
+
+from middlewared.service import ServiceContext
+
+from .sync_data import SyncData
+
+__all__ = ("configure_vlans_impl",)
 
 
-class InterfaceService(Service):
+def configure_vlans_impl(
+    ctx: ServiceContext,
+    sock: socket.socket,
+    links: dict[str, LinkInfo],
+    sync_data: SyncData,
+) -> list[str]:
+    """Configure all VLAN interfaces from database.
 
-    class Config:
-        namespace_alias = 'interfaces'
+    Args:
+        ctx: Service context
+        sock: Netlink socket from netlink_route()
+        links: Dict of LinkInfo objects from get_links()
+        sync_data: Combined database data
 
-    @private
-    def vlan_setup(self, vlan, parent_interfaces):
-        self.logger.info('Setting up %r', vlan['vlan_vint'])
+    Returns:
+        List of configured VLAN interface names
+    """
+    configured = []
+    for vlan in sync_data.vlans:
         try:
-            iface = netif.get_interface(vlan['vlan_vint'])
-        except KeyError:
-            try:
-                netif.create_vlan(vlan['vlan_vint'], vlan['vlan_pint'], vlan['vlan_tag'])
-            except FileNotFoundError:
-                self.logger.warning(
-                    'VLAN %r parent interface %r not found, skipping.', vlan['vlan_vint'], vlan['vlan_pint']
-                )
-                return
-            iface = netif.get_interface(vlan['vlan_vint'])
+            configure_vlan_impl(ctx, sock, links, vlan)
+            configured.append(vlan["vlan_vint"])
+        except ParentInterfaceNotFound:
+            ctx.logger.error(
+                "VLAN %r parent interface %r not found, skipping.",
+                vlan["vlan_vint"],
+                vlan["vlan_pint"],
+            )
+        except Exception:
+            ctx.logger.error(
+                "Error configuring VLAN %s", vlan["vlan_vint"], exc_info=True
+            )
+    return configured
 
-        if iface.parent != vlan['vlan_pint'] or iface.tag != vlan['vlan_tag'] or iface.pcp != vlan['vlan_pcp']:
-            iface.unconfigure()
-            try:
-                iface.configure(vlan['vlan_pint'], vlan['vlan_tag'], vlan['vlan_pcp'])
-            except FileNotFoundError:
-                self.logger.warning(
-                    'VLAN %r parent interface %r not found, skipping.', vlan['vlan_vint'], vlan['vlan_pint']
-                )
-                return
 
-        try:
-            parent_iface = netif.get_interface(iface.parent)
-        except KeyError:
-            self.logger.warning('Could not find %r from %r', iface.parent, vlan['vlan_vint'])
-            return
+def configure_vlan_impl(
+    ctx: ServiceContext,
+    sock: socket.socket,
+    links: dict[str, LinkInfo],
+    vlan: dict,
+) -> None:
+    """Configure a single VLAN interface.
 
-        parent_interfaces.append(iface.parent)
-        parent_iface.up()
-
-        iface.up()
+    Args:
+        ctx: Service context
+        sock: Netlink socket from netlink_route()
+        links: Dict of LinkInfo objects from get_links()
+        vlan: Database record for the VLAN interface
+    """
+    ctx.logger.info("Configuring VLAN %s", vlan["vlan_vint"])
+    config = VlanConfig(
+        name=vlan["vlan_vint"],
+        parent=vlan["vlan_pint"],
+        tag=vlan["vlan_tag"],
+    )
+    ctx.logger.debug("Configuring %s with config: %r", vlan["vlan_vint"], config)
+    pynetif_configure_vlan(sock, config, links)

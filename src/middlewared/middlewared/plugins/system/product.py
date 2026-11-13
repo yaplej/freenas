@@ -1,224 +1,160 @@
-import os
+# Copyright (c) - iXsystems Inc. dba TrueNAS
+#
+# Licensed under the terms of the TrueNAS Enterprise License Agreement
+# See the file LICENSE.IX for complete terms and conditions
 
-from datetime import date
-from licenselib.license import ContractType, Features, License
-from pathlib import Path
+from types import MappingProxyType
 
-from middlewared.schema import accepts, Bool, returns, Str
-from middlewared.service import CallError, no_auth_required, private, Service
-from middlewared.utils import sw_version, sw_version_is_stable
-from middlewared.utils.license import LICENSE_ADDHW_MAPPING
+from truenas_pylicensed.features import LicenseFeature
 
+from middlewared.api import api_method
+from middlewared.api.current import (
+    SystemFeatureEnabledArgs,
+    SystemFeatureEnabledResult,
+    SystemLicenseUpdateArgs,
+    SystemLicenseUpdateResult,
+    SystemProductTypeArgs,
+    SystemProductTypeResult,
+    SystemReleaseNotesUrlArgs,
+    SystemReleaseNotesUrlResult,
+    SystemVersionArgs,
+    SystemVersionResult,
+    SystemVersionShortArgs,
+    SystemVersionShortResult,
+)
+from middlewared.service import CallError, Service, ValidationError, private
+from middlewared.utils import ProductType, sw_info
+from middlewared.utils.hardware import get_hardware_class, get_hardware_info
+from middlewared.utils.license import LEGACY_LICENSE_FILE, LICENSE_ADDHW_MAPPING, LICENSE_FILE
+from middlewared.utils.version import parse_version_string
 
-LICENSE_FILE = '/data/license'
+PRODUCT_NAME = "TrueNAS"
+LICENSE_ADDHW_REVERSE_MAPPING = MappingProxyType({v: k for k, v in LICENSE_ADDHW_MAPPING.items()})
 
 
 class SystemService(Service):
 
-    PRODUCT_TYPE = None
+    @api_method(
+        SystemProductTypeArgs,
+        SystemProductTypeResult,
+        roles=["SYSTEM_PRODUCT_READ"],
+        removed_in="v28",
+    )
+    def product_type(self):
+        """Returns the type of the product."""
+        if get_hardware_class().is_appliance:
+            return ProductType.ENTERPRISE
 
-    @no_auth_required
-    @accepts()
-    @returns(Bool('system_is_truenas_core'))
-    async def is_freenas(self):
-        """
-        FreeNAS is now TrueNAS CORE.
-
-        DEPRECATED: Use `system.product_type`
-        """
-        return (await self.product_type()) == 'CORE'
-
-    @no_auth_required
-    @accepts()
-    @returns(Str('product_type'))
-    async def product_type(self):
-        """
-        Returns the type of the product.
-
-        SCALE - TrueNAS SCALE, community version
-        SCALE_ENTERPRISE - TrueNAS SCALE Enterprise, appliance version
-        """
-        if SystemService.PRODUCT_TYPE is None:
-            if await self.middleware.call('failover.hardware') != 'MANUAL':
-                # HA capable hardware
-                SystemService.PRODUCT_TYPE = 'SCALE_ENTERPRISE'
-            else:
-                if license := await self.middleware.call('system.license'):
-                    if license['model'].lower().startswith('freenas'):
-                        # legacy freenas certified
-                        SystemService.PRODUCT_TYPE = 'SCALE'
-                    else:
-                        # the license has been issued for a "certified" line
-                        # of hardware which is considered enterprise
-                        SystemService.PRODUCT_TYPE = 'SCALE_ENTERPRISE'
-                else:
-                    # no license
-                    SystemService.PRODUCT_TYPE = 'SCALE'
-
-        return SystemService.PRODUCT_TYPE
+        return ProductType.COMMUNITY_EDITION
 
     @private
-    async def is_enterprise(self):
-        return await self.middleware.call('system.product_type') == 'SCALE_ENTERPRISE'
+    def is_ha_capable(self):
+        return get_hardware_info().is_ha_capable
 
-    @no_auth_required
-    @accepts()
-    @returns(Str('product_name'))
-    async def product_name(self):
-        """
-        Returns name of the product we are using.
-        """
-        return "TrueNAS"
+    @private
+    def sed_enabled(self):
+        return self.call_sync2(self.s.truenas.entitlements.check, LicenseFeature.SED).entitled
 
-    @accepts()
-    @returns(Str('truenas_version'))
+    @api_method(
+        SystemVersionShortArgs,
+        SystemVersionShortResult,
+        authorization_required=False,
+    )
+    def version_short(self):
+        """Returns the short name of the software version of the system."""
+        return sw_info().version
+
+    @api_method(
+        SystemReleaseNotesUrlArgs,
+        SystemReleaseNotesUrlResult,
+        roles=["SYSTEM_PRODUCT_READ"],
+    )
+    def release_notes_url(self, version_str):
+        """Returns the release notes URL for a version of SCALE.
+
+        If a version is not provided, the URL for the currently installed version is returned.
+        """
+        parsed_version = parse_version_string(version_str or self.version_short())
+        if parsed_version is None:
+            raise CallError(f"Invalid version string specified: {version_str}")
+
+        major = parsed_version.split(".")[0]
+        return f"https://www.truenas.com/docs/scale/{major}/gettingstarted/versionnotes"
+
+    @api_method(
+        SystemVersionArgs,
+        SystemVersionResult,
+        authorization_required=False,
+    )
     def version(self):
-        """
-        Returns software version of the system.
-        """
-        return sw_version()
-
-    @accepts()
-    @returns(Str('is_stable'))
-    def is_stable(self):
-        """
-        Returns whether software version of the system is stable.
-        """
-        return sw_version_is_stable()
-
-    @no_auth_required
-    @accepts()
-    @returns(Str('product_running_environment', enum=['DEFAULT', 'EC2']))
-    async def environment(self):
-        """
-        Return environment in which product is running. Possible values:
-        - DEFAULT
-        - EC2
-        """
-        if os.path.exists('/.ec2'):
-            return 'EC2'
-
-        return 'DEFAULT'
+        """Returns the full name of the software version of the system."""
+        return sw_info().fullname
 
     @private
     async def platform(self):
-        return 'LINUX'
+        return "LINUX"
 
     @private
-    async def license(self):
-        return await self.middleware.run_in_thread(self._get_license)
+    def license(self, include_raw_license: bool = False):
+        info = self.call_sync2(self.s.truenas.license.info_private)
+        if info is None:
+            return None
 
-    @staticmethod
-    def _get_license():
-        if not os.path.exists(LICENSE_FILE):
-            return
-
-        with open(LICENSE_FILE, 'r') as f:
-            license_file = f.read().strip('\n')
-
-        try:
-            licenseobj = License.load(license_file)
-        except Exception:
-            return
-
-        license = {
-            "model": licenseobj.model,
-            "system_serial": licenseobj.system_serial,
-            "system_serial_ha": licenseobj.system_serial_ha,
-            "contract_type": ContractType(licenseobj.contract_type).name.upper(),
-            "contract_start": licenseobj.contract_start,
-            "contract_end": licenseobj.contract_end,
-            "legacy_contract_hardware": (
-                licenseobj.contract_hardware.name.upper()
-                if licenseobj.contract_type == ContractType.legacy
-                else None
-            ),
-            "legacy_contract_software": (
-                licenseobj.contract_software.name.upper()
-                if licenseobj.contract_type == ContractType.legacy
-                else None
-            ),
-            "customer_name": licenseobj.customer_name,
-            "expired": licenseobj.expired,
-            "features": [],
-            "addhw": licenseobj.addhw,
-            "addhw_detail": [
-                f"{quantity} × " + (f"{LICENSE_ADDHW_MAPPING[code]} Expansion shelf" if code in LICENSE_ADDHW_MAPPING
-                                    else f"<Unknown hardware {code}>")
-                for quantity, code in licenseobj.addhw
-            ],
+        support = info.feature("SUPPORT")
+        result = {
+            'model': info.model,
+            'system_serial': info.serials[0] if info.serials else None,
+            'system_serial_ha': info.serials[1] if len(info.serials) > 1 else None,
+            'contract_type': info.contract_type,
+            'contract_start': support.start_date if support is not None else None,
+            # Kept for mixed-version HA upgrades: an un-upgraded peer's UI still reads this
+            # key from the merged remote payload.
+            'contract_end': info.support_expires_at,
+            'legacy_contract_hardware': None,
+            'legacy_contract_software': None,
+            'customer_name': None,
+            'features': list(info.features),
+            'addhw': [],
+            'addhw_detail': [],
         }
-        for feature in licenseobj.features:
-            license["features"].append(feature.name.upper())
-        # Licenses issued before 2017-04-14 had a bug in the feature bit
-        # for fibre channel, which means they were issued having
-        # dedup+jails instead.
-        if (
-            Features.fibrechannel not in licenseobj.features and licenseobj.contract_start < date(2017, 4, 14) and
-            Features.dedup in licenseobj.features and Features.jails in licenseobj.features
-        ):
-            license["features"].append(Features.fibrechannel.name.upper())
-        return license
 
-    @private
-    def license_path(self):
-        return LICENSE_FILE
+        for name, quantity in info.enclosures.items():
+            result['addhw'].append([quantity, LICENSE_ADDHW_REVERSE_MAPPING.get(name, 0)])
+            result['addhw_detail'].append(f'{quantity} x {name} Expansion shelf')
 
-    @accepts(Str('license'))
-    @returns()
-    def license_update(self, license):
-        """
-        Update license file.
-        """
-        try:
-            License.load(license)
-        except Exception:
-            raise CallError('This is not a valid license.')
+        if include_raw_license:
+            for f in [LICENSE_FILE, LEGACY_LICENSE_FILE]:
+                try:
+                    with open(f) as f:
+                        result['raw_license'] = f.read().strip()
+                        break
+                except FileNotFoundError:
+                    pass
+            else:
+                result['raw_license'] = None
 
-        prev_product_type = self.middleware.call_sync('system.product_type')
+        return result
 
-        with open(LICENSE_FILE, 'w+') as f:
-            f.write(license)
-
-        self.middleware.call_sync('etc.generate', 'rc')
-
-        SystemService.PRODUCT_TYPE = None
-        if self.middleware.call_sync('system.is_enterprise'):
-            Path('/data/truenas-eula-pending').touch(exist_ok=True)
-        self.middleware.run_coroutine(
-            self.middleware.call_hook('system.post_license_update', prev_product_type=prev_product_type), wait=False,
+    @api_method(
+        SystemLicenseUpdateArgs,
+        SystemLicenseUpdateResult,
+        roles=["SYSTEM_PRODUCT_WRITE"],
+    )
+    def license_update(self, license_):
+        """Update license file."""
+        raise ValidationError(
+            "system.license_update",
+            "Legacy license upload is no longer supported. Use truenas.license.upload instead.",
         )
 
-    @accepts(Str('feature', enum=['DEDUP', 'FIBRECHANNEL', 'VM']))
-    @returns(Bool('feature_enabled'))
+    @api_method(
+        SystemFeatureEnabledArgs,
+        SystemFeatureEnabledResult,
+        roles=["SYSTEM_PRODUCT_READ"],
+        removed_in="v27",
+    )
     async def feature_enabled(self, name):
         """
-        Returns whether the `feature` is enabled or not
+        Returns whether the ``feature`` is enabled.
         """
-        is_core = (await self.middleware.call('system.product_type')) == 'CORE'
-        if name == 'FIBRECHANNEL' and is_core:
-            return False
-        elif is_core:
-            return True
-        license = await self.middleware.call('system.license')
-        if license and name in license['features']:
-            return True
-        return False
-
-    @private
-    async def is_ix_hardware(self):
-        product = (await self.middleware.call('system.dmidecode_info'))['system-product-name']
-        return product is not None and product.startswith(('FREENAS-', 'TRUENAS-'))
-
-    @private
-    async def is_enterprise_ix_hardware(self):
-        return await self.middleware.call('truenas.get_chassis_hardware') != 'TRUENAS-UNKNOWN'
-
-
-async def hook_license_update(middleware, prev_product_type, *args, **kwargs):
-    if prev_product_type != 'ENTERPRISE' and await middleware.call('system.product_type') == 'ENTERPRISE':
-        await middleware.call('system.advanced.update', {'autotune': True})
-
-
-async def setup(middleware):
-    middleware.register_hook('system.post_license_update', hook_license_update)
+        return (await self.call2(self.s.truenas.entitlements.check, name)).entitled

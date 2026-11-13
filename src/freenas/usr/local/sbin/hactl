@@ -1,14 +1,17 @@
 #!/usr/bin/python3
 import argparse
-import os
 import sys
 import enum
 import errno
 
-from middlewared.client import Client, ClientException
+from truenas_api_client import Client, ClientException
+from middlewared.plugins.failover_.enums import DisabledReasonsEnum
+from middlewared.utils.dmi import cached_dmi
 
 BASE_NODE = 'Node status: '
 BASE_FAILOVER = 'Failover status: '
+HEALTHY = 'Failover is healthy.'
+UNKNOWN = 'UNKNOWN'
 
 
 class StatusEnum(enum.Enum):
@@ -21,24 +24,9 @@ class StatusEnum(enum.Enum):
     UNKNOWN = BASE_NODE + 'Unknown'
 
 
-class DisabledEnum(enum.Enum):
-    NO_CRITICAL_INTERFACES = 'No network interfaces are marked critical for failover.'
-    MISMATCH_DISKS = 'The quantity of disks do not match between the nodes.'
-    DISAGREE_VIP = 'Nodes Virtual IP states do not agree.'
-    NO_LICENSE = 'Other node has no license.'
-    NO_FAILOVER = 'Administratively Disabled.'
-    NO_PONG = 'Unable to contact remote node via the heartbeat interface.'
-    NO_VOLUME = 'No zpools have been configured.'
-    NO_VIP = 'No interfaces have been configured with a Virtual IP.'
-    NO_SYSTEM_READY = 'Other node has not finished booting.'
-    NO_FENCED = 'Fenced is not running.'
-    HEALTHY = 'Failover is healthy.'
-    UNKNOWN = 'UNKNOWN'
-
-
 def get_client():
     try:
-        return Client()
+        return Client(private_methods=True)
     except Exception as e:
         print_msg_and_exit(f'Unexpected failure enumerating websocket client: {e}')
 
@@ -64,36 +52,46 @@ def handle_status_command(client, status):
     failover_status = getattr(StatusEnum, status, StatusEnum.UNKNOWN).value
     print(failover_status)
 
-    # print local and remote serial info
-    local_serial = client.call('system.dmidecode_info')['system-serial-number']
+    print(f'This node serial: {cached_dmi().system.serial_number}')
     timeout = 2
+    connect_timeout = 2.0
+    options = {'timeout': timeout, 'connect_timeout': connect_timeout}
     try:
-        remote_serial = client.call('failover.call_remote', 'system.dmidecode_info', [], {'timeout': timeout})
-        remote_serial = remote_serial['system-serial-number']
+        remote_serial = client.call('failover.call_remote', 'system.info', [], options)
+        remote_serial = remote_serial['system_serial']
     except Exception as e:
         remote_serial = 'UNKNOWN'
         if isinstance(e, ClientException):
             if e.errno in (errno.ECONNREFUSED, errno.EHOSTUNREACH):
-                remote_serial = 'Failed to connect to remote node after 20 seconds.'
+                remote_serial = f'Failed to connect to remote node after {connect_timeout} seconds.'
             elif e.errno == errno.EFAULT and 'Call timeout' in str(e):
                 remote_serial = f'Timed out after {timeout} seconds waiting on response from remote node.'
 
         if remote_serial == 'UNKNOWN':
             remote_serial = f'{e}'
 
-    print(f'This node serial: {local_serial}')
     print(f'Other node serial: {remote_serial}')
 
     # print failover disabled reason(s) (if any)
     reasons = client.call('failover.disabled.reasons')
     if not reasons:
-        print(BASE_FAILOVER + DisabledEnum.HEALTHY.value)
+        print(BASE_FAILOVER + HEALTHY)
     elif len(reasons) == 1:
-        print(BASE_FAILOVER + getattr(DisabledEnum, reasons[0], DisabledEnum.UNKNOWN).value)
+        try:
+            reason = DisabledReasonsEnum[reasons[0]].value
+        except KeyError:
+            reason = UNKNOWN
+
+        print(BASE_FAILOVER + reason)
     else:
         print(BASE_FAILOVER)
         for idx, reason in enumerate(reasons, start=1):
-            print(f'    {idx}: {getattr(DisabledEnum, reason, DisabledEnum.UNKNOWN).value}')
+            try:
+                reason = DisabledReasonsEnum[reason].value
+            except KeyError:
+                reason = UNKNOWN
+
+            print(f'    {idx}: {reason}')
 
     # end this section with a newline
     print()
@@ -116,41 +114,6 @@ def handle_enable_or_disable_command(command, client, status, config):
             print_msg_and_exit(f'Failover {command}d.', exit_code=0)
 
 
-def handle_takeover_or_giveback_command(command, client, status, config):
-    if config['disabled']:
-        print_msg_and_exit('Failover must be enabled before running this command.')
-    elif command == 'takeover' and status != 'BACKUP':
-        print_msg_and_exit('This command can only be run on the standby node.')
-    elif command == 'giveback' and status != 'MASTER':
-        print_msg_and_exit('This command can only be run on the active node.')
-    elif client.call('failover.disabled.reasons'):
-        print_msg_and_exit('This command can only be run when HA is healthy.')
-    else:
-        if command == 'takeover':
-            reboot_ourself = False
-            print('This will likely cause the active node to reboot.')
-        else:
-            reboot_ourself = True
-            print('This node will reboot.')
-
-        while True:
-            ans = input(f'Proceed with {command}? (y/n): ')
-            ans = ans.lower()
-            if ans in ('y', 'yes'):
-                break
-            elif ans in ('n', 'no'):
-                print_msg_and_exit(f'Command: {command!r} cancelled.')
-            else:
-                print('Invalid input')
-                continue
-
-        if reboot_ourself:
-            client.call('failover.become_passive')
-            os.system('shutdown -r now')
-        else:
-            client.call('failover.call_remote', 'failover.become_passive')
-
-
 def main(command, quiet):
     client = get_client()
     is_ha, failover_config = get_failover_info(client)
@@ -163,8 +126,6 @@ def main(command, quiet):
         handle_status_command(client, failover_status)
     elif command in ('enable', 'disable'):
         handle_enable_or_disable_command(command, client, failover_status, failover_config)
-    elif command in ('takeover', 'giveback'):
-        handle_takeover_or_giveback_command(command, client, failover_status, failover_config)
 
 
 if __name__ == '__main__':
@@ -173,8 +134,8 @@ if __name__ == '__main__':
         'command',
         default='status',
         nargs='?',
-        help=('subcommand: enable disable status takeover giveback'),
-        choices=['enable', 'disable', 'status', 'takeover', 'giveback'],
+        help=('subcommand: enable disable status'),
+        choices=['enable', 'disable', 'status']
     )
     parser.add_argument('-q', help='Be silent if this is a non HA node', action='store_true')
     args = parser.parse_args()

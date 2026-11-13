@@ -7,44 +7,34 @@ enable tmp.mount
 
 # Enabled services
 enable zfs-zed.service
-enable collectd.service
 enable nginx.service
-enable ntp.service
-enable rrdcached.service
-enable smartmontools.service
+enable chronyd.service
 enable syslog-ng.service
+enable truenas-discoveryd.service
 
 # Disabled services
+disable certmonger.service
 disable smbd.service
 disable proftpd.service
-disable avahi-daemon.service
-disable nmbd.service
 disable nfs*
 disable rsync.service
-disable nscd.service
-disable minio.service
+disable netdata.service
 disable snmpd.service
 disable snmp-agent.service
 disable ssh*
 disable wg-quick*
 disable nut-*
-disable apache2.service
-disable wsdd.service
+disable nut.target
 disable libvirtd.service
+disable virtlogd.service
 disable winbind.service
-disable glusterd*
-disable docker*
-disable kubelet*
-disable openvpn*
 disable nvidia-*
 disable libvirt*
-disable k3s*
-disable cni*
-disable kube-router*
-disable containerd*
 disable walinuxagent*
 disable serial-getty@*
-disable haproxy*
+disable docker*
+disable containerd.service
+disable smartmontools.service
 
 # We want middlewared to import pools
 disable zfs-mount.service
@@ -54,3 +44,9 @@ disable zfs-import-scan.service
 
 # It unconfigures interfaces we've just configured even if it is instructed to do not touch anything
 disable systemd-networkd.service
+
+# Prevent `apt.systemd.daily[3756924]: /usr/lib/apt/apt.systemd.daily: 325: apt-config: Permission denied`
+disable apt-daily-upgrade.service
+disable apt-daily-upgrade.timer
+disable apt-daily.service
+disable apt-daily.timer

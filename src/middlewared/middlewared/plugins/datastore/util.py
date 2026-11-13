@@ -1,5 +1,4 @@
-from middlewared.schema import accepts
-from middlewared.service import CallError, private, Service
+from middlewared.service import CallError, Service
 from middlewared.sqlalchemy import Model
 
 from .schema import SchemaMixin
@@ -10,8 +9,7 @@ class DatastoreService(Service, SchemaMixin):
     class Config:
         private = True
 
-    @private
-    def get_backrefs(self, name):
+    async def get_backrefs(self, name):
         """
         Returns list of (datastore_name, column_name) for all tables that reference this table
         without being ON DELETE CASCADE / ON DELETE SET NULL.
@@ -32,7 +30,6 @@ class DatastoreService(Service, SchemaMixin):
 
         return result
 
-    @private
     async def sql(self, query, *args):
         try:
             if query.strip().split()[0].upper() == 'SELECT':
@@ -41,32 +38,3 @@ class DatastoreService(Service, SchemaMixin):
                 await self.middleware.call('datastore.execute', query, *args)
         except Exception as e:
             raise CallError(e)
-
-    @accepts()
-    async def dump_json(self):
-        models = []
-        for table, in await self.middleware.call(
-                "datastore.fetchall",
-                "SELECT name FROM sqlite_master WHERE type = 'table'"
-        ):
-            try:
-                entries = await self.middleware.call("datastore.sql", f"SELECT * FROM {table}")
-            except CallError as e:
-                self.logger.debug("%r", e)
-                continue
-
-            models.append({
-                "table_name": table,
-                "verbose_name": table,
-                "fields": [
-                    {
-                        "name": row[1],
-                        "verbose_name": row[1],
-                        "database_type": row[2],
-                    }
-                    for row in await self.middleware.call("datastore.fetchall", "PRAGMA table_info('%s');" % table)
-                ],
-                "entries": entries,
-            })
-
-        return models

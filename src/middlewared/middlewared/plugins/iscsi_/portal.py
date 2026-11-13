@@ -1,11 +1,28 @@
-import errno
-
+from middlewared.api import api_method
+from middlewared.api.current import (
+    ISCSIPortalCreateArgs,
+    ISCSIPortalCreateResult,
+    ISCSIPortalDeleteArgs,
+    ISCSIPortalDeleteResult,
+    ISCSIPortalEntry,
+    ISCSIPortalListenIpChoicesArgs,
+    ISCSIPortalListenIpChoicesResult,
+    ISCSIPortalUpdateArgs,
+    ISCSIPortalUpdateResult,
+)
+from middlewared.service import CRUDService, ValidationErrors, private
 import middlewared.sqlalchemy as sa
 
-from middlewared.schema import accepts, Dict, Int, IPAddr, List, Patch, Str
-from middlewared.service import CRUDService, private, ValidationErrors
 
-from .utils import AUTHMETHOD_LEGACY_MAP
+def portal_summary(data):
+    """Select a human-readable string representing this portal"""
+    if title := data.get('comment'):
+        return title
+    ips = []
+    for pair in data.get('listen', []):
+        if ip := pair.get('ip'):
+            ips.append(ip)
+    return ','.join(ips)
 
 
 class ISCSIPortalModel(sa.Model):
@@ -14,8 +31,6 @@ class ISCSIPortalModel(sa.Model):
     id = sa.Column(sa.Integer(), primary_key=True)
     iscsi_target_portal_tag = sa.Column(sa.Integer(), default=1)
     iscsi_target_portal_comment = sa.Column(sa.String(120))
-    iscsi_target_portal_discoveryauthmethod = sa.Column(sa.String(120), default='None')
-    iscsi_target_portal_discoveryauthgroup = sa.Column(sa.Integer(), nullable=True)
 
 
 class ISCSIPortalIPModel(sa.Model):
@@ -38,6 +53,8 @@ class ISCSIPortalService(CRUDService):
         datastore_prefix = 'iscsi_target_portal_'
         namespace = 'iscsi.portal'
         cli_namespace = 'sharing.iscsi.portal'
+        role_prefix = 'SHARING_ISCSI_PORTAL'
+        entry = ISCSIPortalEntry
 
     @private
     async def config_extend_context(self, rows, extra):
@@ -58,16 +75,12 @@ class ISCSIPortalService(CRUDService):
                 'ip': portalip['ip'],
                 'port': context['global_config']['listen_port'],
             })
-        data['discovery_authmethod'] = AUTHMETHOD_LEGACY_MAP.get(
-            data.pop('discoveryauthmethod')
-        )
-        data['discovery_authgroup'] = data.pop('discoveryauthgroup')
         return data
 
-    @accepts()
+    @api_method(ISCSIPortalListenIpChoicesArgs, ISCSIPortalListenIpChoicesResult)
     async def listen_ip_choices(self):
         """
-        Returns possible choices for `listen.ip` attribute of portal create and update.
+        Returns possible choices for ``listen.ip`` attribute of portal create and update.
         """
         choices = {'0.0.0.0': '0.0.0.0', '::': '::'}
         if (await self.middleware.call('iscsi.global.config'))['alua']:
@@ -80,13 +93,18 @@ class ISCSIPortalService(CRUDService):
 
             filters = [('alias_vip', 'nin', [None, ''])]
             for i in await self.middleware.call('datastore.query', 'network.Alias', filters):
-                choices[i['alias_vip']] = f'{i["alias_address"]}/{i["alias_netmask"]}'
+                choices[i['alias_vip']] = f'{i["alias_address"]}/{i["alias_address_b"]}'
         else:
-            for i in await self.middleware.call('interface.query'):
-                for alias in i.get('failover_virtual_aliases') or []:
-                    choices[alias['address']] = alias['address']
-                for alias in i['aliases']:
-                    choices[alias['address']] = alias['address']
+            if await self.middleware.call('failover.licensed'):
+                # If ALUA is disabled, HA system should only offer Virtual IPs
+                for i in await self.middleware.call('interface.query'):
+                    for alias in i.get('failover_virtual_aliases') or []:
+                        choices[alias['address']] = alias['address']
+            else:
+                # Non-HA system should offer all addresses
+                for i in await self.middleware.call('interface.query'):
+                    for alias in i['aliases']:
+                        choices[alias['address']] = alias['address']
         return choices
 
     async def __validate(self, verrors, data, schema, old=None):
@@ -110,43 +128,19 @@ class ISCSIPortalService(CRUDService):
                 ):
                     verrors.add(f'{schema}.listen', f'IP {i["ip"]} not configured on this system.')
 
-        if data['discovery_authgroup']:
-            if not await self.middleware.call(
-                'datastore.query', 'services.iscsitargetauthcredential',
-                [('iscsi_target_auth_tag', '=', data['discovery_authgroup'])]
-            ):
-                verrors.add(
-                    f'{schema}.discovery_authgroup',
-                    f'Auth Group "{data["discovery_authgroup"]}" not found.',
-                    errno.ENOENT,
-                )
-        elif data['discovery_authmethod'] in ('CHAP', 'CHAP_MUTUAL'):
-            verrors.add(f'{schema}.discovery_authgroup', 'This field is required if discovery method is '
-                                                         'set to CHAP or CHAP Mutual.')
-
-    @accepts(Dict(
-        'iscsiportal_create',
-        Str('comment'),
-        Str('discovery_authmethod', default='NONE', enum=['NONE', 'CHAP', 'CHAP_MUTUAL']),
-        Int('discovery_authgroup', default=None, null=True),
-        List('listen', required=True, items=[
-            Dict(
-                'listen',
-                IPAddr('ip', required=True),
-            ),
-        ]),
-        register=True,
-    ))
+    @api_method(
+        ISCSIPortalCreateArgs,
+        ISCSIPortalCreateResult,
+        audit='Create iSCSI portal',
+        audit_extended=lambda data: portal_summary(data)
+    )
     async def do_create(self, data):
         """
         Create a new iSCSI Portal.
-
-        `discovery_authgroup` is required for CHAP and CHAP_MUTUAL.
         """
         verrors = ValidationErrors()
         await self.__validate(verrors, data, 'iscsiportal_create')
-        if verrors:
-            raise verrors
+        verrors.check()
 
         # tag attribute increments sequentially
         data['tag'] = (await self.middleware.call(
@@ -154,8 +148,7 @@ class ISCSIPortalService(CRUDService):
         )) + 1
 
         listen = data.pop('listen')
-        data['discoveryauthgroup'] = data.pop('discovery_authgroup', None)
-        data['discoveryauthmethod'] = AUTHMETHOD_LEGACY_MAP.inv.get(data.pop('discovery_authmethod'), 'None')
+
         pk = await self.middleware.call(
             'datastore.insert', self._config.datastore, data,
             {'prefix': self._config.datastore_prefix}
@@ -175,8 +168,9 @@ class ISCSIPortalService(CRUDService):
         Update database with new listen IPs.
         It will delete no longer existing addresses and add new ones.
         """
-        new_listen_set = set([tuple(i.items()) for i in new])
-        old_listen_set = set([tuple(i.items()) for i in old]) if old else set()
+        # We only want to compare 'ip', weed out any 'port' present
+        new_listen_set = set([(('ip', i.get('ip')),) for i in new])
+        old_listen_set = set([(('ip', i.get('ip')),) for i in old]) if old else set()
         for i in new_listen_set - old_listen_set:
             i = dict(i)
             await self.middleware.call(
@@ -199,32 +193,28 @@ class ISCSIPortalService(CRUDService):
                     'datastore.delete', 'services.iscsitargetportalip', portalip[0]['id']
                 )
 
-    @accepts(
-        Int('id'),
-        Patch(
-            'iscsiportal_create',
-            'iscsiportal_update',
-            ('attr', {'update': True})
-        )
+    @api_method(
+        ISCSIPortalUpdateArgs,
+        ISCSIPortalUpdateResult,
+        audit='Update iSCSI portal',
+        audit_callback=True,
     )
-    async def do_update(self, pk, data):
+    async def do_update(self, audit_callback, pk, data):
         """
-        Update iSCSI Portal `id`.
+        Update iSCSI Portal ``id``.
         """
 
         old = await self.get_instance(pk)
+        audit_callback(portal_summary(old))
 
         new = old.copy()
         new.update(data)
 
         verrors = ValidationErrors()
         await self.__validate(verrors, new, 'iscsiportal_update', old)
-        if verrors:
-            raise verrors
+        verrors.check()
 
         listen = new.pop('listen')
-        new['discoveryauthgroup'] = new.pop('discovery_authgroup', None)
-        new['discoveryauthmethod'] = AUTHMETHOD_LEGACY_MAP.inv.get(new.pop('discovery_authmethod'), 'None')
 
         await self.__save_listen(pk, listen, old['listen'])
 
@@ -237,19 +227,25 @@ class ISCSIPortalService(CRUDService):
 
         return await self.get_instance(pk)
 
-    @accepts(Int('id'))
-    async def do_delete(self, id):
+    @api_method(
+        ISCSIPortalDeleteArgs,
+        ISCSIPortalDeleteResult,
+        audit='Delete iSCSI portal',
+        audit_callback=True,
+    )
+    async def do_delete(self, audit_callback, id_):
         """
-        Delete iSCSI Portal `id`.
+        Delete iSCSI Portal ``id``.
         """
-        await self.get_instance(id)
+        old = await self.get_instance(id_)
+        audit_callback(portal_summary(old))
         await self.middleware.call(
-            'datastore.delete', 'services.iscsitargetgroups', [['iscsi_target_portalgroup', '=', id]]
+            'datastore.delete', 'services.iscsitargetgroups', [['iscsi_target_portalgroup', '=', id_]]
         )
         await self.middleware.call(
-            'datastore.delete', 'services.iscsitargetportalip', [['iscsi_target_portalip_portal', '=', id]]
+            'datastore.delete', 'services.iscsitargetportalip', [['iscsi_target_portalip_portal', '=', id_]]
         )
-        result = await self.middleware.call('datastore.delete', self._config.datastore, id)
+        result = await self.middleware.call('datastore.delete', self._config.datastore, id_)
 
         for i, portal in enumerate(await self.middleware.call('iscsi.portal.query', [], {'order_by': ['tag']})):
             await self.middleware.call(

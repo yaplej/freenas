@@ -1,12 +1,21 @@
-from middlewared.service import Service, job, private
-from middlewared.service_exception import CallError
-from middlewared.utils import Popen, run
-from middlewared.plugins.smb import SMBCmd, SMBPath
+from typing import Any
 
-import os
-import subprocess
-import time
-import asyncio
+from middlewared.alert.source.smb import SMBUserMissingHashAlert
+from middlewared.service import Service, filterable_api_method, job, private
+from middlewared.utils.sid import get_domain_rid
+
+from .constants import SMB_ACCOUNT_METADATA_LOCK
+from .util_account_policy import sync_account_policy
+from .util_passdb import (
+    PassdbMustReinit,
+    add_version_info,
+    delete_passdb_entry,
+    insert_passdb_entries,
+    query_passdb_entries,
+    reinit_passdb,
+    update_passdb_entry,
+    user_entry_to_passdb_entry,
+)
 
 
 class SMBService(Service):
@@ -15,234 +24,96 @@ class SMBService(Service):
         service = 'cifs'
         service_verb = 'restart'
 
-    @private
-    async def smbpasswd_dump(self):
-        out = {}
-        p = await run([SMBCmd.PDBEDIT.value, '-d', '0', '-Lw'], check=False)
-        if p.returncode != 0:
-            raise CallError(f'Failed to dump passdb file: {p.stderr.decode()}')
-
-        for entry in p.stdout.decode().splitlines():
-            out.update({
-                entry.split(":")[0]: entry
-            })
-
-        return out
+    @filterable_api_method(private=True)
+    def passdb_list(self, filters, options):
+        """ query existing passdb users """
+        try:
+            return query_passdb_entries(filters or [], options or {})
+        except PassdbMustReinit as err:
+            self.logger.warning(err.errmsg)
+            self.middleware.call_sync('smb.synchronize_passdb').wait_sync(raise_error=True)
+            return query_passdb_entries(filters or [], options or {})
 
     @private
-    async def passdb_list(self, verbose=False):
-        """
-        passdb entries for local SAM database. This will be populated with
-        local users in an AD environment. Immediately return in ldap enviornment.
-        """
-        pdbentries = []
+    def update_passdb_user(self, user: dict[str, Any]):
+        smb_config = self.middleware.call_sync('smb.config')
+        server_name = smb_config['netbiosname']
 
-        passdb_backend = await self.middleware.call('smb.getparm', 'passdb backend', 'global')
-        if not passdb_backend.startswith('tdbsam'):
-            return pdbentries
+        existing_entry = self.passdb_list([['username', '=', user['username']]])
+        passdb_entry = user_entry_to_passdb_entry(
+            server_name,
+            user,
+            existing_entry[0] if existing_entry else None,
+        )
 
-        if not verbose:
-            pdb = await run([SMBCmd.PDBEDIT.value, '-L', '-d', '0'], check=False)
-            if pdb.returncode != 0:
-                raise CallError(f'Failed to list passdb output: {pdb.stderr.decode()}')
-
-            for p in (pdb.stdout.decode()).splitlines():
-                entry = p.split(':')
-                try:
-                    pdbentries.append({
-                        'username': entry[0],
-                        'full_name': entry[2],
-                        'uid': entry[1],
-                    })
-                except Exception as e:
-                    self.logger.debug('Failed to parse passdb entry [%s]: %s', p, e)
-
-            return pdbentries
-
-        pdb = await run([SMBCmd.PDBEDIT.value, '-Lv', '-d', '0'], check=False)
-        if pdb.returncode != 0:
-            raise CallError(f'Failed to list passdb output: {pdb.stderr.decode()}')
-
-        for p in (pdb.stdout.decode()).split('---------------'):
-            pdbentry = {}
-            for entry in p.splitlines():
-                parm = entry.split(':')
-                if len(parm) != 2:
-                    continue
-
-                pdbentry.update({parm[0].rstrip(): parm[1].lstrip() if parm[1] else ''})
-
-            if pdbentry:
-                pdbentries.append(pdbentry)
-
-        return pdbentries
+        update_passdb_entry(passdb_entry)
+        self.middleware.call_sync('smb.push_local_accounts_to_standby')
 
     @private
-    async def update_passdb_user(self, user):
-        if user['smbhash'] == user['pdb']:
-            return
-
-        smbpasswd_string = user['smbhash'].split(":")
-        username = user['username']
-        if len(smbpasswd_string) != 7:
-            self.logger.warning("SMB hash for user [%s] is invalid. Authentication for SMB "
-                                "sessions for this user will fail until this is repaired. "
-                                "This may indicate that configuration was restored without a secret "
-                                "seed, and may be repaired by resetting the user password.", username)
-            return
-
-        if user['pdb'] is None:
-            cmd = [SMBCmd.PDBEDIT.value, '-d', '0', '-a', username]
-
-            # If we're clustered, next_rid will be -1 and we _must_ use passdb rid counter
-            # this is because database ids can't be relied on to be consistent cluster-wide
-            next_rid = await self.middleware.call('smb.get_next_rid', 'USER', user['id'])
-
-            self.logger.debug("User [%s] does not exist in the passdb.tdb file. "
-                              "Creating entry with rid [%s].", username, next_rid)
-            if next_rid != -1:
-                cmd.extend(['-U', str(next_rid)])
-
-            cmd.append('-t')
-
-            pdbcreate = await Popen(
-                cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, stdin=subprocess.PIPE
-            )
-            out, err = await pdbcreate.communicate(input=" \n \n".encode())
-            if pdbcreate.returncode != 0:
-                raise CallError(f'{username}: failed to create passdb user: {err.decode()}')
-
-            setntpass = await run([SMBCmd.PDBEDIT.value, '-d', '0', '--set-nt-hash', smbpasswd_string[3], username], check=False)
-            if setntpass.returncode != 0:
-                raise CallError(f'Failed to set NT password for {username}: {setntpass.stderr.decode()}')
-
-            if user['locked']:
-                disableacct = await run([SMBCmd.SMBPASSWD.value, '-d', username], check=False)
-                if disableacct.returncode != 0:
-                    raise CallError(f'Failed to disable {username}: {disableacct.stderr.decode()}')
-            return
-
-        """
-        If an invalid global auxiliary parameter is present
-        in the smb.conf, then pdbedit will write error messages
-        to stdout (two for each invalid parameter, separated by \n).
-        The last line of output in this case will be the passdb entry
-        in smbpasswd format (-Lw). This is the reason why we pre-emptively
-        splitlines() and use last element of resulting list for our checks.
-        """
-        entry = user['pdb'].split(":")
-
-        if smbpasswd_string[3] != entry[3]:
-            setntpass = await run([SMBCmd.PDBEDIT.value, '-d', '0', '--set-nt-hash', smbpasswd_string[3], username], check=False)
-            if setntpass.returncode != 0:
-                raise CallError(f'Failed to set NT password for {username}: {setntpass.stderr.decode()}')
-        if user['locked'] and 'D' not in entry[4]:
-            disableacct = await run([SMBCmd.SMBPASSWD.value, '-d', username], check=False)
-            if disableacct.returncode != 0:
-                raise CallError(f'Failed to disable {username}: {disableacct.stderr.decode()}')
-        elif not user['locked'] and 'D' in entry[4]:
-            enableacct = await run([SMBCmd.SMBPASSWD.value, '-e', username], check=False)
-            if enableacct.returncode != 0:
-                raise CallError(f'Failed to enable {username}: {enableacct.stderr.decode()}')
+    def remove_passdb_user(self, username, sid):
+        delete_passdb_entry(username, get_domain_rid(sid))
+        self.middleware.call_sync('smb.push_local_accounts_to_standby')
 
     @private
-    async def remove_passdb_user(self, username):
-        ha_mode = await self.middleware.call('smb.get_smb_ha_mode')
-        if ha_mode == "CLUSTERED":
-            self.logger.debug("passdb support not yet implemented in clustered TrueNAS.")
-            return
-
-        deluser = await run([SMBCmd.PDBEDIT.value, '-d', '0', '-x', username], check=False)
-        if deluser.returncode != 0:
-            raise CallError(f'Failed to delete user [{username}]: {deluser.stderr.decode()}')
+    def apply_account_policy(self):
+        security = self.call_sync2(self.s.system.security.config)
+        sync_account_policy(security)
 
     @private
-    async def passdb_reinit(self, conf_users):
-        """
-        This method gets called if we need to rebuild passdb.tdb from scratch.
-        Back up problematic version first to preserve collateral in case of regression.
-        `conf_users` contains results of `user.query`. Since users will receive new
-        SID values, we will need to flush samba's cache to ensure consistency.
-        """
-        private_dir = SMBPath.PASSDB_DIR.platform()
-        ts = int(time.time())
-        old_path = f'{private_dir}/passdb.tdb'
-        new_path = f'{private_dir}/passdb.{ts}.corrupted'
-        os.rename(old_path, new_path)
-        self.logger.debug("Backing up original passdb to [%s]", new_path)
-        for u in conf_users:
-            await self.middleware.call('smb.update_passdb_user', u)
+    def reconcile_passdb(self):
+        """ Sync user configuration from our user table with Samba's passdb.tdb file
 
-        net = await run([SMBCmd.NET.value, 'cache', 'flush'], check=False)
-        if net.returncode != 0:
-            self.logger.warning("Samba gencache flush failed with error: %s", net.stderr.decode())
+        The caller must hold SMB_ACCOUNT_METADATA_LOCK; synchronize_passdb is this as a job.
 
-    @private
-    async def set_cluster_lock_wait(self):
+        Raises:
+            RuntimeError - TDB library error
         """
-        Set cluster-wide PASS_DB lock with 5 minute timeout.
-        In theory this should give us plenty of time to finish passdb operations.
-        Other nodes will block waiting for this to be released. Trying once per
-        minute to synchronize passdb.
-        """
-        pnn = await self.middleware.call('ctdb.general.pnn')
+        server_name = self.middleware.call_sync('smb.config')['netbiosname']
 
-        while True:
+        try:
+            pdb_entries = {entry['user_rid']: entry for entry in query_passdb_entries([], {})}
+        except PassdbMustReinit:
+            reinit_passdb()
+            pdb_entries = {}
+
+        add_version_info()
+        to_update = []
+        broken_entries = []
+
+        for user in self.call_sync2(self.s.user.query, [("smb", "=", True), ('local', '=', True)]):
+            entry = user.model_dump(expose_secrets=True)
+            existing_entry = pdb_entries.pop(get_domain_rid(entry['sid']), None)
             try:
-                lock = await self.middleware.call('clustercache.get', 'PASSDB_LOCK')
-                if lock["node"] == pnn:
-                    return
-            except KeyError:
-                pass
+                to_update.append(user_entry_to_passdb_entry(server_name, entry, existing_entry))
+            except ValueError:
+                # This will occur if config was restored without a secret seed
+                broken_entries.append(entry['username'])
+                continue
 
-            try:
-                await self.middleware.call(
-                    'clustercache.put', "PASSDB_LOCK",
-                    {"node": pnn}, 300, {"flag": "CREATE"}
-                )
-                return
-            except KeyError:
-                self.logger.debug("waiting for clustered PASSDB_LOCK")
-                await asyncio.sleep(60)
+            if existing_entry and existing_entry['username'] != entry['username']:
+                # username changed. Since it's part of key for one of tdb entries we have to nuke it.
+                delete_passdb_entry(existing_entry['username'], existing_entry['user_rid'])
+
+        # inserting over existing entries replaces them
+        # this is performed with a transaction lock in place and so
+        # we don't have to worry about rollback in case of failure
+        insert_passdb_entries(to_update)
+
+        for entry in pdb_entries.values():
+            # we popped off keys as we matched them to existing DB users.
+            # any remaining shouldn't be in the passdb file
+
+            self.logger.debug('%s: removing user from SMB user database', entry['username'])
+            delete_passdb_entry(entry['username'], entry['user_rid'])
+
+        if broken_entries:
+            self.call_sync2(self.s.alert.oneshot_create,
+                            SMBUserMissingHashAlert(entries=','.join(broken_entries)))
+        else:
+            self.call_sync2(self.s.alert.oneshot_delete, "SMBUserMissingHash")
 
     @private
-    @job(lock="passdb_sync")
-    async def synchronize_passdb(self, job):
-        """
-        Create any missing entries in the passdb.tdb.
-        Replace NT hashes of users if they do not match what is the the config file.
-        Synchronize the "disabled" state of users
-        Delete any entries in the passdb_tdb file that don't exist in the config file.
-        This method may cause temporary service disruption for SMB.
-        """
-        ha_mode = await self.middleware.call('smb.get_smb_ha_mode')
-
-        passdb_backend = await self.middleware.call('smb.getparm',
-                                                    'passdb backend',
-                                                    'global')
-
-        if not passdb_backend.startswith('tdbsam'):
-            return
-
-        if ha_mode == 'CLUSTERED':
-            await self.set_cluster_lock_wait()
-
-        conf_users = await self.middleware.call('user.query', [("smb", "=", True)])
-
-        pdb_users = await self.smbpasswd_dump()
-        for u in conf_users:
-            pdb_entry = pdb_users.pop(u['username'], None)
-            u.update({"pdb": pdb_entry})
-            await self.middleware.call('smb.update_passdb_user', u)
-
-        for entry in pdb_users.keys():
-            self.logger.debug('Synchronizing passdb with config file: deleting user [%s] from passdb.tdb', entry)
-            try:
-                await self.remove_passdb_user(entry)
-            except Exception:
-                self.logger.warning("Failed to remove passdb user. This may indicate a corrupted passdb. Regenerating.", exc_info=True)
-                await self.passdb_reinit(conf_users)
-                break
-
-        if ha_mode == "CLUSTERED":
-            await self.middleware.call("clustercache.pop", "PASSDB_LOCK")
+    @job(lock=SMB_ACCOUNT_METADATA_LOCK, lock_queue_size=None)
+    def synchronize_passdb(self, passdb_job):
+        """ reconcile_passdb under SMB_ACCOUNT_METADATA_LOCK, for callers that do not hold it """
+        self.reconcile_passdb()

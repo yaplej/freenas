@@ -1,139 +1,225 @@
+from __future__ import annotations
+
 import errno
 import re
+import typing
 import uuid
 
-from middlewared.plugins.zfs_.utils import zvol_name_to_path, zvol_path_to_name
-from middlewared.schema import accepts, Bool, Int, returns, Str
-from middlewared.service import CallError, item_method, Service
+from middlewared.api.current import (
+    VMCreate,
+    VMDeleteOptions,
+    VMDeviceCreate,
+    VMDeviceEntry,
+    ZFSResourceQuery,
+    ZFSResourceSnapshotCloneArgsData,
+    ZFSResourceSnapshotCreateArgsData,
+    ZFSResourceSnapshotDestroyArgsData,
+    ZFSResourceSnapshotQuery,
+)
+from middlewared.plugins.zfs.zvol_utils import zvol_name_to_path, zvol_path_to_name
+from middlewared.service import CallError, ServiceContext
+from middlewared.service_exception import ValidationErrors
+from middlewared.utils.libvirt.nic import NICDelegate
 
+from .utils import copy_vm_state, vm_state_missing_sources
+
+if typing.TYPE_CHECKING:
+    from middlewared.utils.types import AuditCallback
 
 ZVOL_CLONE_SUFFIX = '_clone'
 ZVOL_CLONE_RE = re.compile(rf'^(.*){ZVOL_CLONE_SUFFIX}\d+$')
 
 
-class VMService(Service):
-
-    async def __next_clone_name(self, name):
-        vm_names = [
-            i['name']
-            for i in await self.middleware.call('vm.query', [
-                ('name', '~', rf'{name}{ZVOL_CLONE_SUFFIX}\d+')
-            ])
-        ]
-        clone_index = 0
-        while True:
-            clone_name = f'{name}{ZVOL_CLONE_SUFFIX}{clone_index}'
-            if clone_name not in vm_names:
-                break
-            clone_index += 1
-        return clone_name
-
-    async def __clone_zvol(self, name, zvol, created_snaps, created_clones):
-        if not await self.middleware.call('zfs.dataset.query', [('id', '=', zvol)]):
-            raise CallError(f'zvol {zvol} does not exist.', errno.ENOENT)
-
-        snapshot_name = name
-        i = 0
-        while True:
-            zvol_snapshot = f'{zvol}@{snapshot_name}'
-            if await self.middleware.call('zfs.snapshot.query', [('id', '=', zvol_snapshot)]):
-                if ZVOL_CLONE_RE.search(snapshot_name):
-                    snapshot_name = ZVOL_CLONE_RE.sub(rf'\1{ZVOL_CLONE_SUFFIX}{i}', snapshot_name)
-                else:
-                    snapshot_name = f'{name}{ZVOL_CLONE_SUFFIX}{i}'
-                i += 1
-                continue
+async def _next_clone_name(context: ServiceContext, name: str) -> str:
+    vm_names = [
+        i['name']
+        for i in await context.middleware.call('datastore.query', 'vm.vm', [
+            ('name', '~', rf'{name}{ZVOL_CLONE_SUFFIX}\d+')
+        ])
+    ]
+    clone_index = 0
+    while True:
+        clone_name = f'{name}{ZVOL_CLONE_SUFFIX}{clone_index}'
+        if clone_name not in vm_names:
             break
+        clone_index += 1
+    return clone_name
 
-        await self.middleware.call('zfs.snapshot.create', {'dataset': zvol, 'name': snapshot_name})
-        created_snaps.append(zvol_snapshot)
 
-        clone_suffix = name
-        i = 0
-        while True:
-            clone_dst = f'{zvol}_{clone_suffix}'
-            if await self.middleware.call('zfs.dataset.query', [('id', '=', clone_dst)]):
-                if ZVOL_CLONE_RE.search(clone_suffix):
-                    clone_suffix = ZVOL_CLONE_RE.sub(rf'\1{ZVOL_CLONE_SUFFIX}{i}', clone_suffix)
-                else:
-                    clone_suffix = f'{name}{ZVOL_CLONE_SUFFIX}{i}'
-                i += 1
-                continue
-            break
+async def _clone_zvol(
+    context: ServiceContext, name: str, zvol: str, created_snaps: list[str], created_clones: list[str],
+) -> str:
+    zz = await context.call2(
+        context.s.zfs.resource.list_impl,
+        ZFSResourceQuery(paths=[zvol], properties=None),
+    )
+    if not zz:
+        raise CallError(f'zvol {zvol} does not exist.', errno.ENOENT)
 
-        await self.middleware.call('zfs.snapshot.clone', {'snapshot': zvol_snapshot, 'dataset_dst': clone_dst})
+    # Get existing snapshots for this zvol (properties: None for efficiency)
+    existing_snaps = await context.call2(context.s.zfs.resource.snapshot.list, ZFSResourceSnapshotQuery(
+        paths=[zvol], properties=None,
+    ))
+    existing_snap_names = {s.name for s in existing_snaps}
 
-        created_clones.append(clone_dst)
+    snapshot_name = name
+    i = 0
+    while True:
+        zvol_snapshot = f'{zvol}@{snapshot_name}'
+        if zvol_snapshot in existing_snap_names:
+            if ZVOL_CLONE_RE.search(snapshot_name):
+                snapshot_name = ZVOL_CLONE_RE.sub(rf'\1{ZVOL_CLONE_SUFFIX}{i}', snapshot_name)
+            else:
+                snapshot_name = f'{name}{ZVOL_CLONE_SUFFIX}{i}'
+            i += 1
+            continue
+        break
 
-        return clone_dst
+    await context.call2(context.s.zfs.resource.snapshot.create_impl, ZFSResourceSnapshotCreateArgsData(
+        dataset=zvol,
+        name=snapshot_name,
+    ))
+    created_snaps.append(zvol_snapshot)
 
-    @item_method
-    @accepts(Int('id'), Str('name', default=None))
-    @returns(Bool())
-    async def clone(self, id, name):
-        """
-        Clone the VM `id`.
+    clone_suffix = name
+    i = 0
+    while True:
+        clone_dst = f'{zvol}_{clone_suffix}'
+        if await context.call2(
+            context.s.zfs.resource.list_impl, ZFSResourceQuery(paths=[clone_dst], properties=None)
+        ):
+            if ZVOL_CLONE_RE.search(clone_suffix):
+                clone_suffix = ZVOL_CLONE_RE.sub(rf'\1{ZVOL_CLONE_SUFFIX}{i}', clone_suffix)
+            else:
+                clone_suffix = f'{name}{ZVOL_CLONE_SUFFIX}{i}'
+            i += 1
+            continue
+        break
 
-        `name` is an optional parameter for the cloned VM.
-        If not provided it will append the next number available to the VM name.
-        """
-        vm = await self.middleware.call('vm.get_instance', id)
+    await context.call2(context.s.zfs.resource.snapshot.clone, ZFSResourceSnapshotCloneArgsData(
+        snapshot=zvol_snapshot,
+        dataset=clone_dst,
+    ))
 
-        origin_name = vm['name']
-        del vm['id']
-        del vm['status']
-        devices = vm.pop('devices')
+    created_clones.append(clone_dst)
 
-        vm['name'] = await self.__next_clone_name(vm['name'])
-        vm['uuid'] = str(uuid.uuid4())  # We want to use a newer uuid here as it is supposed to be unique per VM
+    return clone_dst
 
-        if name is not None:
-            vm['name'] = name
 
-        # In case we need to rollback
-        created_snaps = []
-        created_clones = []
+def validate_clone(vm_devices: list[VMDeviceEntry]) -> None:
+    verrors = ValidationErrors()
+    for index, device in enumerate(vm_devices):
+        if device.attributes.dtype == 'DISPLAY' and not device.attributes.password:
+            verrors.add(
+                f'vm.devices.{index}.attributes.password',
+                'Password must be configured for display device in order to clone the VM.'
+            )
+    verrors.check()
+
+
+async def clone_vm(context: ServiceContext, id_: int, name: str | None, *, audit_callback: AuditCallback) -> bool:
+    vm = await context.call2(context.s.vm.get_instance, id_)
+    audit_callback(f'{vm.name} to {name or "auto"}')
+    validate_clone(vm.devices)
+
+    origin_name = vm.name
+    clone_name = name if name is not None else await _next_clone_name(context, vm.name)
+
+    # Build VMCreate from the existing VM entry, overriding name and uuid
+    vm_dict = vm.model_dump()
+    for key in ('id', 'status', 'display_available', 'devices'):
+        vm_dict.pop(key, None)
+    vm_dict['name'] = clone_name
+    vm_dict['uuid'] = str(uuid.uuid4())  # We want to use a newer uuid here as it is supposed to be unique per VM
+    create_data = VMCreate.model_validate(vm_dict)
+
+    created_snaps: list[str] = []
+    created_clones: list[str] = []
+    new_vm = None
+    try:
+        new_vm = await context.call2(context.s.vm.create, create_data)
+
         try:
-            new_vm = await self.middleware.call('vm.do_create', vm)
+            await context.to_thread(copy_vm_state, vm.id, vm.name, new_vm.id, new_vm.name)
+        except FileExistsError as fe:
+            raise CallError(
+                f'Cannot clone VM {vm.name!r} -> {new_vm.name!r}: on-disk state '
+                'already exists at the destination (likely stale NVRAM/TPM left '
+                'over from a previously deleted VM). Aborting; VM configuration '
+                'is unchanged.'
+            ) from fe
+        except OSError as oe:
+            raise CallError(
+                f'Failed to copy VM state for {vm.name!r} -> {new_vm.name!r}: '
+                f'{oe.strerror or oe} (errno={oe.errno}).'
+            ) from oe
 
-            for item in devices:
-                item.pop('id', None)
-                item['vm'] = new_vm['id']
-                if item['dtype'] == 'NIC':
-                    if 'mac' in item['attributes']:
-                        del item['attributes']['mac']
-                if item['dtype'] == 'DISPLAY':
-                    if 'port' in item['attributes']:
-                        dev_dict = await self.middleware.call('vm.port_wizard')
-                        item['attributes']['port'] = dev_dict['port']
-                        item['attributes']['web_port'] = dev_dict['web']
-                if item['dtype'] == 'DISK':
-                    zvol = zvol_path_to_name(item['attributes']['path'])
-                    item['attributes']['path'] = zvol_name_to_path(
-                        await self.__clone_zvol(vm['name'], zvol, created_snaps, created_clones)
-                    )
-                if item['dtype'] == 'RAW':
-                    self.logger.warning('RAW disks must be copied manually. Skipping...')
-                    continue
+        missing = await context.to_thread(
+            vm_state_missing_sources, vm.id, vm.name,
+            vm.bootloader, vm.trusted_platform_module,
+        )
+        if missing:
+            context.logger.warning(
+                '%s -> %s: clone proceeded with no source on-disk state for %s; '
+                'libvirt/swtpm will initialise fresh state on first boot.',
+                vm.name, new_vm.name, ', '.join(missing),
+            )
 
-                await self.middleware.call('vm.device.create', item)
-        except Exception as e:
-            for i in reversed(created_clones):
-                try:
-                    await self.middleware.call('zfs.dataset.delete', i)
-                except Exception:
-                    self.logger.warning('Rollback of VM clone left dangling zvol: %s', i)
-            for i in reversed(created_snaps):
-                try:
-                    dataset, snap = i.split('@')
-                    await self.middleware.call('zfs.snapshot.remove', {
-                        'dataset': dataset,
-                        'name': snap,
-                        'defer_delete': True,
-                    })
-                except Exception:
-                    self.logger.warn('Rollback of VM clone left dangling snapshot: %s', i)
-            raise e
-        self.logger.info('VM cloned from {0} to {1}'.format(origin_name, vm['name']))
+        for device in vm.devices:
+            device_dict = device.model_dump(expose_secrets=True)
+            device_dict.pop('id', None)
+            device_dict['vm'] = new_vm.id
+            dtype = device.attributes.dtype
 
-        return True
+            if dtype == 'NIC':
+                device_dict['attributes']['mac'] = NICDelegate.random_mac()
+            if dtype == 'DISPLAY':
+                if 'port' in device_dict['attributes']:
+                    port_dev = await context.call2(context.s.vm.port_wizard)
+                    device_dict['attributes']['port'] = port_dev.port
+                    device_dict['attributes']['web_port'] = port_dev.web
+            if dtype == 'DISK':
+                zvol = zvol_path_to_name(device_dict['attributes']['path'])
+                device_dict['attributes']['path'] = zvol_name_to_path(
+                    await _clone_zvol(context, clone_name, zvol, created_snaps, created_clones)
+                )
+            if dtype == 'RAW':
+                context.logger.warning('RAW disks must be copied manually. Skipping...')
+                continue
+
+            await context.call2(context.s.vm.device.create, VMDeviceCreate.model_validate(device_dict))
+    except Exception:
+        # Destroy clones before their origin snapshots: a clone pins the snapshot it
+        # was created from, so the snapshot can only be removed once every clone is gone.
+        # The two lists can differ in length if _clone_zvol failed between creating the
+        # snapshot and the clone, so unwinding them separately.
+        for clone in reversed(created_clones):
+            try:
+                await context.call2(context.s.zfs.resource.destroy_impl, clone)
+            except Exception:
+                context.logger.exception('clone rollback: failed to destroy cloned zvol %r', clone)
+        for snap in reversed(created_snaps):
+            try:
+                await context.call2(
+                    context.s.zfs.resource.snapshot.destroy_impl,
+                    ZFSResourceSnapshotDestroyArgsData(path=snap),
+                )
+            except Exception:
+                context.logger.exception('clone rollback: failed to destroy snapshot %r', snap)
+        if new_vm is not None:
+            # Remove the partially-created VM: its datastore row, any device rows already
+            # created, and copied NVRAM/TPM state. zvols=False since the clone datasets are
+            # handled above; force=True skips the running-VM guard (it was never started).
+            try:
+                await context.call2(
+                    context.s.vm.delete, new_vm.id, VMDeleteOptions(zvols=False, force=True),
+                )
+            except Exception:
+                context.logger.error(
+                    '%s: clone rollback failed to remove partially-created VM record',
+                    new_vm.name, exc_info=True,
+                )
+        raise
+
+    context.logger.info('VM cloned from %r to %r', origin_name, clone_name)
+    return True

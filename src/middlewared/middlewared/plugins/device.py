@@ -1,5 +1,7 @@
-from middlewared.schema import accepts, Bool, Dict, Int, List, OROperator, returns, Str
+from middlewared.api import api_method
+from middlewared.api.current import DeviceGetInfoArgs, DeviceGetInfoResult
 from middlewared.service import Service
+from middlewared.utils.serial import serial_port_choices
 
 
 class DeviceService(Service):
@@ -7,43 +9,12 @@ class DeviceService(Service):
     class Config:
         cli_namespace = 'system.device'
 
-    @accepts(Str('type', enum=['SERIAL', 'DISK', 'GPU']))
-    @returns(OROperator(
-        List('serial_info', items=[Dict(
-            'serial_info',
-            Str('name', required=True),
-            Str('location'),
-            Str('drivername'),
-            Str('start'),
-            Int('size'),
-            Str('description'),
-        )]),
-        List('gpu_info', items=[Dict(
-            'gpu_info',
-            Dict(
-                'addr',
-                Str('pci_slot', required=True),
-                Str('domain', required=True),
-                Str('bus', required=True),
-                Str('slot', True),
-            ),
-            Str('description', required=True),
-            List('devices', items=[Dict(
-                'gpu_device',
-                Str('pci_id', required=True),
-                Str('pci_slot', required=True),
-                Str('vm_pci_slot', required=True),
-            )]),
-            Str('vendor', required=True, null=True),
-            Bool('available_to_host', required=True),
-            Bool('uses_system_critical_devices', required=True),
-        ),
-        ]),
-        Dict('disk_info', additional_attrs=True),
-        name='device_info',
-    ))
-    async def get_info(self, _type):
-        """
-        Get info for SERIAL/DISK/GPU device types.
-        """
-        return await self.middleware.call(f'device.get_{_type.lower()}s')
+    @api_method(DeviceGetInfoArgs, DeviceGetInfoResult, roles=['READONLY_ADMIN'])
+    async def get_info(self, data):
+        """Get info for ``type`` device."""
+        method = f'device.get_{data["type"].lower()}s'
+        if method == 'device.get_disks':
+            return await self.middleware.call(method, data['get_partitions'], data['serials_only'])
+        elif method == 'device.get_serials':
+            return await self.middleware.run_in_thread(serial_port_choices)
+        return await self.middleware.call(method)

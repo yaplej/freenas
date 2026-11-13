@@ -7,20 +7,35 @@
 # (e.g., /etc/shadow, LDAP, Kerberos, etc.).  The default is to use the
 # traditional Unix authentication mechanisms.
 
-<%namespace name="pam" file="pam.inc.mako" />\
 <%
-        dsp = pam.getDirectoryServicePam(middleware=middleware, render_ctx=render_ctx)
+    from middlewared.utils.directoryservices.constants import DSType
+    from middlewared.utils.pam import (
+        STANDALONE_AUTH, AD_AUTH, SSS_AUTH,
+        FAILLOCK_AUTH_FAIL, FAILLOCK_AUTH_SUCC,
+    )
+
+    match (dstype := render_ctx['directoryservices.status']['type']):
+        # dstype of None means standalone server
+        case None:
+            conf = STANDALONE_AUTH
+        case DSType.AD.value:
+            conf = AD_AUTH
+        case DSType.LDAP.value | DSType.IPA.value:
+            conf = SSS_AUTH
+        case _:
+            raise TypeError(f'{dstype}: unknown DSType')
 %>\
 
-# here are the per-package modules (the "Primary" block)
-${dsp.pam_auth()}
-
-auth	[success=1 default=ignore]      pam_unix.so obscure sha512
-# here's the fallback if no module succeeds
-auth	requisite			pam_deny.so
-# prime the stack with a positive return value if there isn't one already;
-# this avoids us returning an error just because nothing sets a success code
-# since the modules above will each just jump around
-auth	required			pam_permit.so
-# and here are more per-package modules (the "Additional" block)
-# end of pam-auth-update config
+% if render_ctx['system.security.config'].enable_gpos_stig:
+auth	optional	pam_faildelay.so	delay=4000000
+% endif
+% if conf.primary:
+${'\n'.join(line.as_conf() for line in conf.primary)}
+% endif
+@include common-auth-unix
+% if render_ctx['system.security.config'].enable_gpos_stig:
+${FAILLOCK_AUTH_SUCC.as_conf()}
+% endif
+% if conf.secondary:
+${'\n'.join(line.as_conf() for line in conf.secondary)}
+% endif

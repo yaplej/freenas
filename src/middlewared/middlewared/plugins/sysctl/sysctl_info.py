@@ -1,68 +1,81 @@
 import os
-import psutil
+from typing import Any
 
-from middlewared.service import CallError, Service
-from middlewared.utils import run
+from truenas_pylibzfs import kstat
 
+from middlewared.service import CallError
+from middlewared.utils import MIDDLEWARE_RUN_DIR, run
 
 ZFS_MODULE_PARAMS_PATH = '/sys/module/zfs/parameters'
+DEFAULT_ARC_MAX_FILE = f'{MIDDLEWARE_RUN_DIR}/default_arc_max'
 
 
-class SysctlService(Service):
+async def get_value(sysctl_name: str) -> str:
+    cp = await run(['sysctl', sysctl_name], check=False)
+    if cp.returncode:
+        raise CallError(f'Unable to retrieve value of "{sysctl_name}" sysctl : {cp.stderr.decode()}')
+    return cp.stdout.decode().split('=')[-1].strip()
 
-    class Config:
-        private = True
 
-    async def get_value(self, sysctl_name):
-        cp = await run(['sysctl', sysctl_name], check=False)
-        if cp.returncode:
-            raise CallError(f'Unable to retrieve value of "{sysctl_name}" sysctl : {cp.stderr.decode()}')
-        return cp.stdout.decode().split('=')[-1].strip()
+def store_default_arc_max() -> int:
+    """This should be called _BEFORE_ we initialize any VMs so that we can capture what the
+    ARC max value was before we start changing the various ARC sysctls based on VM memory
+    configurations."""
+    val = kstat.get_arcstats().c_max
+    try:
+        with open(DEFAULT_ARC_MAX_FILE, 'x') as f:
+            f.write(str(val))
+            f.flush()
+    except FileExistsError:
+        return get_default_arc_max()
+    else:
+        return val
 
-    def get_default_arc_max(self):
-        # Default value of arc max on systems
-        # https://github.com/truenas/zfs/blob/f38f3a4a3ee430a15fa221ba9fc2b6b8fd17c040/module/os/linux/zfs/arc_os.c#L85
-        return psutil.virtual_memory().total // 2
 
-    def get_arc_max(self):
-        return self.get_arcstats()['c_max']
+def get_default_arc_max() -> int:
+    try:
+        with open(DEFAULT_ARC_MAX_FILE) as f:
+            return int(f.read())
+    except FileNotFoundError:
+        return store_default_arc_max()
 
-    def get_arc_min(self):
-        return self.get_arcstats()['c_min']
 
-    async def get_pagesize(self):
-        cp = await run(['getconf', 'PAGESIZE'], check=False)
-        if cp.returncode:
-            raise CallError(f'Unable to retrieve pagesize value: {cp.stderr.decode()}')
-        return int(cp.stdout.decode().strip())
+def get_arc_max() -> int:
+    return kstat.get_arcstats().c_max
 
-    def get_arcstats(self):
-        path = '/proc/spl/kstat/zfs/arcstats'
-        if not os.path.exists(path):
-            raise CallError(f'Unable to locate {path}')
 
-        with open(path, 'r') as f:
-            data = f.read()
+def get_arc_min() -> int:
+    return kstat.get_arcstats().c_min
 
-        stats = {}
-        for line in filter(lambda l: l and len(l.split()) == 3, map(str.strip, data.split('\n'))):
-            key, _type, data = line.split()
-            stats[key.strip()] = int(data.strip()) if data.strip().isdigit() else data
 
-        return stats
+async def get_pagesize() -> int:
+    cp = await run(['getconf', 'PAGESIZE'], check=False)
+    if cp.returncode:
+        raise CallError(f'Unable to retrieve pagesize value: {cp.stderr.decode()}')
+    return int(cp.stdout.decode().strip())
 
-    def get_arcstats_size(self):
-        return self.get_arcstats()['size']
 
-    async def set_value(self, key, value):
-        await run(['sysctl', f'{key}={value}'])
+def get_arcstats() -> dict[str, Any]:
+    arcstats = kstat.get_arcstats()
+    return {name: getattr(arcstats, name) for name in kstat.ArcStats.__match_args__}
 
-    def write_to_file(self, path, value):
-        with open(path, 'w') as f:
-            f.write(str(value))
 
-    def set_arc_max(self, value):
-        return self.write_to_file(os.path.join(ZFS_MODULE_PARAMS_PATH, 'zfs_arc_max'), value)
+def get_arcstats_size() -> int:
+    return kstat.get_arcstats().size
 
-    def set_zvol_volmode(self, value):
-        return self.write_to_file(os.path.join(ZFS_MODULE_PARAMS_PATH, 'zvol_volmode'), value)
+
+async def set_value(key: str, value: str | int) -> None:
+    await run(['sysctl', f'{key}={value}'])
+
+
+def write_to_file(path: str, value: int) -> None:
+    with open(path, 'w') as f:
+        f.write(str(value))
+
+
+def set_arc_max(value: int) -> None:
+    write_to_file(os.path.join(ZFS_MODULE_PARAMS_PATH, 'zfs_arc_max'), value)
+
+
+def set_zvol_volmode(value: int) -> None:
+    write_to_file(os.path.join(ZFS_MODULE_PARAMS_PATH, 'zvol_volmode'), value)

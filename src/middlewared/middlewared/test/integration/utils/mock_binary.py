@@ -5,15 +5,19 @@ import json
 import textwrap
 
 from .call import call
+from .client import truenas_server
 from .ssh import ssh
 
 RESULT_PATH = "/tmp/mocked_binary_launch"
 
 
 class BinaryMock:
+    def __init__(self, ip=None):
+        self.ip = ip
+
     def _load(self):
         try:
-            return json.loads(ssh(f"cat {RESULT_PATH}", check=False).strip())
+            return json.loads(ssh(f"cat {RESULT_PATH}", check=False, ip=self.ip).strip())
         except ValueError:
             return None
 
@@ -30,19 +34,35 @@ class BinaryMock:
         return result
 
 
+def set_usr_readonly(value, ip=None):
+    cmd = 'python3 -c "'
+    cmd += 'from truenas_os_pyutils.mount import statmount;'
+    cmd += 'import truenas_pylibzfs;'
+    cmd += r'ds_name = statmount(path=\"/usr\", as_dict=False).sb_source;'
+    cmd += r'hdl = truenas_pylibzfs.open_handle();'
+    cmd += r'hdl.open_resource(name=ds_name).set_properties(properties={truenas_pylibzfs.ZFSProperty.READONLY: '
+    cmd += f'\\"{value}\\"' + '});"'
+    ssh(cmd, ip=ip)
+
+
 @contextlib.contextmanager
-def mock_binary(path, code="", exitcode=1):
-    ssh(f"rm -f {RESULT_PATH}")
-    ssh(f"mv {path} {path}.bak")
+def mock_binary(path, code="", exitcode=1, remote=False):
+    ip = None
+    if remote:
+        ip = truenas_server.ha_ips()["standby"]
+
+    set_usr_readonly("off", ip)
+    ssh(f"rm -f {RESULT_PATH}", ip=ip)
+    ssh(f"mv {path} {path}.bak", ip=ip)
     try:
-        call(
-            "filesystem.file_receive",
+        method = "filesystem.file_receive"
+        args = [
             path,
             base64.b64encode(textwrap.dedent("""\
                 #!/usr/bin/python3
                 import json
                 import sys
-                
+
                 exitcode = """ + repr(exitcode) + """
                 result = {
                     "argv": sys.argv,
@@ -52,8 +72,19 @@ def mock_binary(path, code="", exitcode=1):
                     json.dump(result, f)
                 sys.exit(exitcode)
             """).replace("%code%", code).encode("utf-8")).decode("ascii"),
-             {"mode": 0o755},
+            {"mode": 0o755},
+        ]
+
+        if remote:
+            args = [method, args]
+            method = "failover.call_remote"
+
+        call(
+            method,
+            *args,
         )
         yield BinaryMock()
     finally:
-        ssh(f"mv {path}.bak {path}")
+        set_usr_readonly("off", ip=ip)  # In case something like `truenas-initrd.py` was launched by `yield`
+        ssh(f"mv {path}.bak {path}", ip=ip)
+        set_usr_readonly("on", ip=ip)

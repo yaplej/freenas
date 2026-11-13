@@ -1,0 +1,58 @@
+from __future__ import annotations
+
+from typing import TYPE_CHECKING
+
+from middlewared.api.current import AppEntry, AppPullImages
+from middlewared.plugins.apps_images.utils import normalize_reference
+from middlewared.service import ServiceContext
+
+from .compose_utils import compose_action
+from .crud import get_usable_instance
+from .utils import app_version, band_progress, child_job_progress
+
+if TYPE_CHECKING:
+    from middlewared.job import Job
+
+
+def outdated_docker_images_for_app(context: ServiceContext, app_name: str) -> list[str]:
+    app = get_usable_instance(context, app_name)
+    image_update_cache = context.call_sync2(context.s.app.image.get_update_cache, True)
+    images = []
+    for image_tag in app.active_workloads.images:
+        if image_update_cache.get(normalize_reference(image_tag)['complete_tag']):
+            images.append(image_tag)
+
+    return images
+
+
+def pull_images_for_app(context: ServiceContext, job: Job, app_name: str, options: AppPullImages) -> None:
+    app = get_usable_instance(context, app_name)
+    return pull_images_internal(context, app_name, app, options, job)
+
+
+def pull_images_internal(
+    context: ServiceContext, app_name: str, app: AppEntry, options: AppPullImages, job: Job | None = None,
+) -> None:
+    progress_callback = None
+    if job is not None:
+        job.set_progress(20, 'Pulling app images')
+        progress_callback = band_progress(job, 20, 75 if options.redeploy else 99)
+
+    compose_action(app_name, app_version(app), action='pull', progress_callback=progress_callback, job=job)
+    if job is not None:
+        job.set_progress(80 if options.redeploy else 100, 'Images pulled successfully')
+
+    # We will update image cache so that it reflects the fact that image has been pulled again
+    # We won't really check again here but rather just update the cache directly because we know
+    # compose action didn't fail and that means the pull succeeded and we should have the newer version
+    # already in the system
+    for image_tag in app.active_workloads.images:
+        context.call_sync2(context.s.app.image.clear_update_flag_for_tag, image_tag)
+
+    if options.redeploy:
+        context.call_sync2(
+            context.s.app.redeploy, app_name,
+            job_on_progress_cb=child_job_progress(job, 80, 100) if job is not None else None,
+        ).wait_sync(raise_error=True)
+        if job is not None:
+            job.set_progress(100, 'App redeployed successfully')

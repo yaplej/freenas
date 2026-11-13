@@ -1,0 +1,238 @@
+# Single-level directory listing built on top of
+# ``truenas_os.iter_filesystem_contents``.  Used by ``filesystem.listdir`` and
+# the various ``directory_is_empty`` callers.
+#
+# NOTE: tests for these utils live in tests/unit/test_directory.py
+
+from __future__ import annotations
+
+from collections.abc import Iterator
+import contextlib
+import enum
+import os
+import typing
+
+import truenas_os
+
+from middlewared.api.current import FilesystemDirEntry
+
+from .acl import acl_is_present, statx_acl_is_trivial
+from .attrs import zfs_attributes_dump
+from .constants import FileType
+from .stat_x import STATX_DEFAULT_MASK, StatxAttr, StatxEtype
+from .utils import get_mount_info_for_path, path_in_ctldir
+
+
+class DirectoryRequestMask(enum.IntFlag):
+    """
+    Bitmask controlling which optional metadata fields are populated for each
+    yielded entry.  Omitting bits avoids the corresponding syscall(s) per entry.
+
+    ACL       - boolean for whether the entry has an ACL (uses listxattr)
+    CTLDIR    - boolean for whether the entry is in a ZFS ctldir
+    REALPATH  - resolved (symlink-followed) path
+    XATTRS    - list of extended attribute names
+    ZFS_ATTRS - list of ZFS file attribute names; None for non-ZFS entries
+
+    NOTE: changes here should be reflected in the ``test_listdir_request_mask``
+    API test.
+    """
+    ACL = enum.auto()
+    CTLDIR = enum.auto()
+    REALPATH = enum.auto()
+    XATTRS = enum.auto()
+    ZFS_ATTRS = enum.auto()
+
+
+ALL_ATTRS = (
+    DirectoryRequestMask.ACL
+    | DirectoryRequestMask.CTLDIR
+    | DirectoryRequestMask.REALPATH
+    | DirectoryRequestMask.XATTRS
+    | DirectoryRequestMask.ZFS_ATTRS
+)
+
+
+def _etype(item: truenas_os.IterInstance) -> typing.Literal['DIRECTORY', 'FILE', 'SYMLINK', 'OTHER']:
+    if item.isdir:
+        return StatxEtype.DIRECTORY.name
+    if item.islnk:
+        return StatxEtype.SYMLINK.name
+    if item.isreg:
+        return StatxEtype.FILE.name
+    return StatxEtype.OTHER.name
+
+
+def _statx_attr_names(stx_attributes: int) -> list[
+    typing.Literal['COMPRESSED', 'APPEND', 'NODUMP', 'ENCRYPTED', 'IMMUTABLE', 'AUTOMOUNT', 'MOUNT_ROOT', 'VERIFY',
+    'DAX', 'POSIXACL', 'NFSV4ACL', 'RDONLY'
+]]:
+    return [
+        a.name  # type: ignore[misc]
+        for a in StatxAttr
+        if stx_attributes & a.value and a.name is not None
+    ]
+
+
+def _zfs_attrs_for(st: truenas_os.StatxResult) -> list[
+    typing.Literal['READONLY', 'HIDDEN', 'SYSTEM', 'ARCHIVE', 'IMMUTABLE', 'NOUNLINK', 'APPENDONLY', 'NODUMP', 'OPAQUE',
+                   'AV_QUARANTINED', 'AV_MODIFIED', 'REPARSE', 'OFFLINE', 'SPARSE'
+]] | None:
+    # Only ZFS fills STATX_ZFSFLAGS.  Match historical None sentinel for everything else.
+    if not st.stx_mask & truenas_os.STATX_ZFSFLAGS:
+        return None
+    return zfs_attributes_dump(st.stx_zfsflags)  # type: ignore[return-value]
+
+
+@contextlib.contextmanager
+def _readable_meta_fd(item: truenas_os.IterInstance, item_path: str) -> Iterator[int]:
+    """Yield an fd suitable for stat / listxattr on the entry's
+    target inode.
+
+    The three entry shapes the iterator can produce:
+
+    * ordinary file or dir — ``item.fd`` is already O_RDONLY-equivalent.
+    * symlink — ``item.fd`` is O_PATH on the link itself; we want the target,
+      so we open ``item_path`` (which follows the link).
+    * mountpoint — ``item.fd`` is O_PATH on the mount root.  statx works but
+      listxattr returns EBADF.  Reopening via ``/proc/self/fd/<fd>``
+      upgrades to O_RDONLY through the procfs magic-link, which is race-free
+      against concurrent mount-table changes.
+    """
+    if not item.islnk and not item.ismount:
+        yield item.fd
+        return
+
+    open_path = f'/proc/self/fd/{item.fd}' if item.ismount else item_path
+    fd = os.open(open_path, os.O_RDONLY)
+    try:
+        yield fd
+    finally:
+        os.close(fd)
+
+
+def _build_entry(
+    parent_path: str,
+    item: truenas_os.IterInstance,
+    etype: typing.Literal['DIRECTORY', 'FILE', 'SYMLINK', 'OTHER'],
+    mask: DirectoryRequestMask,
+) -> FilesystemDirEntry | None:
+    """
+    Render a single iter_filesystem_contents item as a listdir-shaped dict.
+
+    Symlinks are followed for stat/xattr/zfs metadata to match the historical
+    listdir contract (size/mode/etc reflect the symlink target).  An entry
+    whose target inode can't be opened — broken symlink, target races away,
+    EACCES on the target — is skipped by returning ``None``.
+    """
+    item_path = os.path.join(parent_path, item.name)
+
+    if item.islnk:
+        # iter_filesystem_contents gives us O_PATH on the symlink itself.
+        # Follow the link (path-based) so stat / xattr / zfs reflect the target.
+        try:
+            st = truenas_os.statx(item_path, mask=STATX_DEFAULT_MASK)
+        except FileNotFoundError:
+            return None
+    else:
+        st = item.statxinfo
+
+    attributes = _statx_attr_names(st.stx_attributes)
+
+    realpath = os.path.realpath(item_path) if mask & DirectoryRequestMask.REALPATH else None
+
+    try:
+        with _readable_meta_fd(item, item_path) as meta_fd:
+            xattrs = None
+            acl = None
+            if mask & DirectoryRequestMask.ACL and not mask & DirectoryRequestMask.XATTRS and statx_acl_is_trivial(st):
+                acl = False
+            elif mask & (DirectoryRequestMask.XATTRS | DirectoryRequestMask.ACL):
+                try:
+                    xattr_list = os.listxattr(meta_fd)
+                except OSError:
+                    xattr_list = []
+
+                if mask & DirectoryRequestMask.XATTRS:
+                    xattrs = xattr_list
+
+                if mask & DirectoryRequestMask.ACL:
+                    acl = acl_is_present(xattr_list)
+
+            zfs_attrs = _zfs_attrs_for(st) if mask & DirectoryRequestMask.ZFS_ATTRS else None
+    except OSError:
+        # Symlink target became unreachable between statx and open, or the
+        # mountpoint's procfs reopen failed.  Skip the entry like a broken link.
+        return None
+
+    is_ctldir = path_in_ctldir(item_path) if mask & DirectoryRequestMask.CTLDIR else None
+
+    return FilesystemDirEntry(
+        name=item.name,
+        path=item_path,
+        realpath=realpath,
+        type=etype,
+        size=st.stx_size,
+        allocation_size=st.stx_blocks * 512,
+        mode=st.stx_mode,
+        acl=acl,
+        uid=st.stx_uid,
+        gid=st.stx_gid,
+        mount_id=st.stx_mnt_id,
+        is_mountpoint=StatxAttr.MOUNT_ROOT.name in attributes,
+        is_ctldir=is_ctldir,
+        attributes=attributes,
+        xattrs=xattrs,
+        zfs_attrs=zfs_attrs,
+    )
+
+
+def iter_listdir(
+    path: str | os.PathLike[str],
+    file_type: FileType | None = None,
+    request_mask: DirectoryRequestMask | None = None,
+) -> Iterator[FilesystemDirEntry]:
+    """
+    Yield single-level directory entries for ``path`` as listdir-shaped dicts.
+
+    `file_type` - optional pre-filter restricting yielded entries to a single
+    ``FileType``.
+
+    `request_mask` - bitmask of optional metadata to populate.  ``None`` (the
+    default) populates everything in :data:`ALL_ATTRS`; pass an explicit
+    ``DirectoryRequestMask(0)`` to skip every optional fetch.
+    """
+    mnt, fs, rel = get_mount_info_for_path(path)
+    mask = ALL_ATTRS if request_mask is None else request_mask
+    want_type = FileType(file_type).name if file_type is not None else None
+    parent_path = os.fspath(path)
+
+    with truenas_os.iter_filesystem_contents(
+        mnt, fs,
+        relative_path=rel,
+        include_symlinks=True,
+        include_mountpoints=True,
+    ) as it:
+        for item in it:
+            if item.isdir and not item.ismount:
+                # Single-level: never descend.  Mountpoint entries are yielded
+                # as files (the iterator never descends into them) so they
+                # were never pushed onto its dir_stack — calling skip() on
+                # one would pop the *parent* and terminate iteration early.
+                it.skip()
+
+            etype = _etype(item)
+            if want_type is not None and etype != want_type:
+                continue
+
+            entry = _build_entry(parent_path, item, etype, mask)
+            if entry is None:
+                continue
+            yield entry
+
+
+def directory_is_empty(path: str | os.PathLike[str]) -> bool:
+    """
+    Memory-efficient test for whether ``path`` is an empty directory.
+    """
+    return not any(iter_listdir(path, request_mask=DirectoryRequestMask(0)))

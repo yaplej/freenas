@@ -7,6 +7,7 @@ Create Date: 2020-01-14 13:26:02.169132+00:00
 """
 from alembic import op
 import sqlalchemy as sa
+from sqlalchemy import text
 
 
 # revision identifiers, used by Alembic.
@@ -21,8 +22,8 @@ def upgrade():
     with op.batch_alter_table('network_globalconfiguration', schema=None) as batch_op:
         batch_op.add_column(sa.Column('gc_service_announcement', sa.Text(), nullable=True))
 
-    defaults = '{"mdns": true, "wsd": true, "netbios": false}'
-    op.execute(f"UPDATE network_globalconfiguration SET gc_service_announcement = \'{defaults}\'")
+    defaults = '{"mdns": true, "wsd": true, "netbios": true}'
+    op.execute(text(f"UPDATE network_globalconfiguration SET gc_service_announcement = '{defaults}'"))
 
     with op.batch_alter_table('network_globalconfiguration', schema=None) as batch_op:
         batch_op.alter_column('gc_service_announcement', nullable=False)

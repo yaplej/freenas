@@ -1,8 +1,17 @@
 # -*- coding=utf-8 -*-
+from __future__ import annotations
+
 import errno
 import logging
+from typing import TYPE_CHECKING
 
 from middlewared.service_exception import CallError
+
+if TYPE_CHECKING:
+    from types import MethodType
+
+    from middlewared.service import Service
+
 
 logger = logging.getLogger(__name__)
 
@@ -10,19 +19,24 @@ __all__ = ["MethodNotFoundError", "ServiceCallMixin"]
 
 
 class MethodNotFoundError(CallError):
-    def __init__(self, method_name, service):
+    def __init__(self, method_name: str, service: str):
+        self.method_name = method_name
+        self.service = service
         super().__init__(f'Method {method_name!r} not found in {service!r}', CallError.ENOMETHOD)
+
+    def __reduce__(self) -> tuple[type[MethodNotFoundError], tuple[str, str]]:
+        return (type(self), (self.method_name, self.service))
 
 
 class ServiceCallMixin:
-    def _method_lookup(self, name):
+    def get_method(self, name: str) -> tuple[Service, MethodType]:
         if '.' not in name:
             raise CallError('Invalid method name', errno.EBADMSG)
 
         service, method_name = name.rsplit('.', 1)
 
         try:
-            serviceobj = self.get_service(service)
+            serviceobj = self.get_service(service)  # type: ignore[attr-defined]
         except KeyError:
             raise CallError(f'Service {service!r} not found', CallError.ENOMETHOD)
 

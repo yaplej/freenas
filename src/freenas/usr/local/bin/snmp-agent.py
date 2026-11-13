@@ -1,67 +1,40 @@
 #!/usr/bin/env python3
-from collections import defaultdict
-import copy
-from datetime import datetime, timedelta
-from decimal import Decimal
 import threading
 import time
 
-import libzfs
+import truenas_pylibzfs
+from truenas_pylibzfs import kstat
 import netsnmpagent
-import pysnmp.hlapi  # noqa
-import pysnmp.smi
 
-from middlewared.client import Client
-
-
-def get_Kstat():
-    Kstat = {}
-
-    with open("/proc/spl/kstat/zfs/arcstats") as f:
-        for lineno, line in enumerate(f, start=1):
-            if lineno > 2 and (info := line.strip()):
-                name, _, data = info.split()
-                Kstat[f"kstat.zfs.misc.arcstats.{name}"] = Decimal(int(data))
-
-    Kstat["vfs.zfs.version.spa"] = Decimal(5000)
-
-    return Kstat
+from truenas_api_client import Client
+from middlewared.utils.disk_temperatures import get_disks_temperatures_for_snmp
 
 
-def get_arc_efficiency(Kstat):
+def get_arcstats():
+    try:
+        return kstat.get_arcstats()
+    except Exception:
+        return None
+
+
+def get_arc_efficiency(arcstats):
     output = {}
+    arc_hits = arcstats.hits
+    arc_misses = arcstats.misses
+    demand_data_hits = arcstats.demand_data_hits
+    demand_data_misses = arcstats.demand_data_misses
+    demand_metadata_hits = arcstats.demand_metadata_hits
+    demand_metadata_misses = arcstats.demand_metadata_misses
+    mfu_ghost_hits = arcstats.mfu_ghost_hits
+    mfu_hits = arcstats.mfu_hits
+    mru_ghost_hits = arcstats.mru_ghost_hits
+    mru_hits = arcstats.mru_hits
+    prefetch_data_hits = arcstats.prefetch_data_hits
+    prefetch_data_misses = arcstats.prefetch_data_misses
+    prefetch_metadata_hits = arcstats.prefetch_metadata_hits
+    prefetch_metadata_misses = arcstats.prefetch_metadata_misses
 
-    if "vfs.zfs.version.spa" not in Kstat:
-        return
-
-    arc_hits = Kstat["kstat.zfs.misc.arcstats.hits"]
-    arc_misses = Kstat["kstat.zfs.misc.arcstats.misses"]
-    demand_data_hits = Kstat["kstat.zfs.misc.arcstats.demand_data_hits"]
-    demand_data_misses = Kstat["kstat.zfs.misc.arcstats.demand_data_misses"]
-    demand_metadata_hits = Kstat[
-        "kstat.zfs.misc.arcstats.demand_metadata_hits"
-    ]
-    demand_metadata_misses = Kstat[
-        "kstat.zfs.misc.arcstats.demand_metadata_misses"
-    ]
-    mfu_ghost_hits = Kstat["kstat.zfs.misc.arcstats.mfu_ghost_hits"]
-    mfu_hits = Kstat["kstat.zfs.misc.arcstats.mfu_hits"]
-    mru_ghost_hits = Kstat["kstat.zfs.misc.arcstats.mru_ghost_hits"]
-    mru_hits = Kstat["kstat.zfs.misc.arcstats.mru_hits"]
-    prefetch_data_hits = Kstat["kstat.zfs.misc.arcstats.prefetch_data_hits"]
-    prefetch_data_misses = Kstat[
-        "kstat.zfs.misc.arcstats.prefetch_data_misses"
-    ]
-    prefetch_metadata_hits = Kstat[
-        "kstat.zfs.misc.arcstats.prefetch_metadata_hits"
-    ]
-    prefetch_metadata_misses = Kstat[
-        "kstat.zfs.misc.arcstats.prefetch_metadata_misses"
-    ]
-
-    anon_hits = arc_hits - (
-        mfu_hits + mru_hits + mfu_ghost_hits + mru_ghost_hits
-    )
+    anon_hits = arc_hits - (mfu_hits + mru_hits + mfu_ghost_hits + mru_ghost_hits)
     arc_accesses_total = (arc_hits + arc_misses)
     demand_data_total = (demand_data_hits + demand_data_misses)
     prefetch_data_total = (prefetch_data_hits + prefetch_data_misses)
@@ -193,21 +166,9 @@ def fPerc(lVal=0, rVal=0, Decimal=2):
         return str("%0." + str(Decimal) + "f") % 100 + "%"
 
 
-def calculate_allocation_units(*args):
-    allocation_units = 4096
-    while True:
-        values = tuple(map(lambda arg: int(arg / allocation_units), args))
-        if all(v < 2 ** 31 for v in values):
-            break
-
-        allocation_units *= 2
-
-    return allocation_units, values
-
-
-def get_zfs_arc_miss_percent(kstat):
-    arc_hits = kstat["kstat.zfs.misc.arcstats.hits"]
-    arc_misses = kstat["kstat.zfs.misc.arcstats.misses"]
+def get_zfs_arc_miss_percent(arcstats):
+    arc_hits = arcstats.hits
+    arc_misses = arcstats.misses
     arc_read = arc_hits + arc_misses
     if arc_read > 0:
         hit_percent = float(100 * arc_hits / arc_read)
@@ -216,79 +177,55 @@ def get_zfs_arc_miss_percent(kstat):
     return 0
 
 
-mib_builder = pysnmp.smi.builder.MibBuilder()
-mib_sources = mib_builder.getMibSources() + (pysnmp.smi.builder.DirMibSource("/usr/local/share/pysnmp/mibs"),)
-mib_builder.setMibSources(*mib_sources)
-mib_builder.loadModules("FREENAS-MIB")
-mib_builder.loadModules("LM-SENSORS-MIB")
-zpool_health_type = mib_builder.importSymbols("FREENAS-MIB", "ZPoolHealthType")[0]
-
 agent = netsnmpagent.netsnmpAgent(
-    AgentName="FreeNASAgent",
-    MIBFiles=[
-        "/usr/local/share/snmp/mibs/FREENAS-MIB.txt", "/usr/local/share/snmp/mibs/LM-SENSORS-MIB.txt"
-    ],
+    AgentName="TrueNASAgent",
+    MIBFiles=["/usr/local/share/snmp/mibs/TRUENAS-MIB.txt"],
 )
 
 zpool_table = agent.Table(
-    oidstr="FREENAS-MIB::zpoolTable",
-    indexes=[
-        agent.Integer32()
-    ],
+    oidstr="TRUENAS-MIB::zpoolTable",
+    indexes=[agent.Integer32()],
     columns=[
         (1, agent.Integer32()),
         (2, agent.DisplayString()),
-        (3, agent.Integer32()),
-        (4, agent.Integer32()),
-        (5, agent.Integer32()),
-        (6, agent.Integer32()),
-        (7, agent.Integer32()),
+        (3, agent.DisplayString()),
+        (4, agent.Counter64()),
+        (5, agent.Counter64()),
+        (6, agent.Counter64()),
+        (7, agent.Counter64()),
         (8, agent.Counter64()),
         (9, agent.Counter64()),
         (10, agent.Counter64()),
         (11, agent.Counter64()),
-        (12, agent.Counter64()),
-        (13, agent.Counter64()),
-        (14, agent.Counter64()),
-        (15, agent.Counter64()),
-    ],
-)
-
-dataset_table = agent.Table(
-    oidstr="FREENAS-MIB::datasetTable",
-    indexes=[
-        agent.Integer32()
-    ],
-    columns=[
-        (1, agent.Integer32()),
-        (2, agent.DisplayString()),
-        (3, agent.Integer32()),
-        (4, agent.Integer32()),
-        (5, agent.Integer32()),
-        (6, agent.Integer32()),
     ],
 )
 
 zvol_table = agent.Table(
-    oidstr="FREENAS-MIB::zvolTable",
-    indexes=[
-        agent.Integer32()
-    ],
+    oidstr="TRUENAS-MIB::zvolTable",
+    indexes=[agent.Integer32()],
     columns=[
         (1, agent.Integer32()),
         (2, agent.DisplayString()),
-        (3, agent.Integer32()),
-        (4, agent.Integer32()),
-        (5, agent.Integer32()),
-        (6, agent.Integer32()),
-        (7, agent.Integer32()),
+        (3, agent.Counter64()),
+        (4, agent.Counter64()),
+        (5, agent.Counter64()),
     ],
 )
 
-lm_sensors_table = None
+dataset_table = agent.Table(
+    oidstr="TRUENAS-MIB::datasetTable",
+    indexes=[agent.Integer32()],
+    columns=[
+        (1, agent.Integer32()),
+        (2, agent.DisplayString()),
+        (3, agent.Counter64()),
+        (4, agent.Counter64()),
+        (5, agent.Counter64()),
+    ],
+)
 
 hdd_temp_table = agent.Table(
-    oidstr="FREENAS-MIB::hddTempTable",
+    oidstr="TRUENAS-MIB::hddTempTable",
     indexes=[
         agent.Integer32(),
     ],
@@ -298,74 +235,30 @@ hdd_temp_table = agent.Table(
     ]
 )
 
-zfs_arc_size = agent.Unsigned32(oidstr="FREENAS-MIB::zfsArcSize")
-zfs_arc_meta = agent.Unsigned32(oidstr="FREENAS-MIB::zfsArcMeta")
-zfs_arc_data = agent.Unsigned32(oidstr="FREENAS-MIB::zfsArcData")
-zfs_arc_hits = agent.Unsigned32(oidstr="FREENAS-MIB::zfsArcHits")
-zfs_arc_misses = agent.Unsigned32(oidstr="FREENAS-MIB::zfsArcMisses")
-zfs_arc_c = agent.Unsigned32(oidstr="FREENAS-MIB::zfsArcC")
-zfs_arc_p = agent.Unsigned32(oidstr="FREENAS-MIB::zfsArcP")
-zfs_arc_miss_percent = agent.DisplayString(oidstr="FREENAS-MIB::zfsArcMissPercent")
-zfs_arc_cache_hit_ratio = agent.DisplayString(oidstr="FREENAS-MIB::zfsArcCacheHitRatio")
-zfs_arc_cache_miss_ratio = agent.DisplayString(oidstr="FREENAS-MIB::zfsArcCacheMissRatio")
+zfs_arc_size = agent.Unsigned32(oidstr="TRUENAS-MIB::zfsArcSize")
+zfs_arc_meta = agent.Unsigned32(oidstr="TRUENAS-MIB::zfsArcMeta")
+zfs_arc_data = agent.Unsigned32(oidstr="TRUENAS-MIB::zfsArcData")
+zfs_arc_hits = agent.Unsigned32(oidstr="TRUENAS-MIB::zfsArcHits")
+zfs_arc_misses = agent.Unsigned32(oidstr="TRUENAS-MIB::zfsArcMisses")
+zfs_arc_c = agent.Unsigned32(oidstr="TRUENAS-MIB::zfsArcC")
+zfs_arc_miss_percent = agent.DisplayString(oidstr="TRUENAS-MIB::zfsArcMissPercent")
+zfs_arc_cache_hit_ratio = agent.DisplayString(oidstr="TRUENAS-MIB::zfsArcCacheHitRatio")
+zfs_arc_cache_miss_ratio = agent.DisplayString(oidstr="TRUENAS-MIB::zfsArcCacheMissRatio")
 
-zfs_l2arc_hits = agent.Counter32(oidstr="FREENAS-MIB::zfsL2ArcHits")
-zfs_l2arc_misses = agent.Counter32(oidstr="FREENAS-MIB::zfsL2ArcMisses")
-zfs_l2arc_read = agent.Counter32(oidstr="FREENAS-MIB::zfsL2ArcRead")
-zfs_l2arc_write = agent.Counter32(oidstr="FREENAS-MIB::zfsL2ArcWrite")
-zfs_l2arc_size = agent.Unsigned32(oidstr="FREENAS-MIB::zfsL2ArcSize")
+zfs_l2arc_hits = agent.Counter32(oidstr="TRUENAS-MIB::zfsL2ArcHits")
+zfs_l2arc_misses = agent.Counter32(oidstr="TRUENAS-MIB::zfsL2ArcMisses")
+zfs_l2arc_read = agent.Counter32(oidstr="TRUENAS-MIB::zfsL2ArcRead")
+zfs_l2arc_write = agent.Counter32(oidstr="TRUENAS-MIB::zfsL2ArcWrite")
+zfs_l2arc_size = agent.Unsigned32(oidstr="TRUENAS-MIB::zfsL2ArcSize")
 
-zfs_zilstat_ops1 = agent.Counter64(oidstr="FREENAS-MIB::zfsZilstatOps1sec")
-zfs_zilstat_ops5 = agent.Counter64(oidstr="FREENAS-MIB::zfsZilstatOps5sec")
-zfs_zilstat_ops10 = agent.Counter64(oidstr="FREENAS-MIB::zfsZilstatOps10sec")
-
-
-class ZpoolIoThread(threading.Thread):
-    def __init__(self):
-        super().__init__()
-
-        self.daemon = True
-
-        self.stop_event = threading.Event()
-
-        self.lock = threading.Lock()
-        self.values_overall = defaultdict(lambda: defaultdict(lambda: 0))
-        self.values_1s = defaultdict(lambda: defaultdict(lambda: 0))
-
-    def run(self):
-        zfs = libzfs.ZFS()
-        while not self.stop_event.wait(1.0):
-            with self.lock:
-                previous_values = copy.deepcopy(self.values_overall)
-
-                for pool in zfs.pools:
-                    self.values_overall[pool.name] = {
-                        "read_ops": pool.root_vdev.stats.ops[libzfs.ZIOType.READ],
-                        "write_ops": pool.root_vdev.stats.ops[libzfs.ZIOType.WRITE],
-                        "read_bytes": pool.root_vdev.stats.bytes[libzfs.ZIOType.READ],
-                        "write_bytes": pool.root_vdev.stats.bytes[libzfs.ZIOType.WRITE],
-                    }
-
-                    if pool.name in previous_values:
-                        for k in ["read_ops", "write_ops", "read_bytes", "write_bytes"]:
-                            self.values_1s[pool.name][k] = (
-                                self.values_overall[pool.name][k] -
-                                previous_values[pool.name][k]
-                            )
-
-    def get_values(self):
-        with self.lock:
-            return copy.deepcopy(self.values_overall), copy.deepcopy(self.values_1s)
+zfs_zilstat_ops1 = agent.Counter64(oidstr="TRUENAS-MIB::zfsZilstatOps1sec")
+zfs_zilstat_ops5 = agent.Counter64(oidstr="TRUENAS-MIB::zfsZilstatOps5sec")
+zfs_zilstat_ops10 = agent.Counter64(oidstr="TRUENAS-MIB::zfsZilstatOps10sec")
 
 
 def readZilOpsCount() -> int:
-    total = 0
-    with open("/proc/spl/kstat/zfs/zil") as f:
-        for line in f:
-            var, _size, val, *_ = line.split()
-            if var in ("zil_itx_metaslab_normal_count", "zil_itx_metaslab_slog_count"):
-                total += int(val)
-    return total
+    zilstats = kstat.get_zilstats()
+    return zilstats.zil_itx_metaslab_normal_count + zilstats.zil_itx_metaslab_slog_count
 
 
 class ZilstatThread(threading.Thread):
@@ -386,11 +279,6 @@ class ZilstatThread(threading.Thread):
             previous = current
 
 
-class CpuTempThread(threading.Thread):
-    # TODO: Linux implementation
-    pass
-
-
 class DiskTempThread(threading.Thread):
     def __init__(self, interval):
         super().__init__()
@@ -400,176 +288,158 @@ class DiskTempThread(threading.Thread):
         self.interval = interval
         self.temperatures = {}
 
-        self.initialized = False
-        self.disks = []
-        self.powermode = None
-
     def run(self):
         while True:
-            if not self.initialized:
-                try:
-                    with Client() as c:
-                        self.disks = c.call("disk.disks_for_temperature_monitoring")
-                        self.powermode = c.call("smart.config")["powermode"]
-                except Exception as e:
-                    print(f"Failed to query disks for temperature monitoring: {e!r}")
-                else:
-                    self.initialized = True
-
-            if not self.initialized:
-                time.sleep(self.interval)
-                continue
-
-            if not self.disks:
-                return
-
             try:
                 with Client() as c:
-                    self.temperatures = {
-                        disk: temperature * 1000
-                        for disk, temperature in c.call("disk.temperatures", self.disks, self.powermode).items()
-                        if temperature is not None
-                    }
+                    netdata_metrics = c.call('netdata.get_all_metrics')
             except Exception as e:
-                print(f"Failed to collect disks temperatures: {e!r}")
+                print(f"Failed to query netdata metrics: {e!r}")
                 self.temperatures = {}
+            else:
+                self.temperatures = get_disks_temperatures_for_snmp(netdata_metrics)
 
             time.sleep(self.interval)
 
 
+def gather_zpool_iostat_info(prev_data, name, pool_status):
+    r_ops = w_ops = r_bytes = w_bytes = 0
+    for v in pool_status.storage_vdevs:
+        if v.stats is not None:
+            r_ops += v.stats.ops_read
+            w_ops += v.stats.ops_write
+            r_bytes += v.stats.bytes_read
+            w_bytes += v.stats.bytes_write
+
+    # the current values as reported by libzfs
+    values_overall = {name: {
+        "read_ops": r_ops,
+        "write_ops": w_ops,
+        "read_bytes": r_bytes,
+        "write_bytes": w_bytes,
+    }}
+
+    values_1s = {name: {"read_ops": 0, "write_ops": 0, "read_bytes": 0, "write_bytes": 0}}
+    for key in prev_data.get(name, ()):
+        values_1s[name][key] = (values_overall[name][key] - prev_data[name][key])
+
+    return values_overall, values_1s
+
+
+def fill_in_zpool_snmp_row_info(idx, name, health, io_overall, io_1s):
+    row = zpool_table.addRow([agent.Integer32(idx)])
+    row.setRowCell(1, agent.Integer32(idx))
+    row.setRowCell(2, agent.DisplayString(name))
+    row.setRowCell(3, agent.DisplayString(health))
+    row.setRowCell(4, agent.Counter64(io_overall[name]["read_ops"]))
+    row.setRowCell(5, agent.Counter64(io_overall[name]["write_ops"]))
+    row.setRowCell(6, agent.Counter64(io_overall[name]["read_bytes"]))
+    row.setRowCell(7, agent.Counter64(io_overall[name]["write_bytes"]))
+    row.setRowCell(8, agent.Counter64(io_1s[name]["read_ops"]))
+    row.setRowCell(9, agent.Counter64(io_1s[name]["write_ops"]))
+    row.setRowCell(10, agent.Counter64(io_1s[name]["read_bytes"]))
+    row.setRowCell(11, agent.Counter64(io_1s[name]["write_bytes"]))
+
+
+def fill_in_zvol_snmp_row_info(idx, name, props):
+    row = zvol_table.addRow([agent.Integer32(idx)])
+    row.setRowCell(1, agent.Integer32(idx))
+    row.setRowCell(2, agent.DisplayString(name))
+    row.setRowCell(3, agent.Counter64(props.used.value))
+    row.setRowCell(4, agent.Counter64(props.available.value))
+    row.setRowCell(5, agent.Counter64(props.referenced.value))
+
+
+def fill_in_dataset_snmp_row_info(idx, name, props):
+    row = dataset_table.addRow([agent.Integer32(idx)])
+    row.setRowCell(1, agent.Integer32(idx))
+    row.setRowCell(2, agent.DisplayString(name))
+    row.setRowCell(3, agent.Counter64(props.used.value))
+    row.setRowCell(4, agent.Counter64(props.available.value))
+    row.setRowCell(5, agent.Counter64(props.referenced.value))
+
+
+def collect_dataset_info(hdl, state):
+    try:
+        props = hdl.get_properties(properties=state["zfs_props"])
+    except truenas_pylibzfs.ZFSException:
+        pass
+    else:
+        state["dataset_idx"] += 1
+        fill_in_dataset_snmp_row_info(state["dataset_idx"], hdl.name, props)
+        if hdl.type == truenas_pylibzfs.ZFSType.ZFS_TYPE_VOLUME:
+            state["zvol_idx"] += 1
+            fill_in_zvol_snmp_row_info(state["zvol_idx"], hdl.name, props)
+
+    hdl.iter_filesystems(callback=collect_dataset_info, state=state)
+    return True
+
+
+def collect_zfs_info(pool, state):
+    state["pool_idx"] += 1
+    idx = state["pool_idx"]
+    name = pool.name
+
+    health = pool.get_properties(
+        properties={truenas_pylibzfs.ZPOOLProperty.HEALTH}
+    ).health.value
+    pool_status = pool.status(get_stats=True)
+    io_overall, io_1s = gather_zpool_iostat_info(state["prev_zpool_info"], name, pool_status)
+    fill_in_zpool_snmp_row_info(idx, name, health, io_overall, io_1s)
+    # be sure and update our zpool io data so next time it's called
+    # we calculate the 1sec values properly
+    state["prev_zpool_info"].update(io_overall)
+
+    collect_dataset_info(pool.root_dataset(), state)
+    return True
+
+
+def report_zfs_info(prev_zpool_info):
+    zpool_table.clear()
+    zvol_table.clear()
+    dataset_table.clear()
+
+    lz = truenas_pylibzfs.open_handle()
+    state = {
+        "prev_zpool_info": prev_zpool_info,
+        "pool_idx": 0,
+        "zvol_idx": 0,
+        "dataset_idx": 0,
+        "zfs_props": {
+            truenas_pylibzfs.ZFSProperty.USED,
+            truenas_pylibzfs.ZFSProperty.AVAILABLE,
+            truenas_pylibzfs.ZFSProperty.REFERENCED,
+        },
+    }
+    lz.iter_pools(callback=collect_zfs_info, state=state)
+
+
 if __name__ == "__main__":
+    zilstat_1_thread = zilstat_5_thread = zilstat_10_thread = None
     with Client() as c:
-        config = c.call("snmp.config")
+        if c.call("snmp.config")["zilstat"]:
+            zilstat_1_thread = ZilstatThread(1)
+            zilstat_5_thread = ZilstatThread(5)
+            zilstat_10_thread = ZilstatThread(10)
 
-    zfs = libzfs.ZFS()
+            zilstat_1_thread.start()
+            zilstat_5_thread.start()
+            zilstat_10_thread.start()
 
-    zpool_io_thread = ZpoolIoThread()
-    zpool_io_thread.start()
-
-    zilstat_1_thread = None
-    zilstat_5_thread = None
-    zilstat_10_thread = None
-
-    if config["zilstat"]:
-        zilstat_1_thread = ZilstatThread(1)
-        zilstat_5_thread = ZilstatThread(5)
-        zilstat_10_thread = ZilstatThread(10)
-
-        zilstat_1_thread.start()
-        zilstat_5_thread.start()
-        zilstat_10_thread.start()
-
-    # TODO: Linux implementation
-    cpu_temp_thread = None
-
-    disk_temp_thread = DiskTempThread(300)
+    # Netdata's disk plugin updates every 5 minutes.
+    # Increase the timeout to ensure values are refreshed after the plugin interval.
+    disk_temp_thread = DiskTempThread(310)
     disk_temp_thread.start()
 
     agent.start()
 
-    last_update_at = datetime.min
+    prev_zpool_info = {}
+    last_update_at = int(time.monotonic())
     while True:
         agent.check_and_process()
 
-        if datetime.utcnow() - last_update_at > timedelta(seconds=1):
-            zpool_io_overall, zpool_io_1sec = zpool_io_thread.get_values()
-
-            datasets = []
-            zvols = []
-            zpool_table.clear()
-            for i, zpool in enumerate(zfs.pools):
-                row = zpool_table.addRow([agent.Integer32(i + 1)])
-                row.setRowCell(1, agent.Integer32(i + 1))
-                row.setRowCell(2, agent.DisplayString(zpool.properties["name"].value))
-                try:
-                    allocation_units, \
-                        (
-                            size,
-                            used,
-                            available
-                        ) = calculate_allocation_units(
-                            int(zpool.properties["size"].rawvalue),
-                            int(zpool.properties["allocated"].rawvalue),
-                            int(zpool.properties["free"].rawvalue),
-                        )
-                except ValueError:
-                    allocation_units = 4096
-                    size = used = available = 0
-                row.setRowCell(3, agent.Integer32(allocation_units))
-                row.setRowCell(4, agent.Integer32(size))
-                row.setRowCell(5, agent.Integer32(used))
-                row.setRowCell(6, agent.Integer32(available))
-                row.setRowCell(7, agent.Integer32(zpool_health_type.namedValues.getValue(
-                    zpool.properties["health"].value.lower())))
-                row.setRowCell(8, agent.Counter64(zpool_io_overall[zpool.name]["read_ops"]))
-                row.setRowCell(9, agent.Counter64(zpool_io_overall[zpool.name]["write_ops"]))
-                row.setRowCell(10, agent.Counter64(zpool_io_overall[zpool.name]["read_bytes"]))
-                row.setRowCell(11, agent.Counter64(zpool_io_overall[zpool.name]["write_bytes"]))
-                row.setRowCell(12, agent.Counter64(zpool_io_1sec[zpool.name]["read_ops"]))
-                row.setRowCell(13, agent.Counter64(zpool_io_1sec[zpool.name]["write_ops"]))
-                row.setRowCell(14, agent.Counter64(zpool_io_1sec[zpool.name]["read_bytes"]))
-                row.setRowCell(15, agent.Counter64(zpool_io_1sec[zpool.name]["write_bytes"]))
-
-                for dataset in zpool.root_dataset.children_recursive:
-                    if dataset.type == libzfs.DatasetType.FILESYSTEM:
-                        datasets.append(dataset)
-                    if dataset.type == libzfs.DatasetType.VOLUME:
-                        zvols.append(dataset)
-
-            dataset_table.clear()
-            for i, dataset in enumerate(datasets):
-                row = dataset_table.addRow([agent.Integer32(i + 1)])
-                row.setRowCell(1, agent.Integer32(i + 1))
-                row.setRowCell(2, agent.DisplayString(dataset.properties["name"].value))
-                allocation_units, (
-                    size,
-                    used,
-                    available
-                ) = calculate_allocation_units(
-                    int(dataset.properties["used"].rawvalue) + int(dataset.properties["available"].rawvalue),
-                    int(dataset.properties["used"].rawvalue),
-                    int(dataset.properties["available"].rawvalue),
-                )
-                row.setRowCell(3, agent.Integer32(allocation_units))
-                row.setRowCell(4, agent.Integer32(size))
-                row.setRowCell(5, agent.Integer32(used))
-                row.setRowCell(6, agent.Integer32(available))
-
-            zvol_table.clear()
-            for i, zvol in enumerate(zvols):
-                row = zvol_table.addRow([agent.Integer32(i + 1)])
-                row.setRowCell(1, agent.Integer32(i + 1))
-                row.setRowCell(2, agent.DisplayString(zvol.properties["name"].value))
-                allocation_units, (
-                    volsize,
-                    used,
-                    available,
-                    referenced
-                ) = calculate_allocation_units(
-                    int(zvol.properties["volsize"].rawvalue),
-                    int(zvol.properties["used"].rawvalue),
-                    int(zvol.properties["available"].rawvalue),
-                    int(zvol.properties["referenced"].rawvalue),
-                )
-                row.setRowCell(3, agent.Integer32(allocation_units))
-                row.setRowCell(4, agent.Integer32(volsize))
-                row.setRowCell(5, agent.Integer32(used))
-                row.setRowCell(6, agent.Integer32(available))
-                row.setRowCell(7, agent.Integer32(referenced))
-
-            if lm_sensors_table:
-                lm_sensors_table.clear()
-                temperatures = []
-                if cpu_temp_thread:
-                    for i, temp in enumerate(cpu_temp_thread.temperatures.copy()):
-                        temperatures.append((f"CPU{i}", temp))
-                if disk_temp_thread:
-                    temperatures.extend(list(disk_temp_thread.temperatures.items()))
-                for i, (name, temp) in enumerate(temperatures):
-                    row = lm_sensors_table.addRow([agent.Integer32(i + 1)])
-                    row.setRowCell(1, agent.Integer32(i + 1))
-                    row.setRowCell(2, agent.DisplayString(name))
-                    row.setRowCell(3, agent.Unsigned32(temp))
+        if int(time.monotonic()) - last_update_at > 1:
+            report_zfs_info(prev_zpool_info)
 
             if hdd_temp_table:
                 hdd_temp_table.clear()
@@ -579,25 +449,28 @@ if __name__ == "__main__":
                         row.setRowCell(2, agent.DisplayString(name))
                         row.setRowCell(3, agent.Unsigned32(temp))
 
-            kstat = get_Kstat()
-            arc_efficiency = get_arc_efficiency(kstat)
+            arcstats = get_arcstats()
+            if arcstats is None:
+                last_update_at = int(time.monotonic())
+                continue
 
-            zfs_arc_size.update(kstat["kstat.zfs.misc.arcstats.size"] / 1024)
-            zfs_arc_meta.update(kstat["kstat.zfs.misc.arcstats.arc_meta_used"] / 1024)
-            zfs_arc_data.update(kstat["kstat.zfs.misc.arcstats.data_size"] / 1024)
-            zfs_arc_hits.update(kstat["kstat.zfs.misc.arcstats.hits"] % 2 ** 32)
-            zfs_arc_misses.update(kstat["kstat.zfs.misc.arcstats.misses"] % 2 ** 32)
-            zfs_arc_c.update(kstat["kstat.zfs.misc.arcstats.c"] / 1024)
-            zfs_arc_p.update(kstat["kstat.zfs.misc.arcstats.p"] / 1024)
-            zfs_arc_miss_percent.update(str(get_zfs_arc_miss_percent(kstat)).encode("ascii"))
+            arc_efficiency = get_arc_efficiency(arcstats)
+
+            zfs_arc_size.update(arcstats.size // 1024)
+            zfs_arc_meta.update(arcstats.arc_meta_used // 1024)
+            zfs_arc_data.update(arcstats.data_size // 1024)
+            zfs_arc_hits.update(int(arcstats.hits % 2 ** 32))
+            zfs_arc_misses.update(int(arcstats.misses % 2 ** 32))
+            zfs_arc_c.update(arcstats.c // 1024)
+            zfs_arc_miss_percent.update(str(get_zfs_arc_miss_percent(arcstats)).encode("ascii"))
             zfs_arc_cache_hit_ratio.update(str(arc_efficiency["cache_hit_ratio"]["per"][:-1]).encode("ascii"))
             zfs_arc_cache_miss_ratio.update(str(arc_efficiency["cache_miss_ratio"]["per"][:-1]).encode("ascii"))
 
-            zfs_l2arc_hits.update(int(kstat["kstat.zfs.misc.arcstats.l2_hits"] % 2 ** 32))
-            zfs_l2arc_misses.update(int(kstat["kstat.zfs.misc.arcstats.l2_misses"] % 2 ** 32))
-            zfs_l2arc_read.update(int(kstat["kstat.zfs.misc.arcstats.l2_read_bytes"] / 1024 % 2 ** 32))
-            zfs_l2arc_write.update(int(kstat["kstat.zfs.misc.arcstats.l2_write_bytes"] / 1024 % 2 ** 32))
-            zfs_l2arc_size.update(int(kstat["kstat.zfs.misc.arcstats.l2_asize"] / 1024))
+            zfs_l2arc_hits.update(int(arcstats.l2_hits % 2 ** 32))
+            zfs_l2arc_misses.update(int(arcstats.l2_misses % 2 ** 32))
+            zfs_l2arc_read.update(arcstats.l2_read_bytes // 1024 % 2 ** 32)
+            zfs_l2arc_write.update(arcstats.l2_write_bytes // 1024 % 2 ** 32)
+            zfs_l2arc_size.update(arcstats.l2_asize // 1024)
 
             if zilstat_1_thread:
                 zfs_zilstat_ops1.update(zilstat_1_thread.value)
@@ -606,4 +479,4 @@ if __name__ == "__main__":
             if zilstat_10_thread:
                 zfs_zilstat_ops10.update(zilstat_10_thread.value)
 
-            last_update_at = datetime.utcnow()
+            last_update_at = int(time.monotonic())

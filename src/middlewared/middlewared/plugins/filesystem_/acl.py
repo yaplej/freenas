@@ -1,0 +1,1052 @@
+import errno
+import os
+from pathlib import Path
+from typing import Literal
+
+from pydantic import Field
+import truenas_os
+from truenas_os_pyutils.mount import iter_mountinfo, statmount
+
+from middlewared.api import api_method
+from middlewared.api.base import BaseModel, NonEmptyString, single_argument_args
+from middlewared.api.current import (
+    NFS4ACE,
+    POSIXACE,
+    FilesystemChownArgs,
+    FilesystemChownResult,
+    FilesystemGetaclArgs,
+    FilesystemGetaclResult,
+    FilesystemSetaclArgs,
+    FilesystemSetAclOptions,
+    FilesystemSetaclResult,
+    FilesystemSetpermArgs,
+    FilesystemSetpermResult,
+    QueryOptions,
+)
+from middlewared.plugins.zfs.utils import has_internal_path
+from middlewared.service import Service, ValidationErrors, job, private
+from middlewared.service_exception import CallError, MatchNotFound, ValidationError
+from middlewared.utils.filesystem.acl import (
+    ACL_UNDEFINED_ID,
+    FS_ACL_Type,
+    NFS4ACE_MaskSimple,
+    NFS4ACE_Tag,
+    POSIXACE_Tag,
+    nfs4acl_dict_to_obj,
+    nfs4acl_obj_to_dict,
+    normalize_acl_ids,
+    path_get_acltype,
+    posixacl_dict_to_obj,
+    posixacl_obj_to_dict,
+    strip_acl_path,
+)
+from middlewared.utils.filesystem.directory import directory_is_empty
+from middlewared.utils.path import FSLocation, path_location
+
+from .utils import (
+    AclTool,
+    AclToolAction,
+    ATAclOptions,
+    ATChownOptions,
+    ATPermOptions,
+    calculate_inherited_acl,
+)
+
+
+class SimplifiedAclEntry(BaseModel):
+    id_type: Literal[NFS4ACE_Tag.USER, NFS4ACE_Tag.GROUP]
+    id: int
+    access: Literal[
+        NFS4ACE_MaskSimple.READ,
+        NFS4ACE_MaskSimple.MODIFY,
+        NFS4ACE_MaskSimple.FULL_CONTROL
+    ]
+
+
+class FilesystemAddToAclOptions(BaseModel):
+    force: bool = False
+
+
+@single_argument_args('add_to_acl')
+class FilesystemAddToAclArgs(BaseModel):
+    path: NonEmptyString
+    entries: list[SimplifiedAclEntry]
+    options: FilesystemAddToAclOptions = Field(default=FilesystemAddToAclOptions())
+
+
+class FilesystemAddToAclResult(BaseModel):
+    result: bool
+
+
+class FSGetInheritedAclOptions(BaseModel):
+    directory: bool = True
+
+
+@single_argument_args('calculate_inherited_acl')
+class FilesystemGetInheritedAclArgs(BaseModel):
+    path: NonEmptyString
+    options: FSGetInheritedAclOptions = Field(default=FSGetInheritedAclOptions())
+
+
+class FilesystemGetInheritedAclResult(BaseModel):
+    result: list[NFS4ACE] | list[POSIXACE]
+
+
+class FilesystemService(Service):
+
+    class Config:
+        cli_private = True
+
+    def _common_perm_path_validate(self, schema, data, verrors, pool_mp_ok=False, internal_ok=False):
+        loc = path_location(data['path'])
+        if loc is FSLocation.EXTERNAL:
+            verrors.add(f'{schema}.path', 'ACL operations on remote server paths are not possible')
+            return loc
+
+        path = data['path']
+
+        try:
+            st = self.middleware.call_sync('filesystem.stat', path)
+        except CallError as e:
+            if e.errno == errno.EINVAL:
+                verrors.add('f{schema}.path', 'Must be an absolute path')
+                return loc
+
+            raise e
+
+        if st.type == 'FILE' and data['options']['recursive']:
+            verrors.add(f'{schema}.path', 'Recursive operations on a file are invalid.')
+            return loc
+
+        if data['options'].get('traverse') and not data['options'].get('recursive'):
+            verrors.add(
+                f'{schema}.options.traverse',
+                'Traverse requires recursive to be enabled.'
+            )
+
+        if st.is_ctldir:
+            verrors.add(f'{schema}.path',
+                        'Permissions changes in ZFS control directory (.zfs) are not permitted')
+            return loc
+
+        if any(st.realpath.startswith(prefix)
+               for prefix in ('/home/admin/.ssh', '/home/truenas_admin/.ssh', '/root/.ssh')):
+            return loc
+
+        if not st.realpath.startswith('/mnt/'):
+            verrors.add(
+                f'{schema}.path',
+                "Changes to permissions on paths that are not beneath "
+                f"the directory /mnt are not permitted: {path}"
+            )
+
+        elif not internal_ok and has_internal_path(self.middleware.call_sync('filesystem.statfs', st.realpath).source):
+            verrors.add(
+                f'{schema}.path',
+                f'Changes to permissions on paths managed by the system are not permitted: {path}'
+            )
+
+        elif len(Path(st.realpath).resolve().parents) == 2:
+            if not pool_mp_ok:
+                verrors.add(
+                    f'{schema}.path',
+                    f'The specified path is a ZFS pool mountpoint "({path})" '
+                )
+
+        elif self.call_sync2(self.s.zfs.resource.path_is_locked, st.realpath):
+            verrors.add(
+                f'{schema}.path',
+                'Path component is currently encrypted and locked'
+            )
+        else:
+            statfs_flags = self.middleware.call_sync('filesystem.statfs', path).flags
+            if 'RO' in statfs_flags:
+                verrors.add(
+                    f'{schema}.path',
+                    f'{path}: dataset underlying path has the readonly property enabled.'
+                )
+
+            if data['options'].get('recursive'):
+                self._validate_s3_bucket_recursion(schema, st, data['options'].get('traverse'), verrors)
+
+        return loc
+
+    def _validate_s3_bucket_recursion(self, schema, st, traverse, verrors):
+        """
+        Refuse a recursive permissions change that would cover an S3 bucket: the target is a bucket dataset's
+        mount point, a traverse from above would enter one, or the target is inside a bucket but outside
+        ``s3data``. Administrators manage only ``s3data``; the rest of the dataset belongs to the S3 service.
+        ``DATASET`` buckets are not checked.
+        """
+        path = os.path.realpath(st.realpath)
+        bucket = self.call_sync2(self.s.sharing.s3.bucket_of_path, path)
+        if bucket is not None and bucket.within and not bucket.in_share_root:
+            verrors.add(
+                f'{schema}.path',
+                f'{path} is inside S3 bucket {bucket.name!r}, outside its s3data directory. Recursive permissions '
+                f'changes are not supported there. Apply the change to /mnt/{bucket.dataset}/s3data instead.',
+            )
+        # dataset -> mountpoint of every mount the change covers in full: the target's own when it is a
+        # mount root, and each one beneath it when the recursion crosses mounts
+        covered = {}
+        if st.is_mountpoint:
+            covered[statmount(path=path, as_dict=True)["mount_source"]] = path
+        if traverse:
+            for entry in iter_mountinfo(target_mnt_id=st.mount_id, as_dict=True):
+                if entry["mountpoint"].startswith(f"{path}/"):
+                    covered[entry["mount_source"]] = entry["mountpoint"]
+        if not covered:
+            return
+
+        buckets = self.middleware.call_sync(
+            "sharing.s3.query",
+            [["dataset", "in", list(covered)], ["layout", "=", "BUCKET"]],
+            {"select": ["name", "dataset"]},
+        )
+        crossed = []
+        for bucket in buckets:
+            mountpoint = covered[bucket.dataset]
+            if mountpoint == path:
+                verrors.add(
+                    f"{schema}.path",
+                    f"{path} is the mountpoint of S3 bucket {bucket.name!r}. Recursive permissions changes are "
+                    f"not supported on a whole bucket. Apply the change to {path}/s3data instead.",
+                )
+            else:
+                crossed.append(f"{bucket.name!r} ({mountpoint})")
+        if crossed:
+            verrors.add(
+                f"{schema}.options.traverse",
+                f"Traversing from {path} would change permissions on the whole of S3 bucket(s) "
+                f"{', '.join(crossed)}. Recursive permissions changes are not supported on a whole bucket. "
+                "Apply the change to the s3data directory inside each bucket instead.",
+            )
+
+    @private
+    def path_get_acltype(self, path):
+        """
+        The ACL type of the file system holding the path, from the
+        bits of stx_attributes the kernel reports.
+
+        raises NotImplementedError for EXTERNAL paths
+        """
+
+        if path_location(path) is FSLocation.EXTERNAL:
+            raise NotImplementedError
+
+        return path_get_acltype(path)
+
+    @api_method(
+        FilesystemChownArgs, FilesystemChownResult,
+        roles=['FILESYSTEM_ATTRS_WRITE'],
+        audit='Filesystem change owner', audit_extended=lambda data: data['path']
+    )
+    @job(lock=lambda args: f'perm_change:{os.path.normpath(args[0]["path"])}')
+    def chown(self, job, data):
+        """
+        Change owner or group of file at ``path``.
+
+        ``uid`` and ``gid`` specify new owner of the file. If either
+        key is absent or None, then existing value on the file is not
+        changed.
+
+        ``user`` and ``group`` alternatively allow specifying a uid gid by
+        user name or group name.
+
+        ``recursive`` performs action recursively, but does
+        not traverse filesystem mount points.
+
+        If ``traverse`` and ``recursive`` are specified, then the chown
+        operation will traverse filesystem mount points.
+
+        A recursive change may not target the mountpoint of a dataset consumed by an S3 bucket, nor traverse
+        into one; apply it to the bucket's ``s3data`` directory instead.
+        """
+        job.set_progress(0, 'Preparing to change owner.')
+        verrors = ValidationErrors()
+
+        uid = -1 if data['uid'] is None else data.get('uid', -1)
+        gid = -1 if data['gid'] is None else data.get('gid', -1)
+        options = data['options']
+
+        if data['user']:
+            user = self.call_sync2(self.s.user.query, [['username', '=', data['user']]])
+            if user:
+                uid = user[0].uid
+            else:
+                verrors.add('filesystem.chown.user', f'{data["user"]}: user does not exist')
+
+        if data['group']:
+            group = self.call_sync2(self.s.group.query, [['group', '=', data['group']]])
+            if group:
+                gid = group[0].gid
+            else:
+                verrors.add('filesystem.chown.group', f'{data["group"]}: group does not exist')
+
+        self._common_perm_path_validate("filesystem.chown", data, verrors)
+        verrors.check()
+
+        fd = truenas_os.openat2(
+            data['path'], flags=os.O_RDONLY, resolve=truenas_os.RESOLVE_NO_SYMLINKS
+        )
+        try:
+            os.fchown(fd, uid, gid)
+            if options['recursive']:
+                job.set_progress(10, f'Recursively changing owner of {data["path"]}.')
+                AclTool(fd, AclToolAction.CHOWN, uid, gid, ATChownOptions(traverse=options['traverse']), job).run()
+        finally:
+            os.close(fd)
+        job.set_progress(100, 'Finished changing owner.')
+
+    @api_method(
+        FilesystemSetpermArgs, FilesystemSetpermResult,
+        roles=['FILESYSTEM_ATTRS_WRITE'],
+        audit='Filesystem set permission', audit_extended=lambda data: data['path']
+    )
+    @job(lock=lambda args: f'perm_change:{os.path.normpath(args[0]["path"])}')
+    def setperm(self, job, data):
+        """
+        Set Unix permissions on the given ``path``.
+
+        If ``mode`` is specified then the mode is applied to the path, and to files and
+        subdirectories depending on which ``options`` are selected.
+
+        This method will fail if an extended ACL is present on ``path`` unless ``stripacl`` is set.
+        If no ``mode`` is set and ``stripacl`` is ``true``, then non-trivial ACLs are converted to
+        trivial ACLs. An ACL is trivial if it can be expressed as a file mode without losing any
+        access rules.
+
+        A recursive change may not target the mountpoint of a dataset consumed by an S3 bucket, nor traverse
+        into one; apply it to the bucket's ``s3data`` directory instead.
+
+        .. important::
+
+            ``uid``, ``gid``, ``user``, and ``group`` *should* remain unset *unless* the
+            administrator wishes to change the owner or group of files.
+        """
+        job.set_progress(0, 'Preparing to set permissions.')
+        options = data['options']
+        mode = data.get('mode', None)
+        verrors = ValidationErrors()
+
+        uid = -1 if data['uid'] is None else data.get('uid', -1)
+        gid = -1 if data['gid'] is None else data.get('gid', -1)
+
+        if data['user']:
+            user = self.call_sync2(self.s.user.query, [['username', '=', data['user']]])
+            if user:
+                uid = user[0].uid
+            else:
+                verrors.add('filesystem.setperm.user', f'{data["user"]}: user does not exist')
+
+        if data['group']:
+            group = self.call_sync2(self.s.group.query, [['group', '=', data['group']]])
+            if group:
+                gid = group[0].gid
+            else:
+                verrors.add('filesystem.setperm.group', f'{data["group"]}: group does not exist')
+
+        self._common_perm_path_validate("filesystem.setperm", data, verrors)
+
+        current_acl = self.middleware.call_sync('filesystem.getacl', data['path'])
+        acl_is_trivial = current_acl['trivial']
+        if not acl_is_trivial and not options['stripacl']:
+            verrors.add(
+                'filesystem.setperm.mode',
+                f'Non-trivial ACL present on [{data["path"]}]. '
+                'Option "stripacl" required to change permission.',
+            )
+
+        if mode is not None and int(mode, 8) == 0:
+            verrors.add(
+                'filesystem.setperm.mode',
+                'Empty permissions are not permitted.'
+            )
+
+        verrors.check()
+
+        if mode is not None:
+            mode = int(mode, 8)
+
+        strip_acl_path(data['path'])
+
+        fd = truenas_os.openat2(
+            data['path'], flags=os.O_RDONLY, resolve=truenas_os.RESOLVE_NO_SYMLINKS
+        )
+        try:
+            if mode:
+                os.fchmod(fd, mode)
+
+            os.fchown(fd, uid, gid)
+
+            if options['recursive']:
+                job.set_progress(10, f'Recursively setting permissions on {data["path"]}.')
+                AclTool(fd, AclToolAction.STRIP, uid, gid,
+                        ATPermOptions(traverse=options['traverse'], target_mode=mode), job).run()
+        finally:
+            os.close(fd)
+        job.set_progress(100, 'Finished setting permissions.')
+
+    @private
+    def getacl_nfs4(self, path, simplified, resolve_ids):
+        fd = truenas_os.openat2(path, flags=os.O_RDONLY, resolve=truenas_os.RESOLVE_NO_SYMLINKS)
+        try:
+            acl_obj = truenas_os.fgetacl(fd)
+            st = os.fstat(fd)
+        finally:
+            os.close(fd)
+
+        output = nfs4acl_obj_to_dict(acl_obj, st.st_uid, st.st_gid, simplified)
+        output['path'] = path
+        output['acltype'] = 'NFS4'
+
+        for ace in output['acl']:
+            if resolve_ids and ace['id'] != -1:
+                ace['who'] = self.middleware.call_sync('idmap.id_to_name', ace['id'], ace['tag'])
+            elif resolve_ids and ace['tag'] == 'group@':
+                ace['who'] = self.middleware.call_sync('idmap.id_to_name', st.st_gid, 'GROUP')
+            elif resolve_ids and ace['tag'] == 'owner@':
+                ace['who'] = self.middleware.call_sync('idmap.id_to_name', st.st_uid, 'USER')
+            elif resolve_ids:
+                ace['who'] = None
+
+        return output
+
+    @private
+    def getacl_posix1e(self, path, simplified, resolve_ids):
+        fd = truenas_os.openat2(path, flags=os.O_RDONLY, resolve=truenas_os.RESOLVE_NO_SYMLINKS)
+        try:
+            acl_obj = truenas_os.fgetacl(fd)
+            st = os.fstat(fd)
+        finally:
+            os.close(fd)
+
+        ret = posixacl_obj_to_dict(acl_obj, st.st_uid, st.st_gid)
+        ret['acltype'] = FS_ACL_Type.POSIX1E
+        ret['path'] = path
+
+        for ace in ret['acl']:
+            if resolve_ids and ace['id'] != -1:
+                ace['who'] = self.middleware.call_sync('idmap.id_to_name', ace['id'], ace['tag'])
+            elif resolve_ids and ace['tag'] == 'GROUP_OBJ':
+                ace['who'] = self.middleware.call_sync('idmap.id_to_name', st.st_gid, 'GROUP')
+            elif resolve_ids and ace['tag'] == 'USER_OBJ':
+                ace['who'] = self.middleware.call_sync('idmap.id_to_name', st.st_uid, 'USER')
+            elif resolve_ids:
+                ace['who'] = None
+
+        return ret
+
+    @private
+    def getacl_disabled(self, path):
+        st = os.stat(path)
+        return {
+            'path': path,
+            'uid': st.st_uid,
+            'gid': st.st_gid,
+            'acl': None,
+            'acltype': FS_ACL_Type.DISABLED,
+            'trivial': True,
+        }
+
+    @api_method(
+        FilesystemGetaclArgs,
+        FilesystemGetaclResult,
+        roles=['FILESYSTEM_ATTRS_READ'],
+    )
+    def getacl(self, path, simplified, resolve_ids):
+        """
+        Return ACL of a given path. This may return a POSIX1e ACL or a NFSv4 ACL. The ACL type is indicated
+        by the ``acltype`` key.
+        """
+        if path_location(path) is FSLocation.EXTERNAL:
+            raise CallError(f'{path} is external to TrueNAS', errno.EXDEV)
+
+        if not os.path.exists(path):
+            raise CallError('Path not found.', errno.ENOENT)
+
+        acltype = path_get_acltype(path)
+
+        if acltype == FS_ACL_Type.NFS4:
+            ret = self.getacl_nfs4(path, simplified, resolve_ids)
+        elif acltype == FS_ACL_Type.POSIX1E:
+            ret = self.getacl_posix1e(path, simplified, resolve_ids)
+        else:
+            ret = self.getacl_disabled(path)
+
+        ret.update({'user': None, 'group': None})
+
+        if resolve_ids:
+            if user := self.call_sync2(self.s.user.query, [['uid', '=', ret['uid']]]):
+                ret['user'] = user[0].username
+
+            if group := self.call_sync2(self.s.group.query, [['gid', '=', ret['gid']]]):
+                ret['group'] = group[0].group
+
+        return ret
+
+    @private
+    def _validate_child_acltypes(self, path: str, current_acltype: str) -> None:
+        """
+        When traverse is requested on a setacl operation, verify that all child
+        filesystems under `path` share the same ACL type. Mixing NFS4 and POSIX1E
+        across dataset boundaries would silently apply the wrong ACL model.
+        """
+        root_mnt_id = statmount(path=path, as_dict=True)['mount_id']
+        real_path = os.path.realpath(path)
+        mismatched = []
+
+        for entry in iter_mountinfo(target_mnt_id=root_mnt_id, as_dict=True):
+            child_mnt = entry['mountpoint']
+            if not child_mnt.startswith(real_path + '/'):
+                continue
+
+            super_opts = entry['super_opts']
+            if 'NFS4ACL' in super_opts:
+                child_acltype = FS_ACL_Type.NFS4
+            elif 'POSIXACL' in super_opts:
+                child_acltype = FS_ACL_Type.POSIX1E
+            else:
+                child_acltype = FS_ACL_Type.DISABLED
+
+            if child_acltype != current_acltype:
+                mismatched.append(child_mnt)
+
+        if mismatched:
+            raise ValidationError(
+                'filesystem.setacl.options.traverse',
+                f'Child filesystems have a different ACL type than {real_path!r} '
+                f'({current_acltype}). All child filesystems must share the same '
+                f'ACL configuration for traverse operations: '
+                f'{", ".join(mismatched)}'
+            )
+
+    @private
+    def setacl_nfs4(self, job, current_acl, data):
+        job.set_progress(0, 'Preparing to set acl.')
+        recursive = data['options'].get('recursive', False)
+        do_strip = data['options'].get('stripacl', False)
+        action = AclToolAction.CLONE
+
+        verrors = ValidationErrors()
+        job.set_progress(10, 'Setting NFSv4 ACL.')
+
+        if do_strip:
+            action = AclToolAction.STRIP
+            strip_acl_path(data['path'])
+        elif data['options']['validate_effective_acl']:
+            uid_to_check = current_acl['uid'] if data['uid'] == ACL_UNDEFINED_ID else data['uid']
+            gid_to_check = current_acl['gid'] if data['gid'] == ACL_UNDEFINED_ID else data['gid']
+            self.middleware.call_sync(
+                'filesystem.check_acl_execute',
+                data['path'], data['dacl'], uid_to_check, gid_to_check, True
+            )
+
+        fd = truenas_os.openat2(
+            data['path'], flags=os.O_RDONLY, resolve=truenas_os.RESOLVE_NO_SYMLINKS
+        )
+        try:
+            if not do_strip:
+                try:
+                    acl_obj = nfs4acl_dict_to_obj(data['dacl'], aclflags=None)
+                except (ValueError, KeyError) as e:
+                    verrors.add('filesystem_acl.dacl', str(e))
+                    verrors.check()
+                try:
+                    truenas_os.validate_acl(fd, acl_obj)
+                except ValueError as e:
+                    verrors.add('filesystem_acl.dacl', str(e))
+                    verrors.check()
+                try:
+                    truenas_os.fsetacl(fd, acl_obj)
+                except (OSError, ValueError) as e:
+                    raise CallError(str(e))
+                acl_opts = ATAclOptions(traverse=data['options']['traverse'], target_acl=acl_obj)
+            else:
+                # target_mode=None: no explicit chmod; the resulting mode is the
+                # POSIX representation of the ACL that the kernel derives on strip.
+                acl_opts = ATPermOptions(traverse=data['options']['traverse'])
+
+            os.fchown(fd, data['uid'], data['gid'])
+            if recursive:
+                AclTool(fd, action, data['uid'], data['gid'], acl_opts, job).run()
+        finally:
+            os.close(fd)
+
+        job.set_progress(100, 'Finished setting NFSv4 ACL.')
+
+    @private
+    def setacl_posix1e(self, job, current_acl, data):
+        job.set_progress(0, 'Preparing to set acl.')
+        options = data['options']
+        recursive = options.get('recursive', False)
+        do_strip = options.get('stripacl', False)
+        dacl = data.get('dacl', [])
+        verrors = ValidationErrors()
+        action = AclToolAction.STRIP if do_strip else AclToolAction.CLONE
+
+        if do_strip and dacl:
+            verrors.add(
+                'filesystem_acl.dacl',
+                'Simulatenously setting and removing ACL from path is invalid.'
+            )
+
+        if not do_strip:
+            if options['validate_effective_acl']:
+                try:
+                    # check execute on parent paths
+                    uid_to_check = current_acl['uid'] if data['uid'] == ACL_UNDEFINED_ID else data['uid']
+                    gid_to_check = current_acl['gid'] if data['gid'] == ACL_UNDEFINED_ID else data['gid']
+
+                    self.middleware.call_sync(
+                        'filesystem.check_acl_execute',
+                        data['path'], dacl, uid_to_check, gid_to_check, True
+                    )
+                except CallError as e:
+                    if e.errno != errno.EPERM:
+                        raise
+
+                    verrors.add(
+                        'filesystem_acl.path',
+                        e.errmsg
+                    )
+
+        if recursive and not do_strip and not any(entry.get('default') for entry in dacl):
+            verrors.add(
+                'filesystem_acl.dacl',
+                'Default ACL entries are required in order to apply ACL recursively.'
+            )
+
+        acl_obj = None
+        if not do_strip:
+            try:
+                acl_obj = posixacl_dict_to_obj(dacl)
+            except (ValueError, KeyError) as e:
+                verrors.add('filesystem_acl.dacl', str(e))
+
+        verrors.check()
+
+        job.set_progress(10, 'Setting POSIX1e ACL.')
+
+        if do_strip:
+            strip_acl_path(data['path'])
+
+        fd = truenas_os.openat2(
+            data['path'], flags=os.O_RDONLY, resolve=truenas_os.RESOLVE_NO_SYMLINKS
+        )
+        try:
+            if acl_obj is not None:
+                try:
+                    truenas_os.validate_acl(fd, acl_obj)
+                except ValueError as e:
+                    verrors.add('filesystem_acl.dacl', str(e))
+                    verrors.check()
+                try:
+                    truenas_os.fsetacl(fd, acl_obj)
+                except (OSError, ValueError) as e:
+                    raise CallError(f'Failed to set ACL on path [{data["path"]}]: {e}')
+                acl_opts = ATAclOptions(traverse=options['traverse'], target_acl=acl_obj)
+            else:
+                # target_mode=None: no explicit chmod; the resulting mode is the
+                # POSIX representation of the ACL that the kernel derives on strip.
+                acl_opts = ATPermOptions(traverse=options['traverse'])
+
+            os.fchown(fd, data['uid'], data['gid'])
+            if recursive:
+                AclTool(fd, action, data['uid'], data['gid'], acl_opts, job).run()
+        finally:
+            os.close(fd)
+
+        job.set_progress(100, 'Finished setting POSIX1e ACL.')
+
+    @api_method(
+        FilesystemSetaclArgs,
+        FilesystemSetaclResult,
+        roles=['FILESYSTEM_ATTRS_WRITE'],
+        audit='Filesystem set ACL',
+        audit_extended=lambda data: data['path'],
+    )
+    @job(lock=lambda args: f'perm_change:{os.path.normpath(args[0]["path"])}')
+    def setacl(self, job, data):
+        """
+        Set the ACL of a given path.
+
+        The ``dacl`` entry formatting depends on the underlying ``acltype``: an ``NFS4`` ACL requires
+        NFSv4 entries, while a ``POSIX1E`` ACL requires POSIX1e entries. When ``stripacl`` is set, the
+        ACL is converted to a trivial ACL; an ACL is trivial if it can be expressed as a file mode
+        without losing any access rules.
+
+        .. note::
+
+            For each owner change, set one and only one of ``uid`` or ``user`` (and likewise one of
+            ``gid`` or ``group``), and only if the caller wishes to change the owning user or group of
+            the file or directory.
+
+        .. warning::
+
+            If ``user``, ``uid``, ``group``, or ``gid`` is specified in a recursive operation, then the
+            owning user, group, or both for *all* files will be changed.
+
+        A recursive change may not target the mountpoint of a dataset consumed by an S3 bucket, nor traverse
+        into one; apply it to the bucket's ``s3data`` directory instead.
+
+        The following notes about ACL entries are necessarily terse. If more detail is required, please
+        consult relevant TrueNAS documentation.
+
+        .. rubric:: NFSv4 ACL entry semantics
+
+        The ``tag`` identifies the principal to whom the entry applies. ``USER`` and ``GROUP`` have
+        conventional meanings: ``owner@`` refers to the owning user of the file, ``group@`` to the
+        owning group, and ``everyone@`` to all users (including the owning user and group). The
+        ``type`` may be ``ALLOW`` or ``DENY``, and ``DENY`` entries take precedence over ``ALLOW``
+        when the ACL is evaluated. The ``flags`` inheritance flags determine how an entry is presented
+        (if at all) on newly-created files or directories within the specified path and are only
+        valid for directories.
+
+        .. rubric:: POSIX1e ACL entry semantics
+
+        When ``default`` is ``true``, the entry belongs to the POSIX default ACL and is copied to new
+        files and directories created within the directory where it is set; default entries are *not*
+        evaluated when determining access to the file on which they are set. When ``default`` is
+        ``false``, the entry applies to the POSIX access ACL which is used to determine access to the
+        directory but is not inherited.
+
+        For the ``tag``, ``USER_OBJ`` refers to the owning user (denoted "user" in conventional POSIX
+        UGO permissions), ``GROUP_OBJ`` refers to the owning group (denoted "group"), and ``OTHER``
+        applies to all users and groups who are not ``USER_OBJ`` or ``GROUP_OBJ``. ``MASK`` sets the
+        maximum permissions granted to all ``USER`` and ``GROUP`` entries. A valid POSIX1e ACL
+        contains precisely one ``USER_OBJ``, ``GROUP_OBJ``, ``OTHER``, and ``MASK`` entry for each of
+        the default and access lists.
+        """
+        verrors = ValidationErrors()
+        data['loc'] = self._common_perm_path_validate(
+            "filesystem.setacl", data, verrors, internal_ok=data['options']['bypass']
+        )
+        normalize_acl_ids(data)
+        if data['uid'] != ACL_UNDEFINED_ID and data['user']:
+            verrors.add(
+                'filesystem.setacl.user',
+                'User and uid may not be specified simultaneously.'
+            )
+
+        if data['gid'] != ACL_UNDEFINED_ID and data['group']:
+            verrors.add(
+                'filesystem.setacl.group',
+                'group and gid may not be specified simultaneously.'
+            )
+
+        if data['user']:
+            if user := self.call_sync2(self.s.user.query, [['username', '=', data['user']]]):
+                data['uid'] = user[0].uid
+            else:
+                verrors.add(
+                    'filesystem.setacl.user',
+                    f'{data["user"]}: user does not exist.'
+                )
+
+        if data['group']:
+            if group := self.call_sync2(self.s.group.query, [['group', '=', data['group']]]):
+                data['gid'] = group[0].gid
+            else:
+                verrors.add(
+                    'filesystem.setacl.group',
+                    f'{data["group"]}: group does not exist.'
+                )
+
+        verrors.check()
+
+        current_acl = self.getacl(data['path'])
+        if data['acltype'] and data['acltype'] != current_acl['acltype']:
+            raise ValidationError(
+                'filesystem.setacl.dacl.acltype',
+                'ACL type is invalid for selected path'
+            )
+
+        if data['options'].get('traverse') and not data['options'].get('stripacl'):
+            self._validate_child_acltypes(data['path'], current_acl['acltype'])
+
+        for idx, entry in enumerate(data['dacl']):
+            # Convert any names to ids (because ultimately uid/gid is written to disk)
+            # Earlier validation checks whether someone is trying to set both id and name.
+            if entry.get('who') in (None, ''):
+                # entry does not specify a name and so we don't need to normalize
+                continue
+
+            if entry.get('id') != ACL_UNDEFINED_ID:
+                # entry already has a uid / gid
+                continue
+
+            # We're using user.query and group.query to intialize cache entries if required
+            match entry['tag']:
+                case 'USER':
+                    who_filters = [['username', '=', entry['who']]]
+                    who_is_group = False
+                case 'GROUP':
+                    who_filters = [['group', '=', entry['who']]]
+                    who_is_group = True
+                case POSIXACE_Tag.USER_OBJ | POSIXACE_Tag.GROUP_OBJ:
+                    # We currently allow these because we're populating in getacl response
+                    # This may need to be re-evaluated. These tags don't require an explicit uid/gid
+                    # and so we can just skip safely
+                    continue
+                case NFS4ACE_Tag.SPECIAL_OWNER | NFS4ACE_Tag.SPECIAL_GROUP:
+                    # We currently allow these because we're populating in getacl response
+                    # This may need to be re-evaluated. These tags don't require an explicit uid/gid
+                    # and so we can just skip safely
+                    continue
+                case _:
+                    raise ValidationError(
+                        f'filesystem.setacl.{idx}.who',
+                        'Name may only be specified for USER and GROUP entries'
+                    )
+            try:
+                if who_is_group:
+                    entry['id'] = self.call_sync2(
+                        self.s.group.query, who_filters, QueryOptions(get=True),
+                    ).gid
+                else:
+                    entry['id'] = self.call_sync2(
+                        self.s.user.query, who_filters, QueryOptions(get=True),
+                    ).uid
+
+                entry['who'] = None
+            except MatchNotFound:
+                raise ValidationError(f'filesystem.setacl.{idx}.who', f'{entry["who"]}: account does not exist')
+
+        match current_acl['acltype']:
+            case FS_ACL_Type.NFS4:
+                self.setacl_nfs4(job, current_acl, data)
+            case FS_ACL_Type.POSIX1E:
+                self.setacl_posix1e(job, current_acl, data)
+            case FS_ACL_Type.DISABLED:
+                raise CallError(f"{data['path']}: ACLs disabled on path.", errno.EOPNOTSUPP)
+            case _:
+                raise TypeError(f'{current_acl["acltype"]}: unexpected ACL type')
+
+        return self.getacl(data['path'])
+
+    @private
+    def add_to_acl_posix(self, acl, entries):
+        def convert_perm(perm):
+            if perm == 'MODIFY' or perm == 'FULL_CONTROL':
+                return {'READ': True, 'WRITE': True, 'EXECUTE': True}
+
+            if perm == 'READ':
+                return {'READ': True, 'WRITE': False, 'EXECUTE': True}
+
+            raise CallError(f'{perm}: unsupported permissions type for POSIX1E acltype')
+
+        def check_acl_for_entry(entry):
+            id_type = entry['id_type']
+            xid = entry['id']
+            perm = entry['access']
+
+            canonical_entries = {
+                'USER_OBJ': {'has_default': False, 'entry': None},
+                'GROUP_OBJ': {'has_default': False, 'entry': None},
+                'OTHER': {'has_default': False, 'entry': None},
+            }
+
+            has_default = False
+            has_access = False
+            has_access_mask = False
+            has_default_mask = False
+
+            for ace in acl:
+                if (centry := canonical_entries.get(ace['tag'])) is not None:
+                    if ace['default']:
+                        centry['has_default'] = True
+                    else:
+                        centry['entry'] = ace
+
+                    continue
+
+                if ace['tag'] == 'MASK':
+                    if ace['default']:
+                        has_default_mask = True
+                    else:
+                        has_access_mask = True
+
+                    continue
+
+                if ace['tag'] != id_type or ace['id'] != xid:
+                    continue
+
+                if ace['perms'] != convert_perm(perm):
+                    continue
+
+                if ace['default']:
+                    has_default = True
+                else:
+                    has_access = True
+
+            for key, val in canonical_entries.items():
+                if val['has_default']:
+                    continue
+
+                acl.append({
+                    'tag': key,
+                    'id': val['entry']['id'],
+                    'perms': val['entry']['perms'],
+                    'default': True
+                })
+
+            return (has_default, has_access, has_access_mask, has_default_mask)
+
+        def add_entry(entry, default):
+            acl.append({
+                'tag': entry['id_type'],
+                'id': entry['id'],
+                'perms': convert_perm(entry['access']),
+                'default': default
+            })
+
+        def add_mask(default):
+            acl.append({
+                'tag': 'MASK',
+                'id': -1,
+                'perms': {'READ': True, 'WRITE': True, 'EXECUTE': True},
+                'default': default
+            })
+
+        changed = False
+
+        for entry in entries:
+            default, access, mask, default_mask = check_acl_for_entry(entry)
+
+            if not default:
+                changed = True
+                add_entry(entry, True)
+
+            if not access:
+                changed = True
+                add_entry(entry, False)
+
+            if not mask:
+                changed = True
+                add_mask(False)
+
+            if not default_mask:
+                changed = True
+                add_mask(True)
+
+        return changed
+
+    @private
+    def add_to_acl_nfs4(self, acl, entries):
+        def convert_perm(perm):
+            if perm == 'MODIFY':
+                return {'BASIC': 'MODIFY'}
+
+            if perm == 'READ':
+                return {'BASIC': 'READ'}
+
+            if perm == 'FULL_CONTROL':
+                return {'BASIC': 'FULL_CONTROL'}
+
+            raise CallError(f'{perm}: unsupported permissions type for NFSv4 acltype')
+
+        def check_acl_for_entry(entry):
+            id_type = entry['id_type']
+            xid = entry['id']
+            perm = entry['access']
+
+            for ace in acl:
+                if ace['tag'] != id_type or ace['id'] != xid or ace['type'] != 'ALLOW':
+                    continue
+
+                if ace['perms'].get('BASIC', {}) == perm:
+                    return True
+
+            return False
+
+        changed = False
+
+        for entry in entries:
+            if check_acl_for_entry(entry):
+                continue
+
+            acl.append({
+                'tag': entry['id_type'],
+                'id': entry['id'],
+                'perms': convert_perm(entry['access']),
+                'flags': {'BASIC': 'INHERIT'},
+                'type': 'ALLOW'
+            })
+            changed = True
+
+        return changed
+
+    @api_method(
+        FilesystemAddToAclArgs,
+        FilesystemAddToAclResult,
+        audit='Filesystem add to ACL',
+        audit_extended=lambda data: data['path'],
+        private=True
+    )
+    @job()
+    def add_to_acl(self, job, data):
+        """
+        Simplified ACL maintenance API for charts users to grant either read or
+        modify access to particulr IDs on a given path. This call overwrites
+        any existing ACL on the given path.
+
+        `id_type` specifies whether the extra entry will be a user or group
+        `id` specifies the numeric id of the user / group for which access is
+        being granted.
+        `access` specifies the simplified access mask to be granted to the user.
+        For NFSv4 ACLs `READ` means the READ set, and `MODIFY` means the MODIFY
+        set. For POSIX1E `READ` means read and execute, `MODIFY` means read, write,
+        execute.
+        """
+        init_path = data['path']
+        verrors = ValidationErrors()
+        self._common_perm_path_validate('filesystem.add_to_acl', data, verrors, internal_ok=True)
+        verrors.check()
+
+        data['path'] = init_path
+        current_acl = self.getacl(data['path'])
+        acltype = FS_ACL_Type(current_acl['acltype'])
+
+        if acltype == FS_ACL_Type.NFS4:
+            changed = self.add_to_acl_nfs4(current_acl['acl'], data['entries'])
+        elif acltype == FS_ACL_Type.POSIX1E:
+            changed = self.add_to_acl_posix(current_acl['acl'], data['entries'])
+        else:
+            raise CallError(f"{data['path']}: ACLs disabled on path.", errno.EOPNOTSUPP)
+
+        if not changed:
+            job.set_progress(100, 'ACL already contains all requested entries.')
+            return changed
+
+        if not directory_is_empty(data['path']) and not data['options']['force']:
+            raise CallError(
+                f'{data["path"]}: path contains existing data '
+                'and `force` was not specified', errno.EPERM
+            )
+
+        setacl_job = self.middleware.call_sync('filesystem.setacl', {
+            'path': data['path'],
+            'dacl': current_acl['acl'],
+            'acltype': current_acl['acltype'],
+            'options': FilesystemSetAclOptions(recursive=True, validate_effective_acl=False, bypass=True)
+        })
+
+        job.wrap_sync(setacl_job)
+        return changed
+
+    @api_method(FilesystemGetInheritedAclArgs, FilesystemGetInheritedAclResult, private=True)
+    def get_inherited_acl(self, data):
+        """
+        Generate an inherited ACL based on given `path`
+        Supports `directory` `option` that allows specifying whether the generated
+        ACL is for a file or a directory.
+        """
+        verrors = ValidationErrors()
+        self._common_perm_path_validate(
+            'filesystem.get_inherited_acl', data, verrors, pool_mp_ok=True, internal_ok=True
+        )
+        verrors.check()
+
+        current_acl = self.getacl(data['path'], False)
+        return calculate_inherited_acl(current_acl, data['options']['directory'])

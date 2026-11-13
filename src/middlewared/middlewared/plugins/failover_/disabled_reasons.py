@@ -1,104 +1,240 @@
-from middlewared.schema import accepts, returns, List, Str
-from middlewared.service import Service, throttle, pass_app, no_auth_required, private
-from middlewared.plugins.failover_.utils import throttle_condition
+# Copyright (c) - iXsystems Inc. dba TrueNAS
+#
+# Licensed under the terms of the TrueNAS Enterprise License Agreement
+# See the file LICENSE.IX for complete terms and conditions
+from truenas_pynetif.address.constants import IFOperState
+from truenas_pynetif.address.netlink import get_links, netlink_route
+
+from middlewared.api import Event, api_method
+from middlewared.api.current import (
+    FailoverDisabledReasonsArgs,
+    FailoverDisabledReasonsChangedEvent,
+    FailoverDisabledReasonsResult,
+)
+from middlewared.service import Service, private
+from middlewared.utils.zfs import query_imported_fast_impl
+
+from .enums import DisabledReasonsEnum
 
 
-class FailoverDisabledReasonsService(Service):
-
+class FailoverDisabledService(Service):
     class Config:
-        cli_namespace = 'system.failover.disabled'
-        namespace = 'failover.disabled'
+        cli_namespace = "system.failover.disabled"
+        namespace = "failover.disabled"
+        events = [
+            Event(
+                name="failover.disabled.reasons",
+                description="Sent when failover status reasons change.",
+                roles=["FAILOVER_READ"],
+                models={"CHANGED": FailoverDisabledReasonsChangedEvent},
+            ),
+        ]
 
     LAST_DISABLED_REASONS = None
+    SYSTEM_DATASET_SETUP_IN_PROGRESS = False
 
-    @no_auth_required
-    @throttle(seconds=2, condition=throttle_condition)
-    @accepts()
-    @returns(List('reasons', items=[Str('reason')]))
-    @pass_app()
+    @api_method(
+        FailoverDisabledReasonsArgs,
+        FailoverDisabledReasonsResult,
+        pass_app=True,
+        roles=['FAILOVER_READ']
+    )
     def reasons(self, app):
+        """Returns a list of reasons why failover is not enabled/functional.
+        See ``DisabledReasonsEnum`` for the reasons and their explanation.
         """
-        Returns a list of reasons why failover is not enabled/functional.
-
-        NO_VOLUME - There are no pools configured.
-        NO_VIP - There are no interfaces configured with Virtual IP.
-        NO_SYSTEM_READY - Other storage controller has not finished booting.
-        NO_PONG - Other storage controller is not communicable.
-        NO_FAILOVER - Failover is administratively disabled.
-        NO_LICENSE - Other storage controller has no license.
-        DISAGREE_VIP - Nodes Virtual IP states do not agree.
-        MISMATCH_DISKS - The storage controllers do not have the same quantity of disks.
-        NO_CRITICAL_INTERFACES - No network interfaces are marked critical for failover.
-        NO_FENCED - Zpools are imported but fenced isn't running.
-        """
-        reasons = self.middleware.call_sync('failover.disabled.get_reasons', app)
-        if reasons != FailoverDisabledReasonsService.LAST_DISABLED_REASONS:
-            FailoverDisabledReasonsService.LAST_DISABLED_REASONS = reasons
+        reasons = self.middleware.call_sync("failover.disabled.get_reasons", app)
+        if reasons != FailoverDisabledService.LAST_DISABLED_REASONS:
+            FailoverDisabledService.LAST_DISABLED_REASONS = reasons
             self.middleware.send_event(
-                'failover.disabled.reasons', 'CHANGED',
-                fields={'disabled_reasons': list(reasons)}
+                "failover.disabled.reasons",
+                "CHANGED",
+                fields={"disabled_reasons": list(reasons)},
             )
         return list(reasons)
 
     @private
+    def heartbeat_health(self, app, reasons):
+        try:
+            heartbeat_iface_name = self.middleware.call_sync(
+                "failover.internal_interface.detect"
+            )[0]
+        except IndexError:
+            # if something calls this directly from cli on a non-ha machine, don't
+            # crash since it's easily avoided
+            return
+
+        with netlink_route() as sock:
+            links = get_links(sock)
+        if heartbeat_iface_name not in links:
+            # saw this on an internal m50 because the systemd-modules-load.service
+            # timed out and was subsequently killed so the ntb kernel module didn't
+            # get loaded
+            reasons.add(DisabledReasonsEnum.NO_HEARTBEAT_IFACE.name)
+        elif links[heartbeat_iface_name].operstate != IFOperState.UP:
+            reasons.add(DisabledReasonsEnum.NO_CARRIER_ON_HEARTBEAT.name)
+
+    @private
+    def get_local_reasons(self, app, ifaces, reasons):
+        """This method checks the local node to try and determine its failover status."""
+        if self.middleware.call_sync("failover.config")["disabled"]:
+            reasons.add(DisabledReasonsEnum.NO_FAILOVER.name)
+
+        if self.middleware.call_sync("failover.in_progress"):
+            reasons.add(DisabledReasonsEnum.LOC_FAILOVER_ONGOING.name)
+            # no reason to check anything else since failover
+            # is happening on this system
+            return
+
+        reboot_info = self.middleware.call_sync("failover.reboot.info")
+        for key in ("this_node", "other_node"):
+            node = "LOC" if key == "this_node" else "REM"
+            for reason_details in (reboot_info[key] or {}).get("reboot_required_reasons", []):
+                disabled_reason = f"{node}_{reason_details['code']}_REBOOT_REQ"
+                if hasattr(DisabledReasonsEnum, disabled_reason):
+                    reasons.add(disabled_reason)
+                else:
+                    self.logger.error("Unknown reboot reason received: %s", disabled_reason)
+
+        if self.SYSTEM_DATASET_SETUP_IN_PROGRESS:
+            reasons.add(
+                DisabledReasonsEnum.LOC_SYSTEM_DATASET_MIGRATION_IN_PROGRESS.name
+            )
+
+        self.heartbeat_health(app, reasons)
+
+        crit_iface = vip = master = False
+        for iface in ifaces:
+            if iface["failover_critical"]:
+                # only need 1 interface marked critical for failover
+                crit_iface = True
+
+            if iface["failover_virtual_aliases"]:
+                # only need 1 interface with a virtual IP
+                vip = True
+
+            if any(
+                (
+                    i["state"] == "MASTER"
+                    for i in iface["state"].get("vrrp_config") or []
+                )
+            ):
+                # means this interface is MASTER
+                master = True
+
+        if not crit_iface:
+            reasons.add(DisabledReasonsEnum.NO_CRITICAL_INTERFACES.name)
+        elif not vip:
+            reasons.add(DisabledReasonsEnum.NO_VIP.name)
+        elif master:
+            fenced_running = self.middleware.call_sync("failover.fenced.run_info")[
+                "running"
+            ]
+            num_of_zpools_imported = len(query_imported_fast_impl())
+            if num_of_zpools_imported > 1:
+                # boot pool is returned by default which is why we check > 1
+                if not fenced_running:
+                    # zpool(s) imported but fenced isn't running which is bad
+                    reasons.add(DisabledReasonsEnum.NO_FENCED.name)
+            else:
+                # we've got interfaces marked as master but we have no zpool(s) imported
+                reasons.add(DisabledReasonsEnum.NO_VOLUME.name)
+
+    @private
+    def get_remote_reasons(self, app, ifaces, reasons):
+        """This method checks the remote node to try and determine its failover status."""
+        try:
+            assert self.middleware.call_sync("failover.remote_connected")
+            if not self.middleware.call_sync(
+                "failover.call_remote", "system.ready", [], {"timeout": 5}
+            ):
+                # if the remote node panic's (this happens on failover event if we cant export the
+                # zpool in 4 seconds (linux reboots silently by design) then the p2p interface stays
+                # "UP" and the websocket remains open. At this point, we have to wait for the TCP
+                # timeout (60 seconds default). This means the assert line up above will return `True`.
+                # However, any `call_remote` method will hang because the websocket is still
+                # open but hasn't closed due to the default TCP timeout window. This can be painful
+                # on failover events because it delays the process of restarting services in a timely
+                # manner. To work around this, we place a `timeout` of 5 seconds on the system.ready
+                # call. This essentially bypasses the TCP timeout window.
+                reasons.add(DisabledReasonsEnum.NO_SYSTEM_READY.name)
+
+            if not self.middleware.call_sync(
+                "failover.call_remote", "failover.licensed"
+            ):
+                reasons.add(DisabledReasonsEnum.NO_LICENSE.name)
+
+            lsw = self.middleware.call_sync("system.version")
+            rsw = self.middleware.call_sync("failover.call_remote", "system.version")
+            if lsw != rsw:
+                reasons.add(DisabledReasonsEnum.MISMATCH_VERSIONS.name)
+
+            if self.middleware.call_sync(
+                "failover.call_remote", "failover.in_progress"
+            ):
+                reasons.add(DisabledReasonsEnum.REM_FAILOVER_ONGOING.name)
+
+            local = self.middleware.call_sync("failover.vip.get_states", ifaces)
+            remote = self.middleware.call_sync(
+                "failover.call_remote", "failover.vip.get_states"
+            )
+            # the remote node reports every interface with a VIP so narrow
+            # it down to the critical ones, same as what was checked locally
+            critical = {i["name"] for i in ifaces}
+            remote_critical = []
+            for states in remote:
+                names = []
+                for name in filter(lambda x: x in critical, states):
+                    names.append(name)
+                remote_critical.append(names)
+            if self.middleware.call_sync("failover.vip.check_states", local, remote_critical):
+                reasons.add(DisabledReasonsEnum.DISAGREE_VIP.name)
+
+            mismatch_disks = self.middleware.call_sync("failover.mismatch_disks")
+            if mismatch_disks["missing_local"] or mismatch_disks["missing_remote"]:
+                reasons.add(DisabledReasonsEnum.MISMATCH_DISKS.name)
+
+            mismatch_nics = self.middleware.call_sync("failover.mismatch_nics")
+            if mismatch_nics["missing_local"] or mismatch_nics["missing_remote"]:
+                reasons.add(DisabledReasonsEnum.MISMATCH_NICS.name)
+
+            if self.middleware.call_sync(
+                "failover.call_remote",
+                "failover.disabled.get_systemdataset_state",
+                [],
+                {"raise_connect_error": False, "timeout": 2, "connect_timeout": 2},
+            ):
+                reasons.add(
+                    DisabledReasonsEnum.REM_SYSTEM_DATASET_MIGRATION_IN_PROGRESS.name
+                )
+
+        except Exception:
+            reasons.add(DisabledReasonsEnum.NO_PONG.name)
+
+    @private
     def get_reasons(self, app):
         reasons = set()
-
-        fenced_running = self.middleware.call_sync('failover.fenced.run_info')['running']
-        num_of_zpools_imported = len(self.middleware.call_sync('zfs.pool.query_imported_fast'))
-        if fenced_running and num_of_zpools_imported <= 1:
-            # returns the boot pool by default
-            # fenced is running which implies it's the master node but we don't have any
-            # zpools imported (or created)
-            reasons.add('NO_VOLUME')
-        elif not fenced_running and num_of_zpools_imported > 1:
-            # zpool(s) imported but fenced isn't running which is bad
-            reasons.add('NO_FENCED')
-
-        if self.middleware.call_sync('failover.config')['disabled']:
-            reasons.add('NO_FAILOVER')
-
-        db = self.middleware.call_sync('datastore.query', 'network.interfaces')
-        if not any((i['int_vip'] for i in db)):
-            # only need 1 interface with a VIP
-            reasons.add('NO_VIP')
-        elif not any((i['int_critical'] for i in db)):
-            # only need 1 interface marked critical for failover
-            reasons.add('NO_CRITICAL_INTERFACES')
-
-        try:
-            assert self.middleware.call_sync('failover.remote_connected')
-
-            # if the remote node panic's (this happens on failover event if we cant export the
-            # zpool in 4 seconds on freeBSD systems (linux reboots silently by design)
-            # then the p2p interface stays "UP" and the websocket remains open.
-            # At this point, we have to wait for the TCP timeout (60 seconds default).
-            # This means the assert line up above will return `True`.
-            # However, any `call_remote` method will hang because the websocket is still
-            # open but hasn't closed due to the default TCP timeout window. This can be painful
-            # on failover events because it delays the process of restarting services in a timely
-            # manner. To work around this, we place a `timeout` of 5 seconds on the system.ready
-            # call. This essentially bypasses the TCP timeout window.
-            if not self.middleware.call_sync('failover.call_remote', 'system.ready', [], {'timeout': 5}):
-                reasons.add('NO_SYSTEM_READY')
-
-            if not self.middleware.call_sync('failover.call_remote', 'failover.licensed'):
-                reasons.add('NO_LICENSE')
-
-            ifaces = self.middleware.call_sync('interface.query')
-            local = self.middleware.call_sync('failover.vip.get_states', ifaces)
-            remote = self.middleware.call_sync('failover.call_remote', 'failover.vip.get_states')
-            if self.middleware.call_sync('failover.vip.check_states', local, remote):
-                reasons.add('DISAGREE_VIP')
-
-            mismatch_disks = self.middleware.call_sync('failover.mismatch_disks')
-            if mismatch_disks['missing_local'] or mismatch_disks['missing_remote']:
-                reasons.add('MISMATCH_DISKS')
-        except Exception:
-            reasons.add('NO_PONG')
+        if self.middleware.call_sync("failover.licensed"):
+            ifaces = self.middleware.call_sync("interface.query", [["failover_critical", "=", True]])
+            self.get_local_reasons(app, ifaces, reasons)
+            self.get_remote_reasons(app, ifaces, reasons)
 
         return reasons
 
+    @private
+    async def update_systemdataset_state(self, in_progress):
+        self.SYSTEM_DATASET_SETUP_IN_PROGRESS = in_progress
+
+    @private
+    async def get_systemdataset_state(self):
+        return self.SYSTEM_DATASET_SETUP_IN_PROGRESS
+
+
+async def systemdataset_setup_hook(middleware, data):
+    await middleware.call(
+        "failover.disabled.update_systemdataset_state", data["in_progress"]
+    )
+
 
 async def setup(middleware):
-    middleware.event_register('failover.disabled.reasons', 'Sent when failover status reasons change.')
+    middleware.register_hook("sysdataset.setup", systemdataset_setup_hook)

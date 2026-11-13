@@ -1,16 +1,11 @@
+import errno
+
 import pytest
 
+from auto_config import pool_name
+from middlewared.service_exception import ValidationError
 from middlewared.test.integration.assets.pool import dataset
-from middlewared.test.integration.utils import call, ssh
-
-import sys
-import os
-apifolder = os.getcwd()
-sys.path.append(apifolder)
-from auto_config import dev_test
-reason = 'Skip for testing'
-# comment pytestmark for development testing with --dev-test
-pytestmark = pytest.mark.skipif(dev_test, reason=reason)
+from middlewared.test.integration.utils import call
 
 
 def common_min_max_txg_snapshot_test(test_min_txg=False, test_max_txg=False):
@@ -21,23 +16,23 @@ def common_min_max_txg_snapshot_test(test_min_txg=False, test_max_txg=False):
         total_snaps = 20
         for i in range(total_snaps):
             created_snaps.append(int(call(
-                'zfs.snapshot.create', {'dataset': test_dataset, 'name': f'snap_{i}'}
+                'pool.snapshot.create', {'dataset': test_dataset, 'name': f'snap_{i}'}
             )['properties']['createtxg']['value']))
 
-        assert call('zfs.snapshot.query', [['dataset', '=', test_dataset]], {'count': True}) == len(created_snaps)
+        assert call('pool.snapshot.query', [['dataset', '=', test_dataset]], {'count': True}) == len(created_snaps)
 
-        for i in range(int(total_snaps / 2) - 1):
+        for i in range(total_snaps // 2 - 1):
             new_list = created_snaps
             extra_args = {}
             if test_min_txg:
                 new_list = created_snaps[i:]
                 extra_args['min_txg'] = new_list[0]
             if test_max_txg:
-                new_list = new_list[:int(len(new_list) / 2)]
+                new_list = new_list[:len(new_list) // 2]
                 extra_args['max_txg'] = new_list[-1]
 
             assert call(
-                'zfs.snapshot.query', [['dataset', '=', test_dataset]], {'count': True, 'extra': extra_args}
+                'pool.snapshot.query', [['dataset', '=', test_dataset]], {'count': True, 'extra': extra_args}
             ) == len(new_list)
 
 
@@ -51,3 +46,28 @@ def test_max_txg_snapshot_query():
 
 def test_min_max_txg_snapshot_query():
     common_min_max_txg_snapshot_test(True, True)
+
+
+def test_already_exists():
+    with dataset('test') as test_dataset:
+        call('pool.snapshot.create', {'dataset': test_dataset, 'name': 'snap'})
+        with pytest.raises(ValidationError) as ve:
+            call('pool.snapshot.create', {'dataset': test_dataset, 'name': 'snap'})
+
+        assert ve.value.errno == errno.EEXIST
+
+
+def test_create_nonexistent_dataset():
+    with pytest.raises(ValidationError) as ve:
+        call('pool.snapshot.create', {'dataset': f'{pool_name}/does-not-exist', 'name': 'snap'})
+
+    assert ve.value.errno == errno.ENOENT
+    assert ve.value.attribute == 'pool.snapshot.create'
+
+
+def test_create_rejects_at_in_dataset():
+    with dataset('test') as test_dataset:
+        with pytest.raises(ValidationError) as ve:
+            call('pool.snapshot.create', {'dataset': f'{test_dataset}@x', 'name': 'snap'})
+
+        assert ve.value.attribute == 'pool.snapshot.create'

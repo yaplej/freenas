@@ -1,24 +1,50 @@
-from pathlib import Path
+# Copyright (c) - iXsystems Inc. dba TrueNAS
+#
+# Licensed under the terms of the TrueNAS Enterprise License Agreement
+# See the file LICENSE.IX for complete terms and conditions
 
-from middlewared.alert.base import AlertClass, AlertCategory, AlertLevel, Alert, ThreadedAlertSource
+import os
+from typing import Any
+
+from middlewared.alert.applicability import TRUENAS_HARDWARE
+from middlewared.alert.base import (
+    Alert,
+    AlertCategory,
+    AlertClass,
+    AlertClassConfig,
+    AlertLevel,
+    NonDataclassAlertClass,
+    ThreadedAlertSource,
+)
 
 
-class USBStorageAlertClass(AlertClass):
-    category = AlertCategory.HARDWARE
-    level = AlertLevel.CRITICAL
-    title = 'A USB Storage Device Has Been Connected to This System'
-    text = ('A USB storage device %r has been connected to this system. Please remove that USB device to '
-            'prevent problems with system boot or HA failover.')
-    products = ('SCALE_ENTERPRISE',)
-    proactive_support = True
+class USBStorageAlert(NonDataclassAlertClass[str], AlertClass):
+    config = AlertClassConfig(
+        category=AlertCategory.HARDWARE,
+        level=AlertLevel.CRITICAL,
+        title='A USB Storage Device Has Been Connected to This System',
+        text=('A USB storage device %r has been connected to this system. Please remove that USB device to '
+              'prevent problems with system boot or HA failover.'),
+        applies_to=TRUENAS_HARDWARE,
+        proactive_support=True,
+    )
 
 
 class USBStorageAlertSource(ThreadedAlertSource):
-    products = ('SCALE_ENTERPRISE',)
+    applies_to = TRUENAS_HARDWARE
 
-    def check_sync(self):
-        alerts = []
-        for usb in filter(lambda x: x.stem.startswith('usb-'), Path('/dev/disk/by-id').iterdir()):
-            if '-part' not in usb.as_posix():
-                alerts.append(Alert(USBStorageAlertClass, usb.resolve().as_posix()))
+    def check_sync(self) -> list[Alert[Any]] | Alert[Any] | None:
+        alerts: list[Alert[Any]] = []
+        with os.scandir("/dev/disk/by-id") as sdir:
+            for i in filter(lambda x: x.name.lower().startswith("usb-"), sdir):
+                resolved_path = os.path.realpath(i.path)
+                if resolved_path.startswith("/dev/sr"):
+                    # When opening the IPMI KVM console on the
+                    # {f/v}-series platforms, a USB CDROM device
+                    # is automatically added to OS without the
+                    # user actually mounting an ISO. In this
+                    # scenario, we need to ignore the device.
+                    continue
+                elif "-part" not in i.name:
+                    alerts.append(Alert(USBStorageAlert(resolved_path)))
         return alerts

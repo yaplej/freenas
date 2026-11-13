@@ -1,37 +1,48 @@
 import asyncio
-import syslog
 
-from middlewared.logger import CrashReporting
-from middlewared.schema import accepts, Bool, Datetime, Dict, Int, IPAddr, List, Patch, returns, Str
+from truenas_pylicensed.features import LicenseFeature
+
+from middlewared.api import api_method
+from middlewared.api.current import (
+    ServiceOptions,
+    SystemGeneralCheckinArgs,
+    SystemGeneralCheckinResult,
+    SystemGeneralCheckinWaitingArgs,
+    SystemGeneralCheckinWaitingResult,
+    SystemGeneralEntry,
+    SystemGeneralUpdateArgs,
+    SystemGeneralUpdateResult,
+)
+from middlewared.async_validators import validate_port
+from middlewared.service import ConfigService, private
 import middlewared.sqlalchemy as sa
-from middlewared.service import ConfigService, private, ValidationErrors
 from middlewared.utils import run
-from middlewared.validators import Range
+from middlewared.utils.boot.models import BootUpdateInitramfsOptions
+from middlewared.utils.security import GPOS_STIG_DEPRECATED_TLS_PROTOCOLS
+from middlewared.utils.service.settings import SettingsHelper
+from middlewared.utils.timezone_choices import effective_timezone
 
-from .utils import HTTPS_PROTOCOLS
+settings = SettingsHelper()
 
 
 class SystemGeneralModel(sa.Model):
     __tablename__ = 'system_settings'
 
     id = sa.Column(sa.Integer(), primary_key=True)
-    stg_guiaddress = sa.Column(sa.JSON(type=list), default=['0.0.0.0'])
-    stg_guiv6address = sa.Column(sa.JSON(type=list), default=['::'])
-    stg_guiallowlist = sa.Column(sa.JSON(type=list), default=[])
+    stg_guiaddress = sa.Column(sa.JSON(list), default=['0.0.0.0'])
+    stg_guiv6address = sa.Column(sa.JSON(list), default=['::'])
+    stg_guiallowlist = sa.Column(sa.JSON(list), default=[])
     stg_guiport = sa.Column(sa.Integer(), default=80)
     stg_guihttpsport = sa.Column(sa.Integer(), default=443)
     stg_guihttpsredirect = sa.Column(sa.Boolean(), default=False)
-    stg_guihttpsprotocols = sa.Column(sa.JSON(type=list), default=['TLSv1', 'TLSv1.1', 'TLSv1.2', 'TLSv1.3'])
+    stg_guihttpsprotocols = sa.Column(sa.JSON(list), default=['TLSv1', 'TLSv1.1', 'TLSv1.2', 'TLSv1.3'])
     stg_guix_frame_options = sa.Column(sa.String(120), default='SAMEORIGIN')
     stg_guiconsolemsg = sa.Column(sa.Boolean(), default=True)
-    stg_language = sa.Column(sa.String(120), default='en')
     stg_kbdmap = sa.Column(sa.String(120), default='us')
-    stg_birthday = sa.Column(sa.DateTime(), nullable=True)
     stg_timezone = sa.Column(sa.String(120), default='America/Los_Angeles')
     stg_wizardshown = sa.Column(sa.Boolean(), default=False)
     stg_pwenc_check = sa.Column(sa.String(100))
     stg_guicertificate_id = sa.Column(sa.ForeignKey('system_certificate.id'), index=True, nullable=True)
-    stg_crash_reporting = sa.Column(sa.Boolean(), nullable=True)
     stg_usage_collection = sa.Column(sa.Boolean(), nullable=True)
     stg_ds_auth = sa.Column(sa.Boolean(), default=False)
 
@@ -44,42 +55,14 @@ class SystemGeneralService(ConfigService):
         datastore_prefix = 'stg_'
         datastore_extend = 'system.general.general_system_extend'
         cli_namespace = 'system.general'
-
-    ENTRY = Dict(
-        'system_general_entry',
-        Patch(
-            'certificate_entry', 'ui_certificate',
-            ('attr', {'null': True, 'required': True}),
-        ),
-        Int('ui_httpsport', validators=[Range(min=1, max=65535)], required=True),
-        Bool('ui_httpsredirect', required=True),
-        List(
-            'ui_httpsprotocols', items=[Str('protocol', enum=HTTPS_PROTOCOLS)],
-            empty=False, unique=True, required=True
-        ),
-        Int('ui_port', validators=[Range(min=1, max=65535)], required=True),
-        List('ui_address', items=[IPAddr('addr')], empty=False, required=True),
-        List('ui_v6address', items=[IPAddr('addr')], empty=False, required=True),
-        List('ui_allowlist', items=[IPAddr('addr', network=True, network_strict=True)], required=True),
-        Bool('ui_consolemsg', required=True),
-        Str('ui_x_frame_options', enum=['SAMEORIGIN', 'DENY', 'ALLOW_ALL'], required=True),
-        Str('kbdmap', required=True),
-        Str('language', empty=False, required=True),
-        Str('timezone', empty=False, required=True),
-        Bool('crash_reporting', null=True, required=True),
-        Bool('usage_collection', null=True, required=True),
-        Datetime('birthday', required=True),
-        Bool('wizardshown', required=True),
-        Bool('crash_reporting_is_set', required=True),
-        Bool('usage_collection_is_set', required=True),
-        Bool('ds_auth', required=True),
-        Int('id', required=True),
-    )
+        role_prefix = 'SYSTEM_GENERAL'
+        entry = SystemGeneralEntry
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self._original_datastore = {}
         self._rollback_timer = None
+        self._changed_https_port = False, -1
 
     @private
     async def general_system_extend(self, data):
@@ -88,139 +71,163 @@ class SystemGeneralService(ConfigService):
                 data['ui_' + key[3:]] = data.pop(key)
 
         if data['ui_certificate']:
-            data['ui_certificate'] = await self.middleware.call(
-                'certificate.get_instance', data['ui_certificate']['id']
-            )
-
-        data['crash_reporting_is_set'] = data['crash_reporting'] is not None
-        if data['crash_reporting'] is None:
-            data['crash_reporting'] = True
+            data['ui_certificate_name'] = data['ui_certificate']['cert_name']
+            data['ui_certificate'] = data['ui_certificate']['id']
+        else:
+            data['ui_certificate_name'] = None
+            data['ui_certificate'] = None
 
         data['usage_collection_is_set'] = data['usage_collection'] is not None
         if data['usage_collection'] is None:
-            data['usage_collection'] = True
+            # Under no circumstances under GPOS STIG mode should usage_collection show enabled
+            security_config = await self.call2(self.s.system.security.config)
+            data['usage_collection'] = not security_config.enable_gpos_stig
 
         data.pop('pwenc_check')
 
         return data
 
-    @private
-    async def validate_general_settings(self, data, schema):
-        verrors = ValidationErrors()
+    @settings.fields_validator('ui_port', 'ui_address')
+    async def _validate_ui_port_address(self, verrors, ui_port, ui_address):
+        for ui_address in ui_address:
+            verrors.extend(await validate_port(self.middleware, 'ui_port', ui_port, 'system.general', ui_address))
 
-        language = data.get('language')
-        system_languages = await self.middleware.call('system.general.language_choices')
-        if language not in system_languages.keys():
-            verrors.add(
-                f'{schema}.language',
-                f'Specified "{language}" language unknown. Please select a valid language.'
-            )
+    @settings.fields_validator('ui_httpsport', 'ui_address')
+    async def _validate_ui_httpsport_address(self, verrors, ui_httpsport, ui_address):
+        for ui_address in ui_address:
+            verrors.extend(await validate_port(self.middleware, 'ui_httpsport', ui_httpsport, 'system.general',
+                                               ui_address))
 
-        if data['kbdmap'] not in await self.middleware.call('system.general.kbdmap_choices'):
+    @settings.fields_validator('ui_port', 'ui_httpsport')
+    async def _validate_ui_ports(self, verrors, ui_port, ui_httpsport):
+        if ui_port == ui_httpsport:
+            verrors.add('ui_port', 'Must be different from "ui_httpsport"')
+
+    @settings.fields_validator('ds_auth')
+    async def _validate_ds_auth(self, verrors, ds_auth):
+        if ds_auth:
+            entitlement = await self.call2(self.s.truenas.entitlements.check, LicenseFeature.DIRECTORY_SERVICES_AUTH)
+            if not entitlement.entitled:
+                verrors.add('ds_auth', entitlement.message)
+
+    @settings.fields_validator('kbdmap')
+    async def _validate_kbdmap(self, verrors, kbdmap):
+        if kbdmap not in await self.middleware.call('system.general.kbdmap_choices'):
             verrors.add(
-                f'{schema}.kbdmap',
+                'kbdmap',
                 'Please enter a valid keyboard layout'
             )
 
-        timezone = data.get('timezone')
+    @settings.fields_validator('timezone')
+    async def _validate_timezone(self, verrors, timezone):
         timezones = await self.middleware.call('system.general.timezone_choices')
         if timezone not in timezones:
             verrors.add(
-                f'{schema}.timezone',
+                'timezone',
                 'Timezone not known. Please select a valid timezone.'
             )
 
+    @settings.fields_validator('ui_address', 'ui_v6address')
+    async def _validate_ui_address(self, verrors, ui_address, ui_v6address):
         ip4_addresses_list = await self.middleware.call('system.general.ui_address_choices')
         ip6_addresses_list = await self.middleware.call('system.general.ui_v6address_choices')
 
-        ip4_addresses = data.get('ui_address')
-        for ip4_address in ip4_addresses:
+        for ip4_address in ui_address:
             if ip4_address not in ip4_addresses_list:
                 verrors.add(
-                    f'{schema}.ui_address',
+                    'ui_address',
                     f'{ip4_address} ipv4 address is not associated with this machine'
                 )
 
-        ip6_addresses = data.get('ui_v6address')
-        for ip6_address in ip6_addresses:
+        for ip6_address in ui_v6address:
             if ip6_address not in ip6_addresses_list:
                 verrors.add(
-                    f'{schema}.ui_v6address',
+                    'ui_v6address',
                     f'{ip6_address} ipv6 address is not associated with this machine'
                 )
 
-        for key, wildcard, ips in [('ui_address', '0.0.0.0', ip4_addresses), ('ui_v6address', '::', ip6_addresses)]:
+        for key, wildcard, ips in [('ui_address', '0.0.0.0', ui_address), ('ui_v6address', '::', ui_v6address)]:
             if wildcard in ips and len(ips) > 1:
                 verrors.add(
-                    f'{schema}.{key}',
+                    key,
                     f'When "{wildcard}" has been selected, selection of other addresses is not allowed'
                 )
 
-        certificate_id = data.get('ui_certificate')
+    @settings.fields_validator('ui_certificate')
+    async def _validate_ui_certificate(self, verrors, ui_certificate):
         cert = await self.middleware.call(
             'certificate.query',
-            [["id", "=", certificate_id]]
+            [["id", "=", ui_certificate]]
         )
         if not cert:
             verrors.add(
-                f'{schema}.ui_certificate',
+                'ui_certificate',
                 'Please specify a valid certificate which exists in the system'
             )
         else:
-            cert = cert[0]
             verrors.extend(
-                await self.middleware.call(
-                    'certificate.cert_services_validation', certificate_id, f'{schema}.ui_certificate', False
+                await self.middleware.call2(
+                    self.s.certificate.cert_services_validation,
+                    ui_certificate, 'ui_certificate', False,
                 )
             )
 
-            if cert['fingerprint']:
-                syslog.openlog(logoption=syslog.LOG_PID, facility=syslog.LOG_USER)
-                syslog.syslog(syslog.LOG_ERR, 'Fingerprint of the certificate used in UI : ' + cert['fingerprint'])
-                syslog.closelog()
+    @settings.fields_validator('usage_collection')
+    async def _validate_usage_collection(self, verrors, usage_collection):
+        """ Cannot enable usage_collection when STIG is enabled """
+        security_config = await self.call2(self.s.system.security.config)
+        if usage_collection and security_config.enable_gpos_stig:
+            verrors.add(
+                'usage_collection',
+                'Usage collection is not allowed in GPOS STIG mode',
+            )
 
-        return verrors
+    @settings.fields_validator('ui_httpsredirect')
+    async def _validate_ui_httpsredirect(self, verrors, ui_httpsredirect):
+        """ Cannot disable the HTTPS redirect when STIG is enabled """
+        if ui_httpsredirect:
+            return
 
-    @accepts(
-        Patch(
-            'system_general_entry', 'general_settings',
-            ('rm', {'name': 'crash_reporting_is_set'}),
-            ('rm', {'name': 'usage_collection_is_set'}),
-            ('rm', {'name': 'wizardshown'}),
-            ('rm', {'name': 'id'}),
-            ('replace', Int('ui_certificate', null=True)),
-            ('add', Int('rollback_timeout', null=True)),
-            ('add', Int('ui_restart_delay', null=True)),
-            ('attr', {'update': True}),
-        ),
-    )
+        security_config = await self.middleware.call('system.security.config')
+        if security_config.enable_gpos_stig:
+            verrors.add(
+                'ui_httpsredirect',
+                'Redirection of HTTP requests to HTTPS may not be disabled in GPOS STIG mode',
+            )
+
+    @settings.fields_validator('ui_httpsprotocols')
+    async def _validate_ui_httpsprotocols(self, verrors, ui_httpsprotocols):
+        """ Cannot enable deprecated HTTPS protocols when STIG is enabled """
+        security_config = await self.middleware.call('system.security.config')
+        if not security_config.enable_gpos_stig:
+            return
+
+        if deprecated := GPOS_STIG_DEPRECATED_TLS_PROTOCOLS & set(ui_httpsprotocols):
+            verrors.add(
+                'ui_httpsprotocols',
+                'The following HTTPS protocols are deprecated and may not be enabled in GPOS STIG '
+                f'mode: {", ".join(sorted(deprecated))}',
+            )
+        elif not ui_httpsprotocols:
+            verrors.add(
+                'ui_httpsprotocols',
+                'At least one HTTPS protocol must be enabled in GPOS STIG mode',
+            )
+
+    @api_method(SystemGeneralUpdateArgs, SystemGeneralUpdateResult, audit='System general update')
     async def do_update(self, data):
         """
         Update System General Service Configuration.
 
-        `ui_certificate` is used to enable HTTPS access to the system. If `ui_certificate` is not configured on boot,
-        it is automatically created by the system.
-
-        `ui_httpsredirect` when set, makes sure that all HTTP requests are converted to HTTPS requests to better
-        enhance security.
-
-        `ui_address` and `ui_v6address` are a list of valid ipv4/ipv6 addresses respectively which the system will
-        listen on.
-
-        `ui_allowlist` is a list of IP addresses and networks that are allow to use API and UI. If this list is empty,
-        then all IP addresses are allowed to use API and UI.
-
-        `ds_auth` controls whether configured Directory Service users that are granted with Privileges are allowed to
-        log in to the Web UI or use TrueNAS API.
-
-        UI configuration is not applied automatically. Call `system.general.ui_restart` to apply new UI settings (all
-        HTTP connections will be aborted) or specify `ui_restart_delay` (in seconds) to automatically apply them after
-        some small amount of time necessary you might need to receive the response for your settings update request.
+        UI configuration is not applied automatically. Call :method:`system.general.ui_restart` to apply new UI
+        settings (all HTTP connections will be aborted) or specify ``ui_restart_delay`` (in seconds) to automatically
+        apply them after some small amount of time necessary you might need to receive the response for your settings
+        update request.
 
         If incorrect UI configuration is applied, you might loss API connectivity and won't be able to fix the settings.
-        To avoid that, specify `rollback_timeout` (in seconds). It will automatically roll back UI configuration to the
-        previously working settings after `rollback_timeout` passes unless you call `system.general.checkin` in case
-        the new settings were correct and no rollback is necessary.
+        To avoid that, specify ``rollback_timeout`` (in seconds). It will automatically roll back UI configuration
+        to the previously working settings after ``rollback_timeout`` passes unless you call
+        :method:`system.general.checkin` in case the new settings were correct and no rollback is necessary.
         """
         rollback_timeout = data.pop('rollback_timeout', None)
         ui_restart_delay = data.pop('ui_restart_delay', None)
@@ -233,70 +240,127 @@ class SystemGeneralService(ConfigService):
         )
 
         config = await self.config()
-        config['ui_certificate'] = config['ui_certificate']['id'] if config['ui_certificate'] else None
-        if not config.pop('crash_reporting_is_set'):
-            config['crash_reporting'] = None
         if not config.pop('usage_collection_is_set'):
             config['usage_collection'] = None
+        config.pop('ui_certificate_name')
         new_config = config.copy()
         new_config.update(data)
 
-        verrors = await self.validate_general_settings(new_config, 'general_settings_update')
-        if verrors:
-            raise verrors
+        await settings.validate(self, 'general_settings', config, new_config)
 
-        keys = new_config.keys()
-        for key in list(keys):
+        db_config = new_config.copy()
+        for key in list(new_config.keys()):
             if key.startswith('ui_'):
-                new_config['gui' + key[3:]] = new_config.pop(key)
+                db_config['gui' + key[3:]] = db_config.pop(key)
 
         await self.middleware.call(
             'datastore.update',
             self._config.datastore,
             config['id'],
-            new_config,
+            db_config,
             {'prefix': 'stg_'}
         )
 
         if config['kbdmap'] != new_config['kbdmap']:
-            await self.middleware.call('etc.generate', 'keyboard')
-            await run(['setupcon'], check=False)
-            await run(['localectl', 'set-keymap', new_config['kbdmap']], check=False)
+            await self.set_kbdlayout()
 
         if config['timezone'] != new_config['timezone']:
-            await self.middleware.call('zettarepl.update_config', {'timezone': new_config['timezone']})
-            await self.middleware.call('service.reload', 'timeservices')
-            await self.middleware.call('service.restart', 'cron')
+            await self.call2(self.s.zettarepl.update_config, {'timezone': new_config['timezone']})
+            await self.apply_timezone_to_running_system(new_config['timezone'])
+            if await self.middleware.call('failover.licensed'):
+                try:
+                    await self.middleware.call(
+                        'failover.call_remote',
+                        'system.general.apply_timezone_to_running_system',
+                        [new_config['timezone']],
+                        {'raise_connect_error': False, 'timeout': 30},
+                    )
+                except Exception:
+                    self.logger.warning(
+                        'Failed to apply timezone on standby controller', exc_info=True
+                    )
 
-        if config['language'] != new_config['language']:
-            await self.middleware.call('system.general.set_language')
+        # Regenerate pam when ds_auth changes, or when the UI certificate is switched so the
+        # SCRAM-PLUS server channel binding (published by pam_keyring) tracks the served cert.
+        # The switch path does not hit the certificate attachment-delegate redeploy.
+        if (
+            config['ds_auth'] != new_config['ds_auth'] or
+            config['ui_certificate'] != new_config['ui_certificate']
+        ):
+            await self.middleware.call('etc.generate', 'pam')
+            if await self.middleware.call('failover.licensed'):
+                try:
+                    await self.middleware.call('failover.call_remote', 'etc.generate', ['pam'])
+                except Exception:
+                    self.logger.warning('Failed to generate pam configuration on standby controller', exc_info=True)
 
-        if config['crash_reporting'] != new_config['crash_reporting']:
-            await self.middleware.call('system.general.set_crash_reporting')
+        # If self._changed_https_port[0] is True, this means this method was called after the port was updated and
+        # before https_port_changed was called. We want to leave the flag set to show that the port still needs to be
+        # applied.
+        self._changed_https_port = (
+            self._changed_https_port[0] or (config['ui_httpsport'] != new_config['ui_httpsport']),
+            new_config['ui_httpsport']
+        )
 
-        await self.middleware.call('service.start', 'ssl')
+        await (await self.call2(self.s.service.control, 'START', 'ssl')).wait(raise_error=True)
 
         if rollback_timeout is not None:
             self._original_datastore = original_datastore
             self._rollback_timer = asyncio.get_event_loop().call_later(
                 rollback_timeout,
-                lambda: asyncio.ensure_future(self.rollback()),
+                lambda: self.middleware.create_task(self.rollback()),
             )
 
         if ui_restart_delay is not None:
             await self.middleware.call('system.general.ui_restart', ui_restart_delay)
 
+        for key in ('ui_port', 'ui_httpsport', 'ui_httpsredirect', 'ui_address', 'ui_v6address'):
+            if config[key] != new_config[key]:
+                await self.middleware.call('system.reload_cli')
+                break
+
         return await self.config()
 
     @private
-    def set_crash_reporting(self):
-        CrashReporting.enabled_in_settings = self.middleware.call_sync('system.general.config')['crash_reporting']
+    async def apply_timezone_to_running_system(self, timezone):
+        # Apply the configured timezone to the running system. Reused by the
+        # interactive update path, by failover.call_remote from the active to
+        # propagate to the standby, and by vrrp_master on become-master so a
+        # newly-promoted node converges to the DB's timezone without a reboot.
+        tz = effective_timezone(timezone)
+        ha_options = {'ha_propagate': False}
+        await (await self.call2(
+            self.s.service.control, 'RELOAD', 'timeservices', ServiceOptions(**ha_options),
+        )).wait(raise_error=True)
+        # Restart cron so it inherits the new TZ env from middlewared.
+        await (await self.call2(
+            self.s.service.control, 'RESTART', 'cron', ServiceOptions(**ha_options),
+        )).wait(raise_error=True)
+        # Update systemd-timedated's cache so `timedatectl status` and journald
+        # (which subscribes to timedated's PropertiesChanged signal) reflect the
+        # change without a reboot. We do not do this from ix-etc because at boot
+        # ix-etc.service runs Before sysinit.target while systemd-timedated is
+        # ordered After it, so a D-Bus call from there would deadlock. This
+        # method only runs from contexts that come after sysinit.target.
+        cp = await run(
+            ['timedatectl', 'set-timezone', tz],
+            check=False, encoding='utf-8',
+        )
+        if cp.returncode:
+            self.logger.warning(
+                'timedatectl set-timezone %r failed: %s', tz, cp.stderr,
+            )
 
-    @accepts()
-    @returns(Int('remaining_seconds', null=True))
+    @private
+    async def set_kbdlayout(self):
+        await self.middleware.call('etc.generate', 'keyboard')
+        await run(['setupcon'], check=False)
+        await self.call2(self.s.boot.update_initramfs, BootUpdateInitramfsOptions(force=True))
+
+    @api_method(SystemGeneralCheckinWaitingArgs, SystemGeneralCheckinWaitingResult, roles=['SYSTEM_GENERAL_WRITE'])
     async def checkin_waiting(self):
         """
-        Determines whether or not we are waiting user to check-in the applied UI settings changes before they are rolled
+        Determines whether we are waiting user to check in the applied UI settings changes before they are rolled
         back. Returns a number of seconds before the automatic rollback or null if there are no changes pending.
         """
         if self._rollback_timer:
@@ -304,11 +368,10 @@ class SystemGeneralService(ConfigService):
             if remaining > 0:
                 return int(remaining)
 
-    @accepts()
-    @returns()
+    @api_method(SystemGeneralCheckinArgs, SystemGeneralCheckinResult, roles=['SYSTEM_GENERAL_WRITE'])
     async def checkin(self):
         """
-        After UI settings are saved with `rollback_timeout` this method needs to be called within that timeout limit
+        After UI settings are saved with ``rollback_timeout`` this method needs to be called within that timeout limit
         to prevent reverting the changes.
 
         This is to ensure user verifies the changes went as planned and its working.
@@ -332,3 +395,11 @@ class SystemGeneralService(ConfigService):
 
             self._rollback_timer = None
             self._original_datastore = {}
+
+    @private
+    async def https_port_changed(self) -> tuple[bool, int]:
+        """Return whether there is a pending port to apply. Reset the flag when this is called."""
+        ret = self._changed_https_port
+        # Reset the _changed_https_port flag. It will be set again if the port is updated in do_update again.
+        self._changed_https_port = False, -1
+        return ret

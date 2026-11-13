@@ -1,233 +1,148 @@
-import base64
-import fcntl
+from __future__ import annotations
+
+from base64 import b64decode
 import os
-import threading
+from tempfile import NamedTemporaryFile
+from typing import TYPE_CHECKING
 
-from contextlib import contextmanager
-from Cryptodome.Cipher import AES
-from Cryptodome.Util import Counter
+import truenas_pypwenc
 
-from middlewared.plugins.cluster_linux.utils import CTDBConfig, FuseConfig
+from middlewared.api.base.decorator import private_method
+from middlewared.auth import TruenasNodeSessionManagerCredentials
 from middlewared.service import Service
 from middlewared.service_exception import CallError
-from middlewared.utils.path import pathref_open
-
-PWENC_BLOCK_SIZE = 32
-PWENC_FILE_SECRET = os.environ.get('FREENAS_PWENC_SECRET', '/data/pwenc_secret')
-PWENC_PADDING = b'{'
-PWENC_CHECK = 'Donuts!'
-
-CLPWENC_PATH = os.path.join(
-    FuseConfig.FUSE_PATH_BASE.value,
-    CTDBConfig.CTDB_VOL_NAME.value,
+from middlewared.utils.pwenc import (
+    PWENC_CHECK,
+    PWENC_FILE_SECRET,
+    decrypt,
+    encrypt,
+    pwenc_generate_secret,
+    pwenc_rename,
 )
+
+if TYPE_CHECKING:
+    from middlewared.api.base.server.app import App
+    from middlewared.main import Middleware
 
 
 class PWEncService(Service):
 
-    secret = None
-    secret_path = PWENC_FILE_SECRET
-    lock = threading.RLock()
-
     class Config:
         private = True
 
-    def file_secret_path(self):
-        return self.secret_path
-
-    def _reset_passwords(self):
-        for table, field in (
-            ('directoryservice_activedirectory', 'ad_bindpw'),
-            ('directoryservice_ldap', 'ldap_bindpw'),
-            ('services_dynamicdns', 'ddns_password'),
-            ('services_webdav', 'webdav_password'),
-            ('services_ups', 'ups_monpwd'),
-            ('system_email', 'em_pass'),
+    def _reset_passwords(self) -> None:
+        for table, field, value in (
+            ('services_ups', 'ups_monpwd', ''),
+            ('system_email', 'em_pass', ''),
+            ('system_certificate', 'cert_domains_authenticators', 'NULL'),
+            # The following removes all DS-related config and disables directory services
+            ('services_cifs', 'cifs_srv_secrets', 'NULL'),
+            ('directoryservices', 'enable', '0'),
+            ('directoryservices', 'service_type', 'NULL'),
+            ('directoryservices', 'cred_type', 'NULL'),
+            ('directoryservices', 'cred_ldap_plain', 'NULL'),
+            ('directoryservices', 'cred_ldap_mtls_cert_id', 'NULL'),
+            ('directoryservices', 'cred_krb5', 'NULL'),
+            ('directoryservices', 'ad_trusted_domains', 'NULL'),
         ):
-            self.middleware.call_sync('datastore.sql', f'UPDATE {table} SET {field} = \'\'')
+            value = value or "''"
+            self.middleware.call_sync('datastore.sql', f'UPDATE {table} SET {field} = {value}')
 
-    @staticmethod
-    def _secret_opener(path, flags):
-        with pathref_open(os.path.dirname(path), force=True, mode=0o755) as secret_path:
-            return os.open(os.path.basename(path), flags, dir_fd=secret_path)
+        self.middleware.call_sync('datastore.sql', 'DELETE FROM directoryservice_kerberoskeytab')
+        self.middleware.call_sync('datastore.sql', 'DELETE FROM tasks_cloud_backup')
+        self.middleware.call_sync('datastore.sql', 'DELETE FROM tasks_cloudsync')
+        self.middleware.call_sync('datastore.sql', 'DELETE FROM system_cloudcredentials')
+        self.middleware.call_sync('datastore.sql', 'DELETE FROM system_acmednsauthenticator')
+        self.middleware.call_sync(
+            'datastore.sql',
+            'DELETE FROM storage_replication WHERE repl_ssh_credentials_id IS NOT NULL',
+        )
+        self.middleware.call_sync('datastore.sql', 'DELETE FROM tasks_rsync WHERE rsync_ssh_credentials_id IS NOT NULL')
+        self.middleware.call_sync('datastore.sql', 'DELETE FROM system_keychaincredential')
+        # `attributes` is the only payload here and is encrypted; without the key it decrypts to {},
+        # which fails dtype validation and breaks vm/container.query. Parent tables aren't encrypted.
+        self.middleware.call_sync('datastore.sql', 'DELETE FROM vm_device')
+        self.middleware.call_sync('datastore.sql', 'DELETE FROM container_device')
+        # If config is restored without secret seed then SMB auth won't be possible. Disable SMB for all users.
+        self.middleware.call_sync('datastore.sql', 'UPDATE account_bsdusers SET bsdusr_smb=0')
+        # An S3 access key stores a recoverable secret. Without the seed it decrypts to an empty
+        # string, which the S3 service would refuse whole, so drop it; the key reads SECRET_LOST
+        # until an administrator rotates it.
+        self.middleware.call_sync('datastore.sql', 'UPDATE truenas_s3_accesskey SET secret = NULL')
 
-    def _reset_pwenc_check_field(self):
+    def _reset_pwenc_check_field(self) -> None:
         settings = self.middleware.call_sync('datastore.config', 'system.settings')
         self.middleware.call_sync('datastore.update', 'system.settings', settings['id'], {
-            'stg_pwenc_check': self.encrypt(PWENC_CHECK),
+            'stg_pwenc_check': encrypt(PWENC_CHECK),
         })
 
-    @contextmanager
-    def _lock_secrets(self, fd):
-        with self.lock:
-            fcntl.lockf(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            try:
-                yield fd
-            finally:
-                fcntl.lockf(fd, fcntl.LOCK_UN)
-
-    def generate_secret(self, reset_passwords=True):
-        secret = os.urandom(PWENC_BLOCK_SIZE)
-        with open(self.secret_path, 'wb', opener=self._secret_opener) as f:
-            with self._lock_secrets(f.fileno()):
-                os.fchmod(f.fileno(), 0o600)
-                f.write(secret)
-                f.flush()
-                os.fsync(f.fileno())
-
-                self.reset_secret_cache()
-                self._reset_pwenc_check_field()
-
-                if reset_passwords:
-                    self._reset_passwords()
-
-    def check(self):
+    def check(self) -> bool:
         try:
             settings = self.middleware.call_sync('datastore.config', 'system.settings')
         except IndexError:
             self.middleware.call_sync('datastore.insert', 'system.settings', {})
             settings = self.middleware.call_sync('datastore.config', 'system.settings')
 
-        return self.decrypt(settings['stg_pwenc_check']) == PWENC_CHECK
-
-    @classmethod
-    def get_secret(cls):
-        if cls.secret is None:
-            with open(cls.secret_path, 'rb', opener=cls._secret_opener) as f:
-                cls.secret = f.read()
-
-        return cls.secret
-
-    @classmethod
-    def reset_secret_cache(cls):
-        cls.secret = None
-
-    def encrypt(self, data):
-        return encrypt(data)
-
-    def decrypt(self, encrypted, _raise=False):
-        return decrypt(encrypted, _raise)
-
-
-class CLPWEncService(PWEncService):
-
-    class Config:
-        private = True
-
-    secret = None
-    secret_path = os.path.join(
-        CLPWENC_PATH,
-        '.cluster_private',
-        'clpwenc_secret'
-    )
-
-    def _reset_passwords(self):
-        return
-
-    @staticmethod
-    def _secret_opener(path, flags):
-        with pathref_open(CLPWENC_PATH, force=True, mode=0o755) as ctdb_path:
-            st = os.fstat(ctdb_path)
-            if st.st_ino != 1:
-                raise CallError(
-                    f'Unexpected inode number on {CLPWENC_PATH}. '
-                    'This strongly indicates that the ctdb shared volume '
-                    'is no longer mounted.'
-                )
-
-            with pathref_open(
-                ".cluster_private", mode=0o700, dir_fd=ctdb_path, mkdir=True
-            ) as priv:
-                return os.open(os.path.basename(path), flags, dir_fd=priv)
-
-    @contextmanager
-    def check_file(self, flags):
-        def opener(path, flags):
-            with pathref_open(CLPWENC_PATH, force=True, mode=0o755) as ctdb_path:
-                st = os.fstat(ctdb_path)
-                if st.st_ino != 1:
-                    raise CallError(
-                        f'Unexpected inode number on {CLPWENC_PATH}. '
-                        'This strongly indicates that the ctdb shared volume '
-                        'is no longer mounted.'
-                    )
-
-                with pathref_open(
-                    '.cluster_private', force=True, mode=0o700, dir_fd=ctdb_path, mkdir=True
-                ) as priv:
-                    return os.open(path, flags, dir_fd=priv)
-
-        out_file = open('.check_file', flags, opener=opener)
         try:
-            yield out_file
-        finally:
-            out_file.close()
+            return decrypt(settings['stg_pwenc_check'], _raise=True) == PWENC_CHECK
+        except truenas_pypwenc.PwencError as exc:
+            # In principle on a totally fresh install it's expected that we need to generate a new
+            # secret. In this case we expect SECRET_NOT_FOUND. Other errors are unexpected and
+            # should be logged
+            if exc.code != truenas_pypwenc.PWENC_ERROR_SECRET_NOT_FOUND:
+                self.logger.exception('Failed to decrypt stg_pwenc_check')
 
-    def check(self):
-        try:
-            with self.check_file('r') as f:
-                data = f.read()
-        except FileNotFoundError:
-            # this error is raise explicitly in case where our check_file
-            # does not exist. Intermediate paths will be made if needed
-            # assuming that the ctdb_shared_volume is mounted. If it's
-            # not mounted then we expect this to fail / exception to
-            # not be blocked here.
+            return False
+        except Exception:
+            self.logger.exception('Unexpected error while trying to check pwenc secret')
             return False
 
-        return self.decrypt(data) == PWENC_CHECK
+    def generate_secret(self) -> None:
+        pwenc_generate_secret()
+        self._reset_pwenc_check_field()
+        self._reset_passwords()
 
-    def _reset_pwenc_check_field(self):
-        with self.check_file('w') as f:
-            f.write(self.encrypt(PWENC_CHECK))
+    @private_method(pass_app=True)
+    def replace(self, app: App, b64secret: str) -> None:
+        """ This method exists purely for use via failover.call_remote from active controller on HA truenas
+        appliance. """
+        if app and not isinstance(app.authenticated_credentials, TruenasNodeSessionManagerCredentials):
+            raise CallError(f'{type(app.authenticated_credentials)}: unexpected credential type for endpoint.')
 
-    def encrypt(self, data):
-        return encrypt(data, True)
+        data = b64decode(b64secret)
+        if len(data) != truenas_pypwenc.PWENC_BLOCK_SIZE:
+            raise CallError('Unexpected data length for pwenc file')
 
-    def decrypt(self, encrypted, _raise=False):
-        return decrypt(encrypted, _raise, True)
+        with open(PWENC_FILE_SECRET, 'rb') as f:
+            # avoid triggering inotify / churning our pwenc file if possible. This is so that
+            # we don't create unnecessary backup files on a normal sync_to_peer request.
+            if f.read() == data:
+                return
 
+        self.middleware.logger.info('Received pwenc secret file. Replacing.')
+        with NamedTemporaryFile(
+            mode='wb',
+            dir='/data',
+            prefix='.pwenc_secret.',
+            suffix='.tmp',
+            delete=False
+        ) as f:
+            temp_path = f.name
+            f.write(data)
+            f.flush()
 
-async def setup(middleware):
-    if not await middleware.call('pwenc.check'):
-        middleware.logger.debug('Generating new pwenc secret')
-        await middleware.call('pwenc.generate_secret')
+        try:
+            pwenc_rename(temp_path)
+        except Exception:
+            try:
+                os.unlink(temp_path)
+            except Exception:
+                pass
 
-
-def encrypt(data, cluster=False):
-    data = data.encode('utf8')
-
-    def pad(x):
-        return x + (PWENC_BLOCK_SIZE - len(x) % PWENC_BLOCK_SIZE) * PWENC_PADDING
-
-    nonce = os.urandom(8)
-    if cluster:
-        enc_service = CLPWEncService
-    else:
-        enc_service = PWEncService
-
-    cipher = AES.new(enc_service.get_secret(), AES.MODE_CTR, counter=Counter.new(64, prefix=nonce))
-    encoded = base64.b64encode(nonce + cipher.encrypt(pad(data)))
-    return encoded.decode()
-
-
-def decrypt(encrypted, _raise=False, cluster=False):
-    if not encrypted:
-        return ''
-
-    if cluster:
-        enc_service = CLPWEncService
-    else:
-        enc_service = PWEncService
-
-    try:
-        encrypted = base64.b64decode(encrypted)
-        nonce = encrypted[:8]
-        encrypted = encrypted[8:]
-
-        cipher = AES.new(enc_service.get_secret(), AES.MODE_CTR, counter=Counter.new(64, prefix=nonce))
-        return cipher.decrypt(encrypted).rstrip(PWENC_PADDING).decode('utf8')
-    except Exception:
-        if _raise:
             raise
-        return ''
+
+
+async def setup(middleware: Middleware) -> None:
+    if not await middleware.call2(middleware.services.pwenc.check):
+        middleware.logger.debug('Generating new pwenc secret')
+        await middleware.call2(middleware.services.pwenc.generate_secret)

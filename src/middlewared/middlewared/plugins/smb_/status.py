@@ -1,16 +1,16 @@
-from middlewared.schema import Bool, Dict, Ref, Str
-from middlewared.service import Service, accepts
-from middlewared.plugins.smb import SMBCmd
-from middlewared.utils import filter_list
-
 import enum
 import json
 import subprocess
-import time
+
+from middlewared.api import api_method
+from middlewared.api.current import SMBStatusArgs, SMBStatusResult
+from middlewared.plugins.smb import SMBCmd
+from middlewared.service import Service, private
+from middlewared.service_exception import CallError
+from middlewared.utils.filter_list import filter_list
 
 
 class InfoLevel(enum.Enum):
-    AUTH_LOG = 'l'
     ALL = ''
     SESSIONS = 'p'
     SHARES = 'S'
@@ -25,110 +25,79 @@ class SMBService(Service):
         service = 'cifs'
         service_verb = 'restart'
 
-    @accepts(
-        Str('info_level', enum=[x.name for x in InfoLevel], default=InfoLevel.ALL.name),
-        Ref('query-filters'),
-        Ref('query-options'),
-        Dict('status_options',
-             Bool('verbose', default=True),
-             Bool('fast', default=False),
-             Str('restrict_user', default=''),
-             Str('restrict_session', default=''),
-             )
-    )
+    @api_method(SMBStatusArgs, SMBStatusResult, roles=['SHARING_SMB_READ'])
     def status(self, info_level, filters, options, status_options):
-        """
-        Returns SMB server status (sessions, open files, locks, notifications).
-
-        `info_level` type of information requests. Defaults to ALL.
-
-        `status_options` additional options to filter query results. Supported
-        values are as follows: `verbose` gives more verbose status output
-        `fast` causes smbstatus to not check if the status data is valid by
-        checking if the processes that the status data refer to all still
-        exist. This speeds up execution on busy systems and clusters but
-        might display stale data of processes that died without cleaning up
-        properly. `restrict_user` specifies the limits results to the specified
-        user.
-        """
+        """Returns SMB server status (sessions, open files, locks, notifications)."""
         lvl = InfoLevel[info_level]
-        if lvl == InfoLevel.AUTH_LOG:
-            ret = []
-            try:
-                with open("/var/log/samba4/auth_audit.log", "r") as f:
-                    for e in f:
-                        entry = json.loads(e.strip())
-                        ts, extra = entry['timestamp'].split('.', 1)
-                        # add timezone info
-                        ts += extra[6:]
-                        usec = extra[:6]
-                        tv_sec = time.mktime(time.strptime(ts, "%Y-%m-%dT%H:%M:%S%z"))
-                        timestamp_tval = {
-                            "tv_sec": tv_sec,
-                            "tv_usec": int(usec)
-                        }
-                        entry['timestamp_tval'] = timestamp_tval
-                        ret.append(entry)
+        restrict_user = status_options['restrict_user']
+        restrict_session = status_options['restrict_session']
 
-            except FileNotFoundError:
-                self.logger.warning("SMB auth audit log does not exist "
-                                    "this is expected if users have never "
-                                    "authenticated to this server.")
-
-            return filter_list(ret, filters, options)
-
-        """
-        Apply some optimizations for case where filter is only asking
-        for a specific uid or session id.
-        """
+        # Apply some optimizations for case where filter is only asking for a specific uid or session id.
         if len(filters) == 1:
-            to_check = filters[0][:2]
-            if to_check == ["uid", "="]:
-                status_options['restrict_user'] = str(filters[0][2])
-                filters = []
+            f = filters[0]
+            match f[:2]:
+                case ['uid', '=']:
+                    restrict_user = str(f[2])
+                    filters = []
+                case ['session_id', '=']:
+                    restrict_session = str(f[2])
+                    filters = []
 
-            elif to_check == ["session_id", "="]:
-                status_options['restrict_session'] = str(filters[0][2])
-                filters = []
-
-        flags = '-j'
-        flags = flags + lvl.value
-        flags = flags + 'v' if status_options['verbose'] else flags
-        flags = flags + 'f' if status_options['fast'] else flags
+        # Build command
+        flags = '-j' + lvl.value
+        if status_options['verbose']:
+            flags += 'v'
+        if status_options['fast']:
+            flags += 'f'
 
         statuscmd = [SMBCmd.STATUS.value, '-d' '0', flags]
 
-        if status_options['restrict_user']:
-            statuscmd.extend(['-U', status_options['restrict_user']])
+        if restrict_user:
+            statuscmd.extend(['-U', restrict_user])
 
-        if status_options['restrict_session']:
-            statuscmd.extend(['-s', status_options['restrict_session']])
+        if restrict_session:
+            statuscmd.extend(['-s', restrict_session])
 
+        if status_options['resolve_uids']:
+            statuscmd.append('--resolve-uids')
+
+        # Run command
         smbstatus = subprocess.run(statuscmd, capture_output=True)
 
         if smbstatus.returncode != 0:
-            self.logger.debug('smbstatus [{%s}] failed with error: ({%s})',
-                              flags, smbstatus.stderr.decode().strip())
+            raise CallError(f'Failed to retrieve SMB status: {smbstatus.stderr.decode().strip()}')
 
-        output = json.loads(smbstatus.stdout.decode())
+        # Parse and return output
+        json_status = json.loads(smbstatus.stdout.decode() or '{"sessions": {}}')
 
-        if lvl == InfoLevel.SESSIONS:
-            output = output["sessions"]
+        match lvl:
+            case InfoLevel.SESSIONS:
+                key = 'sessions'
+            case InfoLevel.LOCKS:
+                key = 'open_files'
+            case InfoLevel.BYTERANGE:
+                key = 'byte_range_locks'
+            case InfoLevel.NOTIFICATIONS:
+                key = 'notifies'
+            case InfoLevel.SHARES:
+                key = 'tcons'
+            case _:
+                key = 'sessions'
+                for tcon in json_status.get('tcons', {}).values():
+                    if not (session := json_status[key].get(tcon['session_id'])):
+                        continue
 
-        elif lvl == InfoLevel.LOCKS:
-            output = output["locked_files"]
+                    if session.get('share_connections'):
+                        session['share_connections'].append(tcon)
+                    else:
+                        session['share_connections'] = [tcon]
 
-        elif lvl == InfoLevel.BYTERANGE:
-            output = output["brl"]
+        to_filter = list(json_status.get(key, {}).values())
+        return filter_list(to_filter, filters, options)
 
-        elif lvl == InfoLevel.NOTIFICATIONS:
-            output = output["notify"]
-
-        return filter_list(output, filters, options)
-
-    @accepts()
+    @private
     def client_count(self):
         """
         Return currently connected clients count.
         """
-        return self.status("SESSIONS", [], {"count": True}, {"fast": True})
+        return self.status('SESSIONS', [], {'count': True}, {'fast': True})

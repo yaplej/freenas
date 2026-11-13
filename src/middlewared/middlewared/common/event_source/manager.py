@@ -1,26 +1,108 @@
-import asyncio
-import errno
-import functools
+from __future__ import annotations
 
-from collections import defaultdict, namedtuple
+import asyncio
+from collections import defaultdict
+import functools
+from typing import TYPE_CHECKING, Any, Literal, NamedTuple, TypeAlias
+from uuid import uuid4
 
 from middlewared.event import EventSource
-from middlewared.schema import ValidationErrors
-from middlewared.service_exception import CallError
+from middlewared.service_exception import ValidationErrors
 
-IdentData = namedtuple("IdentData", ["app", "name", "arg"])
+if TYPE_CHECKING:
+    from middlewared.api.base.server.ws_handler.rpc import RpcWebSocketApp
+    from middlewared.main import Middleware
+
+
+class IdentData(NamedTuple):
+    subscriber: Subscriber
+    name: str
+    arg: str | None
+
+
+class Subscriber:
+    def send_event(self, event_type: str, **kwargs: Any) -> None:
+        raise NotImplementedError
+
+    def terminate(self, error: Exception | None) -> None:
+        raise NotImplementedError
+
+
+class AppSubscriber(Subscriber):
+    def __init__(self, app: RpcWebSocketApp, collection: str):
+        self.app = app
+        self.collection = collection
+
+    def send_event(self, event_type: str, **kwargs: Any) -> None:
+        self.app.send_event(self.collection, event_type, **kwargs)
+
+    def terminate(self, error: Exception | None) -> None:
+        self.app.notify_unsubscribed(self.collection, error)
+
+
+class InternalSubscriber(Subscriber):
+    def __init__(self) -> None:
+        self.iterator = InternalSubscriberIterator()
+
+    def send_event(self, event_type: str, **kwargs: Any) -> None:
+        self.iterator.queue.put_nowait((False, (event_type, kwargs)))
+
+    def terminate(self, error: Exception | None) -> None:
+        if error:
+            self.iterator.queue.put_nowait((True, error))
+        else:
+            self.iterator.queue.put_nowait(None)
+
+
+_IteratorItem: TypeAlias = tuple[str, dict[str, Any]]
+"""Event type and kwargs"""
+_InternalIteratorItem: TypeAlias = tuple[Literal[True], Exception] | tuple[Literal[False], _IteratorItem] | None
+"""Queue item type for InternalSubscriberIterator:
+- (`True`, Exception): Error to be raised during iteration
+- (`False`, _IteratorItem): Event data to be yielded to consumer
+- `None`: End of iteration signal (StopAsyncIteration)"""
+
+
+class InternalSubscriberIterator:
+    def __init__(self) -> None:
+        self.queue: asyncio.Queue[_InternalIteratorItem] = asyncio.Queue()
+
+    def __aiter__(self) -> InternalSubscriberIterator:
+        return self
+
+    async def __anext__(self) -> _IteratorItem:
+        item = await self.queue.get()
+
+        if item is None:
+            raise StopAsyncIteration
+
+        is_error, value = item
+        if is_error:
+            raise value  # type: ignore[misc]
+        else:
+            return value  # type: ignore[return-value]
+
+
+_EventSourceDict: TypeAlias = dict[str | None, EventSource]
+"""Maps event source arguments to their corresponding EventSource instances.
+Key is the argument string passed to the event source (None for parameterless sources).
+Value is the active EventSource instance for that argument."""
+_SubscriptionsDict: TypeAlias = defaultdict[str | None, set[str]]
+"""Maps event source arguments to sets of subscriber identifiers.
+Key is the argument string passed to the event source (None for parameterless sources).
+Value is a set of subscriber identifiers (idents) currently subscribed to that argument."""
 
 
 class EventSourceManager:
-    def __init__(self, middleware):
+    def __init__(self, middleware: Middleware):
         self.middleware = middleware
 
-        self.event_sources = {}
-        self.instances = defaultdict(dict)
-        self.idents = {}
-        self.subscriptions = defaultdict(lambda: defaultdict(set))
+        self.event_sources: dict[str, type[EventSource]] = {}
+        self.instances: defaultdict[str, _EventSourceDict] = defaultdict(dict)
+        self.idents: dict[str, IdentData] = {}
+        self.subscriptions: defaultdict[str, _SubscriptionsDict] = defaultdict(lambda: defaultdict(set))
 
-    def short_name_arg(self, name):
+    def short_name_arg(self, name: str) -> tuple[str, str | None]:
         if ':' in name:
             shortname, arg = name.split(':', 1)
         else:
@@ -28,28 +110,30 @@ class EventSourceManager:
             arg = None
         return shortname, arg
 
-    def get_full_name(self, name, arg):
+    def get_full_name(self, name: str, arg: str | None) -> str:
         if arg is None:
             return name
         else:
             return f'{name}:{arg}'
 
-    def register(self, name, event_source):
+    def register(self, name: str, event_source: type[EventSource]) -> None:
         if not issubclass(event_source, EventSource):
             raise RuntimeError(f"{event_source} is not EventSource subclass")
 
         self.event_sources[name] = event_source
 
-    async def subscribe(self, app, ident, name, arg):
+        self.middleware.role_manager.register_event(name, event_source.roles)
+
+    async def subscribe(self, subscriber: Subscriber, ident: str, name: str, arg: str | None) -> None:
         if ident in self.idents:
             raise ValueError(f"Ident {ident} is already used")
 
-        self.idents[ident] = IdentData(app, name, arg)
+        self.idents[ident] = IdentData(subscriber, name, arg)
         self.subscriptions[name][arg].add(ident)
 
-        if arg not in self.instances[name]:
+        if (instance := self.instances[name].get(arg)) is None:
             self.middleware.logger.trace("Creating new instance of event source %r:%r", name, arg)
-            self.instances[name][arg] = self.event_sources[name](
+            instance = self.instances[name][arg] = self.event_sources[name](
                 self.middleware, name, arg,
                 functools.partial(self._send_event, name, arg),
                 functools.partial(self._unsubscribe_all, name, arg),
@@ -59,15 +143,23 @@ class EventSourceManager:
                 await self.instances[name][arg].validate_arg()
             except ValidationErrors as e:
                 await self.unsubscribe(ident, e)
+                return
             else:
-                asyncio.ensure_future(self.instances[name][arg].process())
+                self.middleware.create_task(self.instances[name][arg].process())
         else:
             self.middleware.logger.trace("Re-using existing instance of event source %r:%r", name, arg)
 
-    async def unsubscribe(self, ident, error=None):
-        ident_data = self.idents.pop(ident)
-        await self.send_no_sub_message(ident_data, error)
+        try:
+            await instance.send_initial_state(subscriber)
+        except Exception:
+            self.middleware.logger.exception("EventSource %r:%r send_initial_state() failed", name, arg)
 
+    async def unsubscribe(self, ident: str, error: Exception | None = None) -> None:
+        ident_data = self.idents.pop(ident, None)
+        if ident_data is None:
+            return
+
+        self.terminate(ident_data, error)
         idents = self.subscriptions[ident_data.name][ident_data.arg]
         idents.remove(ident)
         if not idents:
@@ -76,28 +168,24 @@ class EventSourceManager:
             instance = self.instances[ident_data.name].pop(ident_data.arg)
             await instance.cancel()
 
-    async def send_no_sub_message(self, ident, error=None):
-        error_dict = {}
-        if error:
-            if isinstance(error, ValidationErrors):
-                error_dict['error'] = ident.app.get_error_dict(
-                    errno.EAGAIN, str(error), etype='VALIDATION', extra=list(error)
-                )
-            elif isinstance(error, CallError):
-                error_dict['error'] = ident.app.get_error_dict(
-                    error.errno, str(error), extra=error.extra
-                )
-            else:
-                error_dict['error'] = ident.app.get_error_dict(errno.EINVAL, str(error))
+    def terminate(self, ident: IdentData, error: Exception | None = None) -> None:
+        ident.subscriber.terminate(error)
 
-        ident.app._send({'msg': 'nosub', 'collection': self.get_full_name(ident.name, ident.arg), **error_dict})
+    async def subscribe_app(self, app: RpcWebSocketApp, ident: str, name: str, arg: str | None) -> None:
+        await self.subscribe(AppSubscriber(app, self.get_full_name(name, arg)), ident, name, arg)
 
-    async def unsubscribe_app(self, app):
+    async def unsubscribe_app(self, app: RpcWebSocketApp) -> None:
         for ident, ident_data in list(self.idents.items()):
-            if ident_data.app == app:
+            if isinstance(ident_data.subscriber, AppSubscriber) and ident_data.subscriber.app == app:
                 await self.unsubscribe(ident)
 
-    def _send_event(self, name, arg, event_type, **kwargs):
+    async def iterate(self, name: str, arg: str | None) -> InternalSubscriberIterator:
+        ident = str(uuid4())
+        subscriber = InternalSubscriber()
+        await self.subscribe(subscriber, ident, name, arg)
+        return subscriber.iterator
+
+    def _send_event(self, name: str, arg: str | None, event_type: str, **kwargs: Any) -> None:
         for ident in list(self.subscriptions[name][arg]):
             try:
                 ident_data = self.idents[ident]
@@ -105,10 +193,11 @@ class EventSourceManager:
                 self.middleware.logger.trace("Ident %r is gone", ident)
                 continue
 
-            ident_data.app.send_event(self.get_full_name(name, arg), event_type, **kwargs)
+            ident_data.subscriber.send_event(event_type, **kwargs)
 
-    async def _unsubscribe_all(self, name, arg, error=None):
+    async def _unsubscribe_all(self, name: str, arg: str | None, error: Exception | None = None) -> None:
         for ident in self.subscriptions[name][arg]:
-            await self.send_no_sub_message(self.idents.pop(ident), error)
+            self.terminate(self.idents.pop(ident), error)
 
+        self.instances[name].pop(arg, None)
         self.subscriptions[name][arg].clear()

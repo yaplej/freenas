@@ -1,16 +1,14 @@
-import socket
 import time
 
 import requests
 import websocket
 
-from middlewared.test.integration.utils import call, host, ssh, url, websocket_url
+from middlewared.test.integration.utils import call, ssh, url, websocket_url
 
 
 def test_system_general_ui_allowlist():
-    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    s.connect((host(), 1))  # connect() for UDP doesn't send packets
-    local_ip = s.getsockname()[0]
+    my_session = call("auth.sessions", [["current", "=", True]], {"get": True})
+    local_ip = my_session["origin"].split(":")[0]
 
     try:
         protected_endpoints = (
@@ -20,7 +18,6 @@ def test_system_general_ui_allowlist():
             "/api/docs",
             "/api/v2.0",
             "/progress",
-            "/vm/display",
         )
         protected_ws_endpoints = (
             ("/websocket", '{"msg": "connect", "version": "1"}'),
@@ -64,7 +61,7 @@ def test_system_general_ui_allowlist():
         # Ensure that we can't access API
         for endpoint in protected_endpoints:
             r = requests.get(url() + endpoint, timeout=10)
-            assert r.status_code == 403, r.text
+            assert r.status_code == 403, (endpoint, r.text)
         for endpoint, message in protected_ws_endpoints:
             ws = websocket.create_connection(websocket_url() + endpoint)
             ws.send(message)

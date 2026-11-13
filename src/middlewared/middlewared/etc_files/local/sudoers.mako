@@ -1,16 +1,21 @@
 <%
-    from middlewared.utils import filter_list
+    users = render_ctx['user.query']
+    groups = render_ctx['group.query']
+    support_entitled = render_ctx['support.truenas.entitlements.check'].entitled
 
-    users = filter_list(render_ctx['user.query'], [["sudo", "=", True]])
-    groups = filter_list(render_ctx['group.query'], [["sudo", "=", True]])
+    def sudo_entry(commands: list[str], commands_nopasswd: list[str]) -> str:
+        entry = []
+        if commands:
+            entry.append(sudo_commands(commands))
+        if commands_nopasswd:
+            entry.append("NOPASSWD: " + sudo_commands(commands_nopasswd))
+        return ", ".join(entry)
 
-    def sudo_commands(commands):
+    def sudo_commands(commands: list[str]) -> str:
         commands = list(filter(None, [command.strip() for command in commands]))
-        if not commands:
-            return "ALL"
         return ", ".join(map(sudo_command, commands))
 
-    def sudo_command(command):
+    def sudo_command(command: str) -> str:
         for c in ["\\", ",", ":", "="]:
             command = command.replace(c, "\\" + c)
         return command
@@ -18,23 +23,21 @@
 %>\
 root ALL=(ALL:ALL) ALL
 % for user in users:
-% if user['sudo_nopasswd']:
-${user['username']} ALL=(ALL) NOPASSWD: ${sudo_commands(user['sudo_commands'])}
-% else:
-${user['username']} ALL=(ALL) ${sudo_commands(user['sudo_commands'])}
+% if user.sudo_commands or user.sudo_commands_nopasswd:
+${user.username} ALL=(ALL) ${sudo_entry(user.sudo_commands, user.sudo_commands_nopasswd)}
 % endif
 % endfor
 % for group in groups:
-% if group['sudo_nopasswd']:
-${f'%{group["group"]}'} ALL=(ALL) NOPASSWD: ${sudo_commands(group['sudo_commands'])}
-% else:
-${f'%{group["group"]}'} ALL=(ALL) ${sudo_commands(group['sudo_commands'])}
+% if group.sudo_commands or group.sudo_commands_nopasswd:
+${f'%{group.group}'} ALL=(ALL) ${sudo_entry(group.sudo_commands, group.sudo_commands_nopasswd)}
 % endif
 % endfor
 Defaults syslog_goodpri = debug
 Defaults secure_path = /sbin:/bin:/usr/sbin:/usr/bin:/usr/local/sbin:/usr/local/bin
+% if support_entitled:
+Defaults log_subcmds
+Defaults log_format=json
+% endif
 
-# Let find_alias_for_smtplib.py runs as root (it needs database access)
-ALL ALL=(ALL) NOPASSWD: /etc/find_alias_for_smtplib.py
-ALL ALL=(ALL) NOPASSWD: /etc/find_alias_for_smtplib.sh
+# TODO: Do we _really_ need to do this??
 nut ALL=(root) NOPASSWD: /usr/local/bin/custom-upssched-cmd

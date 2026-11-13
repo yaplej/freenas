@@ -1,10 +1,11 @@
+import subprocess
+
+from middlewared.api.current import ServiceOptions
 from middlewared.service import Service, private
-from middlewared.utils import run
-from middlewared.plugins.smb import SMBCmd
+from middlewared.service_exception import CallError, MatchNotFound
+from middlewared.utils.sid import random_sid
 
-import re
-
-RE_SID = re.compile(r"S-\d-\d+-(\d+-){1,14}\d+$")
+from .constants import SMBCmd
 
 
 class SMBService(Service):
@@ -14,69 +15,64 @@ class SMBService(Service):
         service_verb = 'restart'
 
     @private
-    async def get_system_sid(self):
-        getSID = await run([SMBCmd.NET.value, "-d", "0", "getlocalsid"], check=False)
-        if getSID.returncode != 0:
-            self.logger.debug('Failed to retrieve local system SID: %s',
-                              getSID.stderr.decode())
-            return None
+    def local_server_sid(self):
+        if (db_sid := self.middleware.call_sync('datastore.config', 'services.cifs')['cifs_SID']):
+            return db_sid
 
-        m = RE_SID.search(getSID.stdout.decode().strip())
-        if m:
-            return m.group(0)
+        new_sid = random_sid()
+        if self.middleware.call_sync('failover.is_single_master_node'):
+            self.middleware.call_sync('datastore.update', 'services.cifs', 1, {'cifs_SID': new_sid})
 
-        self.logger.debug("getlocalsid returned invalid SID: %s",
-                          getSID.stdout.decode().strip())
-        return None
+        return new_sid
 
     @private
-    async def set_sid(self, db_sid):
-        system_SID = await self.get_system_sid()
+    def set_system_sid(self):
+        server_sid = self.local_server_sid()
+        netbiosname = self.middleware.call_sync('smb.config')['netbiosname']
 
-        if system_SID == db_sid:
-            return True
+        sid_read_failed = False
+        try:
+            current_sid = self.middleware.call_sync('directoryservices.secrets.domain_sid', netbiosname)
+        except (FileNotFoundError, MatchNotFound):
+            # secrets.tdb does not exist yet or holds no SID for our netbios name
+            current_sid = None
+        except Exception:
+            # An unexpected read failure is not the same as a genuinely-absent SID: we
+            # cannot prove the SID was unchanged, so record that the read failed and let
+            # the restart decision below err on the side of restarting winbindd.
+            self.logger.warning(
+                '%s: failed to read current local server SID from secrets', netbiosname, exc_info=True
+            )
+            current_sid = None
+            sid_read_failed = True
 
-        if db_sid:
-            if not await self.set_system_sid(db_sid):
-                self.logger.debug('Unable to set set SID to %s', db_sid)
-                return False
-        else:
-            if not system_SID:
-                self.logger.warning('Unable to determine system and database SIDs')
-                return False
+        if current_sid == server_sid:
+            return
 
-            await self.set_database_sid(system_SID)
-            return True
+        setsid = subprocess.run([
+            SMBCmd.NET.value, '-d', '0',
+            'setlocalsid', server_sid,
+        ], capture_output=True, check=False)
 
-    @private
-    async def set_database_sid(self, SID):
-        await self.middleware.call('datastore.update', 'services.cifs', 1, {'cifs_SID': SID})
+        if setsid.returncode != 0:
+            raise CallError(f'setlocalsid failed: {setsid.stderr.decode()}')
 
-    @private
-    async def set_system_sid(self, SID):
-        if not SID:
-            return False
+        if (current_sid is None and not sid_read_failed) or not self.call_sync2(self.s.service.started, 'idmap'):
+            # Skip the restart when we know there was no prior SID (a fresh secrets.tdb has
+            # nothing stale for winbindd to rebuild) or when winbindd isn't running. When the
+            # read failed instead, current_sid is None but sid_read_failed is True, so we fall
+            # through and restart -- leaving winbindd on a possibly-stale SID is the worse risk.
+            return
 
-        setSID = await run([SMBCmd.NET.value, "-d", "0", "setlocalsid", SID], check=False)
-        if setSID.returncode != 0:
-            self.logger.debug("setlocalsid failed with error: %s",
-                              setSID.stderr.decode())
-            return False
-
-        return True
-
-    @private
-    async def fixsid(self, groupmap=None):
-        """
-        Samba generates a new domain sid when its netbios name changes or if samba's secrets.tdb
-        has been deleted. passdb.tdb will automatically reflect the new mappings, but the groupmap
-        database is not automatically updated in these circumstances. This check is performed when
-        synchronizing group mapping database. In case there entries that no longer match our local
-        system sid, group_mapping.tdb will be removed and re-generated.
-        """
-        db_SID = (await self.middleware.call('smb.config'))['cifs_SID']
-        system_sid = await self.get_system_sid()
-
-        if db_SID != system_sid:
-            self.logger.warning(f"Domain SID in group_mapping.tdb ({system_sid}) is not SID in nas config ({db_SID}). Updating db")
-            await self.set_database_sid(system_sid)
+        # winbindd captures the local SAM domain SID from secrets.tdb when it starts.
+        # Changing the SID under a running winbindd leaves its domain list referencing
+        # a SID that the SAMR/passdb layer no longer accepts, and group token expansion
+        # fails with NT_STATUS_NO_SUCH_DOMAIN until winbindd is restarted.
+        self.logger.warning(
+            '%s: local server SID changed from %s to %s while winbindd was running. Restarting '
+            'winbindd to rebuild its view of the local SAM domain.',
+            netbiosname, current_sid, server_sid
+        )
+        self.call_sync2(
+            self.s.service.control, 'RESTART', 'idmap', ServiceOptions(silent=False, ha_propagate=False)
+        ).wait_sync(raise_error=True)

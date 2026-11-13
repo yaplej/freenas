@@ -1,0 +1,134 @@
+import os
+import re
+from typing import Any
+
+import pyudev
+
+from .disks_.disk_class import VALID_WHOLE_DISK, DiskEntry
+from .disks_.identifier import build_identifier, join_serial_lunid
+from .disks_.udev import lunid_from_wwn, serial_from_udev
+
+DISKS_TO_IGNORE = ('sr', 'md', 'dm-', 'loop', 'zd')
+RE_IS_PART = re.compile(r'p\d{1,3}$')
+
+
+def safe_retrieval(prop: dict[str, Any], key: str, default: str, as_int: bool = False) -> str | int:
+    value = prop.get(key)
+    if value is not None:
+        if isinstance(value, bytes):
+            value = value.strip().decode()
+        else:
+            value = value.strip()
+        return value if not as_int else int(value)
+
+    return default
+
+
+def get_disk_serial_from_block_device(block_device: pyudev.Device) -> str:
+    return serial_from_udev(block_device.properties) or ''
+
+
+def get_disk_lunid_from_block_device(block_device: pyudev.Device) -> str | None:
+    # Try udev ID_WWN first (for NAA format WWIDs)
+    if lunid := lunid_from_wwn(block_device.properties.get('ID_WWN')):
+        return lunid
+
+    # NAS-137807: Fallback to sysfs wwid for EUI-64 format WWIDs not exposed in udev properties
+    # Uses DiskEntry._sysfs_lunid which handles sysfs wwid retrieval and normalization, not DiskEntry.lunid,
+    # whose own udev fallback would repeat the lookup just done
+    return DiskEntry(name=block_device.sys_name, devpath=f'/dev/{block_device.sys_name}')._sysfs_lunid()
+
+
+def valid_zfs_partition_uuids() -> tuple[str, str]:
+    # https://salsa.debian.org/debian/gdisk/blob/master/parttypes.cc for valid zfs types
+    # 516e7cba was being used by freebsd and 6a898cc3 is being used by linux
+    return (
+        '6a898cc3-1dd2-11b2-99a6-080020736631',
+        '516e7cba-6ecf-11d6-8ff8-00022d09712b',
+    )
+
+
+def dev_to_ident(name: str, sys_disks: dict[str, dict[str, Any]]) -> str:
+    """Map a disk device (i.e. sda5) to its respective "identifier"
+    (i.e. "{serial_lunid}AAAA_012345")"""
+    try:
+        dev = sys_disks[name]
+    except KeyError:
+        return ''
+
+    def zfs_partition_uuid() -> str | None:
+        part: dict[str, Any]
+        for part in filter(lambda x: x['partition_type'] in valid_zfs_partition_uuids(), dev.get('parts') or ()):
+            return str(part['partition_uuid'])
+
+        return None
+
+    return build_identifier(name, dev['serial_lunid'], dev['serial'], zfs_partition_uuid)
+
+
+def get_disk_names() -> list[str]:
+    """
+    NOTE: The return of this method should match the keys retrieve when running `self.get_disks`.
+    """
+    disks = []
+    with os.scandir('/dev') as sdir:
+        for i in filter(lambda x: VALID_WHOLE_DISK.match(x.name), sdir):
+            disks.append(i.name)
+    return disks
+
+
+def get_disks_with_identifiers(
+    disks_identifier_required: list[str] | None = None, block_devices_data: dict[str, dict[str, Any]] | None = None,
+) -> dict[str, str]:
+    disks = {}
+    available_disks = get_disk_names()
+    disks_identifier_required = disks_identifier_required or available_disks
+    block_devices_data = block_devices_data or {}
+    context = pyudev.Context()
+    for disk_name in disks_identifier_required:
+        if disk_name not in available_disks:
+            continue
+
+        if block_device_data := block_devices_data.get(disk_name, {}):
+            identifier = dev_to_ident(disk_name, block_devices_data)
+            if not identifier.startswith('{devicename}'):
+                disks[disk_name] = identifier
+                continue
+
+        # If we had cached data but we still end up here, it means we still need to try the partitions check
+        # and see if we can use that as an identifier
+        try:
+            # Retrieve the device directly by name
+            block_device = pyudev.Devices.from_name(context, 'block', disk_name)
+            if block_device_data:
+                serial, lunid = block_device_data['serial'], block_device_data['lunid']
+            else:
+                serial = get_disk_serial_from_block_device(block_device)
+                lunid = get_disk_lunid_from_block_device(block_device)
+
+            parts = []
+            for partition in filter(
+                lambda p: all(p.get(k) for k in ('ID_PART_ENTRY_TYPE', 'ID_PART_ENTRY_UUID')), block_device.children
+            ):
+                parts.append({
+                    'partition_type': partition['ID_PART_ENTRY_TYPE'],
+                    'partition_uuid': partition['ID_PART_ENTRY_UUID'],
+                })
+        except pyudev.DeviceNotFoundError:
+            block_device_data = {
+                'serial': '',
+                'lunid': '',
+                'serial_lunid': '',
+                'parts': [],
+            } | block_device_data
+        else:
+            block_device_data = {
+                'serial': serial,
+                'lunid': lunid or None,
+                'serial_lunid': join_serial_lunid(serial, lunid),
+                'parts': parts,
+            }
+
+        disks[disk_name] = dev_to_ident(disk_name, {disk_name: block_device_data})
+
+    return disks

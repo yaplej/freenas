@@ -1,27 +1,23 @@
 import logging
 import os
 
-from middlewared.service import item_method, job, Service
-from middlewared.schema import accepts, Int, returns
+from middlewared.api import api_method
+from middlewared.api.current import PoolExpandArgs, PoolExpandResult
+from middlewared.service import Service, job, private
 from middlewared.utils import run
-
 
 logger = logging.getLogger(__name__)
 
 
 class PoolService(Service):
 
-    @item_method
-    @accepts(
-        Int('id'),
-    )
-    @returns()
+    @api_method(PoolExpandArgs, PoolExpandResult, roles=['POOL_WRITE'])
     @job(lock='pool_expand')
-    async def expand(self, job, id):
+    async def expand(self, job, id_):
         """
         Expand pool to fit all available disk space.
         """
-        pool = await self.middleware.call('pool.get_instance', id)
+        pool = await self.middleware.call('pool.get_instance', id_)
         all_partitions = {p['name']: p for p in await self.middleware.call('disk.list_all_partitions')}
         vdevs = []
         for vdev in sum(pool['topology'].values(), []):
@@ -57,11 +53,11 @@ class PoolService(Service):
                 continue
 
             for guid, part_data in c_vdevs:
-                await self._resize_disk(part_data)
+                await self.expand_partition(part_data)
                 vdevs.append(guid)
 
         # spare/cache devices cannot be expanded
-        # We resize them anyways, for cache devices, whenever we are going to import the pool
+        # We resize them anyway, for cache devices, whenever we are going to import the pool
         # next, it will register the new capacity. For spares, whenever that spare is going to
         # be used, it will register the new capacity as desired.
         for topology_type in filter(
@@ -73,10 +69,29 @@ class PoolService(Service):
                 ):
                     await self.middleware.call('zfs.pool.online', pool['name'], c_vd['guid'], True)
 
-    async def _resize_disk(self, part_data):
+    @private
+    async def expand_partition(self, part_data):
+        size = await self.middleware.call('disk.get_data_partition_size', part_data['disk'], part_data['start'])
+        if size <= part_data['size']:
+            return
+
+        # Wipe potential conflicting ZFS label
+        wipe_size = 1024 ** 2
+        wipe_start = part_data['start'] + size - wipe_size
+        if wipe_start < part_data['end']:
+            return
+
+        def wipe_label():
+            with open(os.path.join('/dev', part_data['disk']), 'r+b') as f:
+                f.seek(wipe_start)
+                f.write(b'0' * wipe_size)
+
+        await self.middleware.run_in_thread(wipe_label)
+
         partition_number = part_data['partition_number']
+        start = part_data['start_sector']
         await run(
-            'sgdisk', '-d', str(partition_number), '-n', f'{partition_number}:0:0', '-t',
+            'sgdisk', '-d', str(partition_number), '-n', f'{partition_number}:{start}:+{int(size / 1024)}KiB', '-t',
             f'{partition_number}:BF01', '-u', f'{partition_number}:{part_data["partition_uuid"]}',
             os.path.join('/dev', part_data['disk'])
         )

@@ -1,216 +1,94 @@
-import asyncio
-import os
-import re
-import subprocess
-import time
-import math
+from datetime import datetime, timedelta
+from time import time
 
-import async_timeout
-
-from middlewared.common.smart.smartctl import SMARTCTL_POWERMODES
-from middlewared.schema import Bool, Dict, Int, returns
-from middlewared.service import accepts, List, private, Ref, Service, Str
-from middlewared.utils.asyncio_ import asyncio_map
-from middlewared.utils.itertools import grouper
-
-
-def get_temperature(stdout):
-    # ataprint.cpp
-
-    data = {}
-    for s in re.findall(r'^((190|194) .+)', stdout, re.M):
-        s = s[0].split()
-        try:
-            data[s[1]] = int(s[9])
-        except (IndexError, ValueError):
-            pass
-    for k in ['Temperature_Celsius', 'Temperature_Internal', 'Drive_Temperature',
-              'Temperature_Case', 'Case_Temperature', 'Airflow_Temperature_Cel']:
-        if k in data:
-            return data[k]
-
-    reg = re.search(r'194\s+Temperature_Celsius[^\n]*', stdout, re.M)
-    if reg:
-        return int(reg.group(0).split()[9])
-
-    # nvmeprint.cpp
-
-    reg = re.search(r'Temperature:\s+([0-9]+) Celsius', stdout, re.M)
-    if reg:
-        return int(reg.group(1))
-
-    reg = re.search(r'Temperature Sensor [0-9]+:\s+([0-9]+) Celsius', stdout, re.M)
-    if reg:
-        return int(reg.group(1))
-
-    # scsiprint.cpp
-
-    reg = re.search(r'Current Drive Temperature:\s+([0-9]+) C', stdout, re.M)
-    if reg:
-        return int(reg.group(1))
+from middlewared.api import api_method
+from middlewared.api.current import (
+    DiskTemperatureAggArgs,
+    DiskTemperatureAggResult,
+    DiskTemperatureAlertsArgs,
+    DiskTemperatureAlertsResult,
+    DiskTemperaturesArgs,
+    DiskTemperaturesResult,
+)
+from middlewared.service import Service
+from middlewared.utils.disks_.disk_class import TempEntry
 
 
 class DiskService(Service):
-    cache = {}
+    temp_cache: dict[str, tuple[TempEntry, float]] = dict()
+    temp_cache_age: int = 300  # 5mins
 
-    @private
-    async def disks_for_temperature_monitoring(self):
-        return [
-            disk['name']
-            for disk in await self.middleware.call(
-                'disk.query',
-                [
-                    ['name', '!=', None],
-                    ['togglesmart', '=', True],
-                    # Polling for disk temperature does not allow them to go to sleep automatically
-                    ['hddstandby', '=', 'ALWAYS ON'],
-                ]
-            )
-        ]
-
-    @accepts(
-        Str('name'),
-        Dict(
-            'options',
-            Int('cache', default=None, null=True),
-            Str('powermode', enum=SMARTCTL_POWERMODES, default=SMARTCTL_POWERMODES[0]),
-        ),
-        deprecated=[
-            (
-                lambda args: len(args) == 2 and isinstance(args[1], str),
-                lambda name, powermode: [name, {'powermode': powermode}],
-            ),
-        ],
+    @api_method(
+        DiskTemperaturesArgs,
+        DiskTemperaturesResult,
+        roles=['REPORTING_READ']
     )
-    @returns(Int('temperature', null=True))
-    async def temperature(self, name, options):
+    def temperatures(self, names, include_thresholds):
         """
-        Returns temperature for device `name` using specified S.M.A.R.T. `powermode`. If `cache` is not null
-        then the last cached within `cache` seconds value is used.
+        Returns disk temperatures for disks in degrees celsius.
+
+        .. note::
+
+            Disk temperatures are not retrieved more than once every 5 minutes.
         """
-        if options['cache'] is not None:
-            if cached := self.cache.get(name):
-                temperature, cache_time = cached
-                if cache_time > time.monotonic() - options['cache']:
-                    return temperature
-
-        temperature = await self.middleware.call('disk.temperature_uncached', name, options['powermode'])
-
-        self.cache[name] = (temperature, time.monotonic())
-        return temperature
-
-    @private
-    async def temperature_uncached(self, name, powermode):
-        output = await self.middleware.call('disk.smartctl', name, ['-a', '-n', powermode.lower()], {'silent': True})
-        if output is not None:
-            return get_temperature(output)
-
-    @private
-    async def reset_temperature_cache(self):
-        self.cache = {}
-
-    @accepts(
-        List('names', items=[Str('name')]),
-        Dict(
-            'options',
-            # A little less than collectd polling interval of 300 seconds to avoid returning old value when polling
-            # occurs in 299.9 seconds.
-            Int('cache', default=290, null=True),
-            Bool('only_cached', default=False),
-            Str('powermode', enum=SMARTCTL_POWERMODES, default=SMARTCTL_POWERMODES[0]),
-        ),
-        deprecated=[
-            (
-                lambda args: len(args) == 2 and isinstance(args[1], str),
-                lambda name, powermode: [name, {'powermode': powermode}],
-            ),
-        ],
-    )
-    @returns(Dict('disks_temperatures', additional_attrs=True))
-    async def temperatures(self, names, options):
-        """
-        Returns temperatures for a list of devices (runs in parallel).
-        See `disk.temperature` documentation for more details.
-        If `only_cached` is specified then this method only returns disk temperatures that exist in cache.
-        """
-        if len(names) == 0:
-            names = await self.disks_for_temperature_monitoring()
-
-        if options.pop('only_cached'):
-            return {
-                disk: temperature
-                for disk, (temperature, cache_time) in self.cache.items()
-                if (
-                    disk in names and
-                    cache_time > time.monotonic() - 610  # Double collectd polling interval + a little bit
-                )
-            }
-
-        async def temperature(name):
+        now = time()
+        rv = {i: None for i in names}
+        for i in self.middleware.call_sync("disk.get_disks"):
             try:
-                async with async_timeout.timeout(15):
-                    return await self.middleware.call('disk.temperature', name, options)
-            except asyncio.TimeoutError:
-                return None
+                temp, temp_time = self.temp_cache[i.name]
+                if now - temp_time > self.temp_cache_age:
+                    # cache time expired, grab a new temp
+                    self.temp_cache[i.name] = (i.temp(), now)
+            except KeyError:
+                # no cache or disk not in cache
+                self.temp_cache[i.name] = (i.temp(), now)
 
-        return dict(zip(names, await asyncio_map(temperature, names, 8)))
+            if not names or i.name in names:
+                if include_thresholds:
+                    rv[i.name] = (
+                        self.temp_cache[i.name][0].temp_c,
+                        self.temp_cache[i.name][0].crit,
+                    )
+                else:
+                    rv[i.name] = self.temp_cache[i.name][0].temp_c
+        return rv
 
-    @private
-    def get_temp_value(self, value):
-        if math.isnan(value):
-            value = None
-        return value
-
-    @accepts(List('names', items=[Str('name')]), Int('days'))
-    @returns(Dict('temperatures', additional_attrs=True))
+    @api_method(
+        DiskTemperatureAggArgs,
+        DiskTemperatureAggResult,
+        roles=['REPORTING_READ']
+    )
     def temperature_agg(self, names, days):
-        """
-        Returns min/max/avg temperature for `names` disks for the last `days` days.
-        """
-        disks = []
-        args = []
-        for name in names:
-            path = f'/var/db/collectd/rrd/localhost/disktemp-{name}/temperature.rrd'
-            if not os.path.exists(path):
-                continue
+        """Returns min/max/avg temperature for ``names`` disks over the last ``days`` days."""
+        # we only keep 7 days of historical data because we keep per second information
+        # which adds up to lots of used disk space quickly depending on the size of the
+        # system
+        end = datetime.now()
+        start = end - timedelta(days=min(days, 7))
+        opts = {'start': round(start.timestamp()), 'end': round(end.timestamp())}
+        final = dict()
+        for disk in self.middleware.call_sync('reporting.netdata_graph', 'disktemp', opts):
+            # identifier looks like "sda | Type: HDD | Model: HUH721212AL4200 | Serial: aaa"
+            # so we need to normalize it before checking if caller has specified it
+            name = disk.identifier.split(' | ')[0].strip()
+            if name in names and disk.aggregations is not None:
+                final[name] = {
+                    'min': disk.aggregations.min.get('temperature_value', None),
+                    'max': disk.aggregations.max.get('temperature_value', None),
+                    'avg': disk.aggregations.mean.get('temperature_value', None),
+                }
+        return final
 
-            disks.append(name)
-            for DEF, VDEF in [('MIN', 'MINIMUM'), ('MAX', 'MAXIMUM'), ('AVERAGE', 'AVERAGE')]:
-                args.extend([
-                    f'DEF:{name}{DEF}=/var/db/collectd/rrd/localhost/disktemp-{name}/temperature.rrd:value:{DEF}',
-                    f'VDEF:v{name}{DEF}={name}{DEF},{VDEF}',
-                    f'PRINT:v{name}{DEF}:%lf',
-                ])
-
-        output = list(map(float, subprocess.check_output(
-            ['rrdtool', 'graph', 'x', '--daemon', 'unix:/var/run/rrdcached.sock', '--start', f'-{days}d', '--end',
-             'now'] + args,
-            encoding='ascii',
-        ).split()[1:]))  # The first line is `0x0`
-
-        result = {}
-        for disk, values in zip(disks, grouper(output, 3)):  # FIXME: `incomplete='strict' when we switch to python 3.10
-            result[disk] = {
-                'min': self.get_temp_value(values[0]),
-                'max': self.get_temp_value(values[1]),
-                'avg': self.get_temp_value(values[2]),
-            }
-
-        return result
-
-    @accepts(List('names', items=[Str('name')]))
-    @returns(Ref('alert'))
+    @api_method(
+        DiskTemperatureAlertsArgs,
+        DiskTemperatureAlertsResult,
+        roles=['REPORTING_READ']
+    )
     async def temperature_alerts(self, names):
-        """
-        Returns existing temperature alerts for specified disk `names.`
-        """
-        devices = {f'/dev/{name}' for name in names}
-        alerts = await self.middleware.call('alert.list')
-        return [
-            alert for alert in alerts
-            if (
-                alert['klass'] == 'SMART' and
-                alert['args']['device'] in devices and
-                'temperature' in alert['args']['message'].lower()
-            )
-        ]
+        """Returns existing temperature alerts for specified disks."""
+        alerts = list()
+        names = {f'/dev/{i}' for i in names}
+        for i in await self.call2(self.s.alert.list):
+            if i.klass == "DiskTemperatureTooHot" and i.args["device"] in names:
+                alerts.append(i)
+        return alerts

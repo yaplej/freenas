@@ -1,7 +1,29 @@
+from middlewared.api import api_method
+from middlewared.api.current import (
+    iSCSITargetAuthorizedInitiatorCreateArgs,
+    iSCSITargetAuthorizedInitiatorCreateResult,
+    iSCSITargetAuthorizedInitiatorDeleteArgs,
+    iSCSITargetAuthorizedInitiatorDeleteResult,
+    iSCSITargetAuthorizedInitiatorEntry,
+    iSCSITargetAuthorizedInitiatorUpdateArgs,
+    iSCSITargetAuthorizedInitiatorUpdateResult,
+)
+from middlewared.service import CRUDService, private
 import middlewared.sqlalchemy as sa
 
-from middlewared.schema import accepts, Dict, Int, List, Patch, Str
-from middlewared.service import CRUDService, private
+
+def initiator_summary(data):
+    """Select a human-readable string representing this initiator"""
+    if title := data.get('comment'):
+        return title
+    initiators = data.get('initiators', [])
+    count = len(initiators)
+    if count == 0:
+        return 'Allow All initiators'
+    elif count == 1:
+        return initiators[0]
+    else:
+        return initiators[0] + ',...'
 
 
 class iSCSITargetAuthorizedInitiatorModel(sa.Model):
@@ -20,19 +42,18 @@ class iSCSITargetAuthorizedInitiator(CRUDService):
         datastore_prefix = 'iscsi_target_initiator_'
         datastore_extend = 'iscsi.initiator.extend'
         cli_namespace = 'sharing.iscsi.target.authorized_initiator'
+        role_prefix = 'SHARING_ISCSI_INITIATOR'
+        entry = iSCSITargetAuthorizedInitiatorEntry
 
-    @accepts(Dict(
-        'iscsi_initiator_create',
-        List('initiators'),
-        Str('comment'),
-        register=True
-    ))
+    @api_method(
+        iSCSITargetAuthorizedInitiatorCreateArgs,
+        iSCSITargetAuthorizedInitiatorCreateResult,
+        audit='Create iSCSI initiator',
+        audit_extended=lambda data: initiator_summary(data)
+    )
     async def do_create(self, data):
         """
         Create an iSCSI Initiator.
-
-        `initiators` is a list of initiator hostnames which are authorized to access an iSCSI Target. To allow all
-        possible initiators, `initiators` can be left empty.
         """
         await self.compress(data)
 
@@ -44,40 +65,45 @@ class iSCSITargetAuthorizedInitiator(CRUDService):
 
         return await self.get_instance(data['id'])
 
-    @accepts(
-        Int('id'),
-        Patch(
-            'iscsi_initiator_create',
-            'iscsi_initiator_update',
-            ('attr', {'update': True})
-        )
+    @api_method(
+        iSCSITargetAuthorizedInitiatorUpdateArgs,
+        iSCSITargetAuthorizedInitiatorUpdateResult,
+        audit='Update iSCSI initiator',
+        audit_callback=True,
     )
-    async def do_update(self, id, data):
+    async def do_update(self, audit_callback, id_, data):
         """
-        Update iSCSI initiator of `id`.
+        Update iSCSI initiator of ``id``.
         """
-        old = await self.get_instance(id)
+        old = await self.get_instance(id_)
+        audit_callback(initiator_summary(old))
 
         new = old.copy()
         new.update(data)
 
         await self.compress(new)
         await self.middleware.call(
-            'datastore.update', self._config.datastore, id, new,
+            'datastore.update', self._config.datastore, id_, new,
             {'prefix': self._config.datastore_prefix})
 
         await self._service_change('iscsitarget', 'reload')
 
-        return await self.get_instance(id)
+        return await self.get_instance(id_)
 
-    @accepts(Int('id'))
-    async def do_delete(self, id):
+    @api_method(
+        iSCSITargetAuthorizedInitiatorDeleteArgs,
+        iSCSITargetAuthorizedInitiatorDeleteResult,
+        audit='Delete iSCSI initiator',
+        audit_callback=True,
+    )
+    async def do_delete(self, audit_callback, id_):
         """
-        Delete iSCSI initiator of `id`.
+        Delete iSCSI initiator of ``id``.
         """
-        await self.get_instance(id)
+        old = await self.get_instance(id_)
+        audit_callback(initiator_summary(old))
         result = await self.middleware.call(
-            'datastore.delete', self._config.datastore, id
+            'datastore.delete', self._config.datastore, id_
         )
 
         await self._service_change('iscsitarget', 'reload')
